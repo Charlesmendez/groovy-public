@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
+import { getWorkspaceMembershipsForUser } from "@/lib/billing/state";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,8 +21,8 @@ export async function DELETE(
   if (authErr || !user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const admin = createSupabaseAdminClient();
-  const membership = await getWorkspaceMembershipForUser({ userId: user.id, admin });
-  const workspaceId = membership?.workspace_id || null;
+  const memberships = await getWorkspaceMembershipsForUser({ userId: user.id, admin });
+  const membershipByWorkspace = new Map(memberships.map((membership) => [membership.workspace_id, membership]));
 
   const { data: device, error } = await admin
     .from("license_devices")
@@ -36,7 +36,8 @@ export async function DELETE(
     : ((device as Record<string, unknown>).licenses as Record<string, unknown> | null);
   const ownsLicense =
     license?.user_id === user.id ||
-    (workspaceId && license?.workspace_id === workspaceId && membership?.role === "admin");
+    (typeof license?.workspace_id === "string" &&
+      membershipByWorkspace.get(license.workspace_id)?.role === "admin");
   if (!ownsLicense) return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   if (license?.status !== "active" && license?.status !== "past_due") {
     return NextResponse.json(

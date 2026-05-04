@@ -25,27 +25,35 @@ function roundUsd(n: number): number {
   return Math.round((n + Number.EPSILON) * 1_000_000) / 1_000_000;
 }
 
-type MembershipRow = { workspace_id: string; role: "admin" | "member" };
+export type MembershipRow = { workspace_id: string; role: "admin" | "member" };
+
+export async function getWorkspaceMembershipsForUser(args: {
+  userId: string;
+  admin?: SupabaseClient;
+}): Promise<MembershipRow[]> {
+  const admin = args.admin || createSupabaseAdminClient();
+  const { data, error } = await admin
+    .from("workspace_members")
+    .select("workspace_id, role")
+    .eq("user_id", args.userId);
+  if (error || !Array.isArray(data)) return [];
+  return data
+    .map((row) => ({
+      workspace_id: String((row as Record<string, unknown>).workspace_id || ""),
+      role:
+        (row as Record<string, unknown>).role === "admin"
+          ? ("admin" as const)
+          : ("member" as const),
+    }))
+    .filter((row) => row.workspace_id);
+}
 
 export async function getWorkspaceMembershipForUser(args: {
   userId: string;
   admin?: SupabaseClient;
 }): Promise<MembershipRow | null> {
-  const admin = args.admin || createSupabaseAdminClient();
-  const { data, error } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role")
-    .eq("user_id", args.userId)
-    .limit(1)
-    .maybeSingle();
-  if (error || !data) return null;
-  return {
-    workspace_id: String((data as Record<string, unknown>).workspace_id || ""),
-    role:
-      (data as Record<string, unknown>).role === "admin"
-        ? "admin"
-        : "member",
-  };
+  const memberships = await getWorkspaceMembershipsForUser(args);
+  return memberships[0] || null;
 }
 
 export async function getBillingWorkspaceState(args: {

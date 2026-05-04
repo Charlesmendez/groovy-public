@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import { getStripeServerClient } from "@/lib/billing/stripe";
 
 export const runtime = "nodejs";
@@ -21,18 +20,26 @@ export async function POST(req: Request) {
   if (authErr || !user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const admin = createSupabaseAdminClient();
-  const membership = await getWorkspaceMembershipForUser({ userId: user.id, admin });
-  if (!membership?.workspace_id) {
-    return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
-  }
-  if (membership.role !== "admin") {
-    return NextResponse.json({ error: "Admin access required" }, { status: 403 });
+  const { data: personalLicense, error: licenseErr } = await admin
+    .from("licenses")
+    .select("id")
+    .eq("user_id", user.id)
+    .eq("license_type", "personal")
+    .order("valid_until", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (licenseErr) return NextResponse.json({ error: licenseErr.message }, { status: 500 });
+
+  const personalLicenseId =
+    typeof personalLicense?.id === "string" ? personalLicense.id.trim() : "";
+  if (!personalLicenseId) {
+    return NextResponse.json({ error: "No personal license found for this account" }, { status: 404 });
   }
 
   const { data: subscription, error } = await admin
     .from("subscriptions")
     .select("stripe_customer_id")
-    .eq("workspace_id", membership.workspace_id)
+    .eq("license_id", personalLicenseId)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
