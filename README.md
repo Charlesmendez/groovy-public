@@ -62,7 +62,50 @@ The fastest way to get the setup prompt is:
 npx @gogroovy/cli setup prompt
 ```
 
+From this repo, you can also run:
+
+```bash
+npm run groovy -- setup prompt
+```
+
 The setup flow covers local development, Vercel, Supabase, Fly.io, Stripe, provider API keys, Groovy license activation, Datagran Memory, Datagran-backed Data Integrations, and connector startup. Browser steps are only needed for account creation, OAuth, or provider dashboards that do not support full CLI setup.
+
+## What Users Actually Install
+
+Groovy has three user-facing pieces:
+
+1. **Groovy account portal**
+   Users sign in here after purchase or enterprise provisioning. The portal shows their license, renewal status, devices, billing, downloads, source snapshots, checksums, and release notes.
+
+2. **Groovy source and downloads**
+   Active personal and enterprise customers get current downloads and source snapshots through the portal and CLI. They do not need private GitHub access by default.
+
+3. **Groovy Connector**
+   The connector is the local runtime installed on the user's machine. It lets Groovy work with the user's browser, files, WhatsApp, terminal, and local tools with the user's permission.
+
+Typical personal flow:
+
+```text
+Buy Groovy Personal -> create/login to account -> open account portal -> download current version/source -> install connector -> connect provider keys -> run Groovy
+```
+
+Typical enterprise flow:
+
+```text
+Contact sales -> sign agreement -> receive enterprise account/license -> download source snapshot and deployment packages -> self-host or install connector -> connect provider and Datagran accounts
+```
+
+## How Updates Work
+
+Updates do not come from giving every customer direct access to the private GitHub repo.
+
+The intended flow is:
+
+```text
+private Groovy repo -> tagged source snapshot/release -> Groovy portal and CLI -> licensed users
+```
+
+When a user's license is active, the portal and CLI can show the latest version they are entitled to download. If a personal license expires, the already-installed version can continue for personal use, but the user loses access to new downloads, new activations, updates, and support.
 
 ## Repository Roles
 
