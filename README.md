@@ -156,14 +156,14 @@ The delayed public GitHub mirror is for:
 - security review
 - developer evaluation
 
-The separate `groovy-releases` repository is for:
+The separate private `groovy-releases` repository is for:
 
 - signed connector installers
 - headless connector tarballs
 - checksums
 - CI-produced release artifacts
 
-GitHub is not the payment or license authority. The Groovy account portal and license system control paid access, device activation, downloads, updates, and enterprise source snapshots.
+GitHub is not the payment, license, or public download authority. The Groovy account portal and license system control paid access, device activation, downloads, updates, and enterprise source snapshots. Current connector downloads should be served through the portal with private storage and signed URLs.
 
 ## Contributing
 
@@ -240,7 +240,7 @@ Groovy currently uses:
 - Stripe for personal yearly subscriptions
 - Datagran for Groovy Memory and Datagran-backed Data Integrations when those features are enabled
 - npm for publishing the Groovy CLI package
-- GitHub Releases for connector release artifacts
+- Private GitHub Releases or private artifact storage for connector release staging
 
 See:
 

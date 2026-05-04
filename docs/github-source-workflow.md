@@ -8,7 +8,7 @@ Use three repositories:
 | --- | --- | --- |
 | `Charlesmendez/groovy` | Private | Current production source, Vercel deployment, paid source snapshots, internal development. |
 | `Charlesmendez/groovy-public` | Public | Delayed source-available mirror, public issues, public pull requests, security review, evaluation. |
-| `Charlesmendez/groovy-releases` | Public for now | Connector release artifacts, signed installers, checksums, headless tarballs. |
+| `Charlesmendez/groovy-releases` | Private | Internal connector release artifact staging for signed installers, checksums, and headless tarballs. |
 
 `groovy` is the source of truth. `groovy-public` is a delayed mirror. Never automatically merge public mirror code back into private source.
 
@@ -125,6 +125,8 @@ Public `groovy-public`:
 
 `groovy-releases`:
 
-- Keep as release artifact automation during transition.
+- Keep private. It is not a public download surface.
 - Do not use it as the license or payment system.
-- Move paid download entitlement to portal/CLI and Supabase signed URLs.
+- Paid users should receive current connector installers through the Groovy account portal/CLI download entitlement.
+- Store production customer-facing artifacts in private storage and serve them through short-lived signed URLs from the portal.
+- Hosted Mac bootstrap must use `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` pointing to an internal/private artifact URL, not a public GitHub Release URL.

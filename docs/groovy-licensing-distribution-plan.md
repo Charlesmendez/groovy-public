@@ -180,7 +180,7 @@ Recommendation:
   - "Groovy does not charge a percentage over token usage by default."
   - "Enterprise reseller billing requires written authorization."
 
-### Distribution Currently Uses GitHub Releases
+### Distribution Previously Used Public GitHub Releases
 
 Relevant files:
 
@@ -190,10 +190,10 @@ Relevant files:
 
 Recommendation:
 
-- Keep GitHub Releases as legacy/internal release automation during transition.
+- Keep GitHub Releases private as legacy/internal release automation during transition.
 - Move paid download/source entitlement to portal/CLI.
 - Use short-lived signed URLs, checksums, release notes, and license-gated source snapshots.
-- Update hosted Mac bootstrap to consume portal/CLI-accessible artifacts where possible, or keep GitHub release URLs only for internal/legacy bootstraps until replaced.
+- Hosted Mac bootstrap must consume private/internal artifact URLs and should not fall back to public GitHub Release assets.
 
 ### Connector and Device Pairing Should Be Reused
 

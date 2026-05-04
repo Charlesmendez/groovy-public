@@ -19,7 +19,7 @@ This checklist is the operating reference for finishing the licensing/distributi
 
 - `Charlesmendez/groovy-public` exists and is public.
 - `Charlesmendez/groovy` remains private.
-- `Charlesmendez/groovy-releases` exists and remains the release artifact repo.
+- `Charlesmendez/groovy-releases` exists, is private, and remains an internal release artifact repo.
 - `groovy-public/main` has branch protection.
 - `PUBLIC_MIRROR_SSH_KEY` exists as a secret on private `groovy`.
 - A write deploy key exists on `groovy-public`.
@@ -27,6 +27,8 @@ This checklist is the operating reference for finishing the licensing/distributi
 ### Still required
 
 Commit and push the local workflow/code changes to private `groovy`; GitHub Actions cannot run files that only exist locally.
+
+Upload the current connector installers/source artifacts into private storage and register them in `/admin` so licensed users download through `/account/downloads`. Do not rely on public GitHub Release asset URLs for customer downloads.
 
 ### Where to go
 

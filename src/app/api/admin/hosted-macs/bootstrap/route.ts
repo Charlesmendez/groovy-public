@@ -92,10 +92,7 @@ export async function POST(req: Request) {
     const relayUrl =
       body.relay_url || process.env.GROOVY_RELAY_URL || "wss://groovy-relay.fly.dev";
     const appUrl = body.app_url || process.env.NEXT_PUBLIC_APP_URL || "";
-    const defaultTarballUrl =
-      "https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-Headless.tar.gz";
-    const tarballUrl =
-      process.env.HOSTED_MAC_BOOTSTRAP_TARBALL_URL || defaultTarballUrl;
+    const tarballUrl = process.env.HOSTED_MAC_BOOTSTRAP_TARBALL_URL || "";
     if (!tarballUrl) {
       logWarn("hosted_mac.bootstrap.missing_tarball_url", {
         request_id: body.request_id,

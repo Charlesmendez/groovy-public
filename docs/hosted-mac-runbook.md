@@ -11,7 +11,9 @@ npm run build:headless
 This creates:
 - `apps/connector/dist/Groovy-Connector-Headless.tar.gz`
 
-Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to GitHub Releases (`Charlesmendez/groovy-releases`).
+Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to a private artifact
+location. `Charlesmendez/groovy-releases` is private and can be used as internal
+staging, but the bootstrap job needs a URL it can fetch server-side.
 
 ---
 
@@ -114,7 +116,7 @@ node --version  # Should show v18+ or v20+
 |----------|---------|---------|
 | `HOSTED_MACS_SLACK_WEBHOOK_URL` | Slack webhook for notifications | `https://hooks.slack.com/...` |
 | `HOSTED_MAC_ADMIN_EMAILS` | Comma-separated admin emails | `admin@example.com,ops@example.com` |
-| `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` | URL to headless tarball | `https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-Headless.tar.gz` |
+| `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` | Private signed/internal URL to headless tarball | `https://.../Groovy-Connector-Headless.tar.gz?...` |
 | `NEXT_PUBLIC_APP_URL` | App URL (connector API target) | `https://gogroovy.ai` |
 | `RELAY_JWT_SECRET` | Same secret as relay | `your-secret-key` |
 

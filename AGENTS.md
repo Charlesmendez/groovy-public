@@ -14,9 +14,10 @@ credential/account blockers.
 - `Charlesmendez/groovy-public` is the delayed public source-available mirror.
   Public issues and public pull requests belong there. It is not the current
   paid source and must not be treated as the development trunk.
-- `Charlesmendez/groovy-releases` is the connector/release artifact repo for
+- `Charlesmendez/groovy-releases` is the private connector/release artifact repo for
   signed installers, headless connector tarballs, checksums, and CI-produced
-  artifacts. It is not the licensing or payment system.
+  artifacts. It is not the licensing or payment system and must not be used as
+  a public customer download surface.
 
 ### Datagran account requirement
 
@@ -816,11 +817,14 @@ Outputs:
 - `apps/connector/dist/Groovy-Connector-Headless.tar.gz`
 
 ### Deploy (needed before bootstrap)
-Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to GitHub Releases (`Charlesmendez/groovy-releases`).
+Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to a private
+artifact location. `Charlesmendez/groovy-releases` is private and can be used
+as internal staging, but hosted Mac bootstrap needs a URL that the server-side
+bootstrap job can fetch.
 
 Example URL (set in env):
 ```
-HOSTED_MAC_BOOTSTRAP_TARBALL_URL=https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-Headless.tar.gz
+HOSTED_MAC_BOOTSTRAP_TARBALL_URL=<private signed/internal headless tarball URL>
 ```
 
 ### Bootstrap (server-side)
@@ -851,14 +855,15 @@ Current behavior:
 | Location | Purpose |
 |----------|---------|
 | `apps/connector/dist/*` | **Local build output** |
-| `Charlesmendez/groovy-releases` (GitHub) | **Production download source** (macOS, Windows, headless) |
+| `Charlesmendez/groovy-releases` (private GitHub) | **Internal release artifact staging** |
+| Groovy account portal/Supabase private storage | **Licensed customer download source** |
 
 ### How it's served
 
-App download links use GitHub Releases latest assets:
-- `.../Groovy-Connector-macOS.dmg`
-- `.../Groovy-Connector-windows.exe`
-- (Hosted bootstrap) `.../Groovy-Connector-Headless.tar.gz`
+App download links must go through `/account/downloads`, which calls the
+licensed download API and returns short-lived signed URLs only for active
+licenses. Do not link public pages, onboarding, or dashboard UI directly to
+GitHub Release assets.
 
 ### Build & release flow
 
@@ -878,8 +883,10 @@ App download links use GitHub Releases latest assets:
    - macOS job now imports Developer ID cert, signs app + nested native binaries, notarizes DMG, and staples ticket before upload
    - Upload target: `Charlesmendez/groovy-releases`
 
-3. **Users always download from GitHub Releases**
-   - No `public/downloads` connector binaries needed.
+3. **Users download through the Groovy account portal**
+   - Upload/register customer-facing artifacts through `/admin`.
+   - The portal serves active licensed users through signed URLs.
+   - Do not put current connector binaries in `public/downloads` or public GitHub Releases.
 
 ### macOS signing and notarization (CI automation)
 
