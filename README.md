@@ -62,6 +62,10 @@ Buy or receive a license -> sign in to the Groovy account portal -> download the
 
 Personal users do **not** need their own Vercel, Supabase, or Fly.io account just to use Groovy.
 
+In the default personal path, Groovy-operated infrastructure powers the account portal, Stripe purchase flow, license activation/checks, device management, downloads/source-snapshot entitlement, and hosted relay/API services where needed. The user controls their local connector, local files, provider API keys, provider billing account, and optional Datagran account.
+
+Groovy should not collect prompts, outputs, documents, workflows, local files, provider credentials, or business content by default.
+
 ### 2. Self-host or work from source
 
 This is the developer and enterprise path.
