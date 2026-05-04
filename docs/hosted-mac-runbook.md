@@ -13,7 +13,8 @@ This creates:
 
 Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to a private artifact
 location. `Charlesmendez/groovy-releases` is private and can be used as internal
-staging, but the bootstrap job needs a URL it can fetch server-side.
+staging, but the bootstrap job needs an artifact reference it can turn into a
+temporary URL for the target Mac to download over SSH.
 
 ---
 
@@ -116,7 +117,7 @@ node --version  # Should show v18+ or v20+
 |----------|---------|---------|
 | `HOSTED_MACS_SLACK_WEBHOOK_URL` | Slack webhook for notifications | `https://hooks.slack.com/...` |
 | `HOSTED_MAC_ADMIN_EMAILS` | Comma-separated admin emails | `admin@example.com,ops@example.com` |
-| `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` | Private signed/internal URL to headless tarball | `https://.../Groovy-Connector-Headless.tar.gz?...` |
+| `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` | Private artifact reference or internal URL to headless tarball | `supabase://groovy-downloads/connector/Groovy-Connector-Headless.tar.gz` |
 | `NEXT_PUBLIC_APP_URL` | App URL (connector API target) | `https://gogroovy.ai` |
 | `RELAY_JWT_SECRET` | Same secret as relay | `your-secret-key` |
 

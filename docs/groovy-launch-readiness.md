@@ -30,6 +30,16 @@ Commit and push the local workflow/code changes to private `groovy`; GitHub Acti
 
 Upload the current connector installers/source artifacts into private storage and register them in `/admin` so licensed users download through `/account/downloads`. Do not rely on public GitHub Release asset URLs for customer downloads.
 
+If hosted Groovy Macs are used, upload the headless connector tarball to private
+storage and set:
+
+```text
+HOSTED_MAC_BOOTSTRAP_TARBALL_URL=supabase://groovy-downloads/connector/Groovy-Connector-Headless.tar.gz
+```
+
+The bootstrap route signs that storage reference at runtime before the target
+Mac downloads it.
+
 ### Where to go
 
 GitHub > `Charlesmendez/groovy` > Actions.

@@ -129,4 +129,4 @@ Public `groovy-public`:
 - Do not use it as the license or payment system.
 - Paid users should receive current connector installers through the Groovy account portal/CLI download entitlement.
 - Store production customer-facing artifacts in private storage and serve them through short-lived signed URLs from the portal.
-- Hosted Mac bootstrap must use `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` pointing to an internal/private artifact URL, not a public GitHub Release URL.
+- Hosted Mac bootstrap must use `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` pointing to an internal/private artifact reference, preferably `supabase://groovy-downloads/connector/Groovy-Connector-Headless.tar.gz`, not a public GitHub Release URL.

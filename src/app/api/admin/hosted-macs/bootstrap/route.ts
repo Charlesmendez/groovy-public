@@ -7,6 +7,7 @@ export const dynamic = "force-dynamic";
 import { Client } from "ssh2";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
+import { signedArtifactUrl } from "@/lib/downloads/artifacts";
 import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
 
@@ -92,12 +93,14 @@ export async function POST(req: Request) {
     const relayUrl =
       body.relay_url || process.env.GROOVY_RELAY_URL || "wss://groovy-relay.fly.dev";
     const appUrl = body.app_url || process.env.NEXT_PUBLIC_APP_URL || "";
-    const tarballUrl = process.env.HOSTED_MAC_BOOTSTRAP_TARBALL_URL || "";
+    const tarballRef = process.env.HOSTED_MAC_BOOTSTRAP_TARBALL_URL || "";
+    const tarballUrl = await signedArtifactUrl(supabase, tarballRef, 60 * 60);
     if (!tarballUrl) {
       logWarn("hosted_mac.bootstrap.missing_tarball_url", {
         request_id: body.request_id,
         user_id: user.id,
         has_app_url: !!appUrl,
+        tarball_ref_set: !!tarballRef,
       });
       return NextResponse.json({ error: "Missing tarball URL" }, { status: 400 });
     }

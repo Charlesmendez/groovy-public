@@ -820,16 +820,19 @@ Outputs:
 Upload `apps/connector/dist/Groovy-Connector-Headless.tar.gz` to a private
 artifact location. `Charlesmendez/groovy-releases` is private and can be used
 as internal staging, but hosted Mac bootstrap needs a URL that the server-side
-bootstrap job can fetch.
+bootstrap route can turn into a temporary URL for the target Mac to fetch over
+SSH.
 
 Example URL (set in env):
 ```
-HOSTED_MAC_BOOTSTRAP_TARBALL_URL=<private signed/internal headless tarball URL>
+HOSTED_MAC_BOOTSTRAP_TARBALL_URL=supabase://groovy-downloads/connector/Groovy-Connector-Headless.tar.gz
 ```
 
-### Bootstrap (server-side)
+### Bootstrap
 Admin page: `/admin/hosted-macs` → **Run bootstrap**
-- Uses SSH to download the tarball and start a LaunchDaemon.
+- Uses SSH to make the target Mac download the tarball and start a LaunchDaemon.
+- If `HOSTED_MAC_BOOTSTRAP_TARBALL_URL` is a `supabase://bucket/path`
+  reference, the app creates a short-lived signed URL at bootstrap time.
 - Requires env:
   - `HOSTED_MAC_BOOTSTRAP_TARBALL_URL`
   - `NEXT_PUBLIC_APP_URL`
