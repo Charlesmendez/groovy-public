@@ -48,13 +48,37 @@ Customers bring their own provider credentials, such as:
 
 Token-consumption billing is only available for authorized enterprise resellers or partners whose license explicitly enables it.
 
-## Easy Setup With An AI Agent
+## Two Setup Paths
+
+Groovy has two different setup paths. They should not be confused.
+
+### 1. Use Groovy
+
+This is the normal path for personal users and most hosted users.
+
+```text
+Buy or receive a license -> sign in to the Groovy account portal -> download the current connector/source snapshot -> install the connector -> add provider keys -> run Groovy
+```
+
+Personal users do **not** need their own Vercel, Supabase, or Fly.io account just to use Groovy.
+
+### 2. Self-host or work from source
+
+This is the developer and enterprise path.
+
+```text
+Get licensed source access -> choose infrastructure -> configure Vercel/Supabase/Fly or replacements -> set secrets -> deploy -> connect provider and Datagran accounts
+```
+
+This path is where the AI-agent CLI setup guide is useful.
+
+## AI-Agent CLI Setup For Developers And Enterprise
 
 Groovy includes a paste-ready setup guide for AI coding agents:
 
 - [docs/ai-agent-setup.md](docs/ai-agent-setup.md)
 
-Copy that document into Claude Code, Codex, Cursor, or another AI coding agent. The agent will ask the user for the missing values and then run the Groovy CLI to configure the setup step by step.
+Copy that document into Claude Code, Codex, Cursor, or another AI coding agent when setting up a developer checkout, self-hosted deployment, or enterprise environment. The agent will ask the operator for missing values and then run the Groovy CLI to configure the setup step by step.
 
 The fastest way to get the setup prompt is:
 
@@ -68,7 +92,7 @@ From this repo, you can also run:
 npm run groovy -- setup prompt
 ```
 
-The setup flow covers local development, Vercel, Supabase, Fly.io, Stripe, provider API keys, Groovy license activation, Datagran Memory, Datagran-backed Data Integrations, and connector startup. Browser steps are only needed for account creation, OAuth, or provider dashboards that do not support full CLI setup.
+The AI-agent setup flow covers local development, Vercel, Supabase, Fly.io, Stripe, provider API keys, Groovy license activation, Datagran Memory, Datagran-backed Data Integrations, and connector startup. Browser steps are only needed for account creation, OAuth, or provider dashboards that do not support full CLI setup.
 
 ## What Users Actually Install
 
@@ -83,13 +107,13 @@ Groovy has three user-facing pieces:
 3. **Groovy Connector**
    The connector is the local runtime installed on the user's machine. It lets Groovy work with the user's browser, files, WhatsApp, terminal, and local tools with the user's permission.
 
-Typical personal flow:
+Typical personal or hosted-user flow:
 
 ```text
 Buy Groovy Personal -> create/login to account -> open account portal -> download current version/source -> install connector -> connect provider keys -> run Groovy
 ```
 
-Typical enterprise flow:
+Typical developer or enterprise self-host flow:
 
 ```text
 Contact sales -> sign agreement -> receive enterprise account/license -> download source snapshot and deployment packages -> self-host or install connector -> connect provider and Datagran accounts
