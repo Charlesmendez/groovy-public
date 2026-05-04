@@ -17,7 +17,7 @@
     "@picovoice/porcupine-node": "^4.0.2",
     "@picovoice/pvrecorder-node": "^1.2.8",
     "@roamhq/wrtc": "^0.9.1",
-    "better-sqlite3": "^12.2.0",
+    "better-sqlite3": "^12.9.0",
     "keytar": "^7.9.0",
     "node-pty": "^1.1.0",
     "puppeteer": "^23.11.1",
