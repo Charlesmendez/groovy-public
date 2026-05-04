@@ -89,6 +89,7 @@ function cleanSourceTree(root) {
     ".github/workflows/deploy-relay-fly.yml",
     ".github/workflows/release-connector.yml",
     ".github/workflows/publish-public-mirror.yml",
+    "AGENTS.md",
   ].forEach((relativePath) => removeIfExists(root, relativePath));
 }
 
