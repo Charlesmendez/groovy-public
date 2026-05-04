@@ -1,12 +1,16 @@
 # Groovy AI-Agent CLI Setup Instructions
 
-Copy this whole document into the user's AI coding agent. The agent should ask the user for the missing values, write secrets only to local env files or platform secret stores, and run the setup through CLI commands wherever possible.
+Copy this whole document into the user's AI coding agent for developer source setup, enterprise self-hosting, or advanced local setup.
+
+This is **not** the normal personal-user install path. Personal users usually buy or receive a license, sign in to the Groovy account portal, download the connector/current source snapshot they are entitled to, install the connector, and add their own provider keys. They do not need their own Vercel, Supabase, or Fly.io account just to use Groovy.
+
+For developer and enterprise setup, the agent should ask the user for the missing values, write secrets only to local env files or platform secret stores, and run the setup through CLI commands wherever possible.
 
 Do not paste secrets into source files, Markdown files, screenshots, logs, GitHub issues, or pull requests.
 
 ## Mission
 
-Set up Groovy for the user using the command line.
+Set up a Groovy developer checkout, self-hosted deployment, or enterprise environment using the command line.
 
 Groovy uses this reference stack:
 
@@ -18,7 +22,7 @@ Groovy uses this reference stack:
 - Customer-owned model provider keys for OpenAI, Anthropic, Google, Azure OpenAI, AWS Bedrock, Groq, Mistral, xAI, or other supported providers.
 - The Groovy CLI package, `@gogroovy/cli`, for setup checks and non-browser setup steps.
 
-The user may replace Groovy's reference infrastructure with their own Vercel, Supabase, Fly, Stripe, Datagran, and provider accounts.
+Developer and enterprise users may replace Groovy's reference infrastructure with their own Vercel, Supabase, Fly, Stripe, Datagran, and provider accounts.
 
 ## Rules For The AI Agent
 
@@ -35,18 +39,19 @@ The user may replace Groovy's reference infrastructure with their own Vercel, Su
 
 Ask the user these questions and wait for answers:
 
-1. Is this a personal, developer, or enterprise setup?
-2. Is the setup local only, Vercel/Supabase/Fly, Docker, or another deployment target?
-3. What app URL should Groovy use? Default local value: `http://localhost:3000`.
-4. What relay URL should Groovy use? Default production value: `wss://groovy-relay.fly.dev`.
-5. What Supabase project should be used?
-6. Which model providers should be configured?
-7. Does the user want Groovy Memory enabled?
-8. Does the user have a Datagran account and `DATAGRAN_API_KEY`?
-9. Which Datagran data integrations should be enabled?
-10. Are integrations OAuth, existing Datagran connection IDs, Web Pixel, or a mix?
-11. Does the user have a Groovy license key?
-12. Should the local connector be installed, run from source, or skipped?
+1. Is this normal personal use, developer source setup, or enterprise self-hosting?
+2. If this is normal personal use, does the user only need account portal, connector, license activation, and provider-key setup?
+3. If this is developer or enterprise setup, is the target local only, Vercel/Supabase/Fly, Docker, or another deployment target?
+4. What app URL should Groovy use? Default local value: `http://localhost:3000`.
+5. What relay URL should Groovy use? Default production value: `wss://groovy-relay.fly.dev`.
+6. For self-hosting, what Supabase project or replacement backend should be used?
+7. Which model providers should be configured?
+8. Does the user want Groovy Memory enabled?
+9. Does the user have a Datagran account and `DATAGRAN_API_KEY`?
+10. Which Datagran data integrations should be enabled?
+11. Are integrations OAuth, existing Datagran connection IDs, Web Pixel, or a mix?
+12. Does the user have a Groovy license key?
+13. Should the local connector be installed, run from source, or skipped?
 
 ## Install Or Run The CLI
 
