@@ -1,0 +1,45 @@
+name: Publish Groovy CLI to npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "CLI version to publish, for example 0.2.1. Leave blank to use package.json."
+        required: false
+        type: string
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/groovy-cli
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node and npm auth
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Apply manual version
+        if: ${{ inputs.version != '' }}
+        run: npm version "${{ inputs.version }}" --no-git-tag-version
+
+      - name: Validate CLI package
+        run: |
+          node --check bin/groovy.mjs
+          npm pack --dry-run
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

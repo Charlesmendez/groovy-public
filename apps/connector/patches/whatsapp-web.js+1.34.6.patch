@@ -1,0 +1,639 @@
+diff --git a/node_modules/whatsapp-web.js/src/Client.js b/node_modules/whatsapp-web.js/src/Client.js
+index f68491f..9baed0b 100644
+--- a/node_modules/whatsapp-web.js/src/Client.js
++++ b/node_modules/whatsapp-web.js/src/Client.js
+@@ -88,6 +88,8 @@ class Client extends EventEmitter {
+ 
+         this.currentIndexHtml = null;
+         this.lastLoggedOut = false;
++        this._authEventListenersInjected = false; // Prevent duplicate event listeners
++        this._readyEmitted = false; // Prevent duplicate READY events
+ 
+         Util.setFfmpegPath(this.options.ffmpegPath);
+     }
+@@ -139,6 +141,25 @@ class Client extends EventEmitter {
+             return state == 'UNPAIRED' || state == 'UNPAIRED_IDLE';
+         });
+ 
++        // Detect logout: if we were previously ready but now need authentication
++        const isUnpairedState = (s) => s === 'UNPAIRED' || s === 'UNPAIRED_IDLE';
++        if (needAuthentication && this._readyEmitted) {
++            // Debounce: WhatsApp can briefly appear unpaired during reload
++            await new Promise(r => setTimeout(r, 1500));
++
++            const stateNow = await this.pupPage.evaluate(() => window.AuthStore?.AppState?.state);
++
++            if (!isUnpairedState(stateNow)) {
++                // False alarm: session restored after brief unpaired state
++                return;
++            }
++
++            this.emit(Events.DISCONNECTED, 'LOGOUT');
++            this._readyEmitted = false;
++            this._authEventListenersInjected = false;
++            this.lastLoggedOut = false;
++        }
++
+         if (needAuthentication) {
+             const { failed, failureEventPayload, restart } = await this.authStrategy.onAuthenticationNeeded();
+ 
+@@ -212,66 +233,77 @@ class Client extends EventEmitter {
+         });
+ 
+         await exposeFunctionIfAbsent(this.pupPage, 'onAppStateHasSyncedEvent', async () => {
+-            const authEventPayload = await this.authStrategy.getAuthEventPayload();
+-            /**
+-                 * Emitted when authentication is successful
+-                 * @event Client#authenticated
+-                 */
+-            this.emit(Events.AUTHENTICATED, authEventPayload);
+-
+-            const injected = await this.pupPage.evaluate(async () => {
+-                return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
+-            });
+-
+-            if (!injected) {
+-                if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
+-                    const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
+-                    const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
+-            
+-                    await webCache.persist(this.currentIndexHtml, version);
+-                }
+-
+-                if (isCometOrAbove) {
+-                    await this.pupPage.evaluate(ExposeStore);
+-                } else {
+-                    // make sure all modules are ready before injection
+-                    // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
+-                    await new Promise(r => setTimeout(r, 2000)); 
+-                    await this.pupPage.evaluate(ExposeLegacyStore);
+-                }
+-                let start = Date.now();
+-                let res = false;
+-                while(start > (Date.now() - 30000)){
+-                    // Check window.Store Injection
+-                    res = await this.pupPage.evaluate('window.Store != undefined');
+-                    if(res){break;}
+-                    await new Promise(r => setTimeout(r, 200));
+-                }
+-                if(!res){
+-                    throw 'ready timeout';
+-                }
++            // Guard against multiple READY events (e.g., if hasSynced toggles true->false->true)
++            if (this._readyEmitted) return;
+ 
++            try {
++                const authEventPayload = await this.authStrategy.getAuthEventPayload();
+                 /**
+-                     * Current connection information
+-                     * @type {ClientInfo}
++                     * Emitted when authentication is successful
++                     * @event Client#authenticated
+                      */
+-                this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+-                    return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+-                }));
++                this.emit(Events.AUTHENTICATED, authEventPayload);
++
++                const injected = await this.pupPage.evaluate(async () => {
++                    return typeof window.Store !== 'undefined' &&
++                        typeof window.WWebJS !== 'undefined' &&
++                        !!window.Store.Chat &&
++                        !!window.Store.Msg &&
++                        !!window.Store.AppState &&
++                        !!window.Store.Conn &&
++                        !!window.Store.User;
++                });
++
++                if (!injected) {
++                    if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
++                        const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
++                        const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
++                        await webCache.persist(this.currentIndexHtml, version);
++                    }
++
++                    if (isCometOrAbove) {
++                        await this.pupPage.evaluate(ExposeStore);
++                    } else {
++                        await new Promise(r => setTimeout(r, 2000));
++                        await this.pupPage.evaluate(ExposeLegacyStore);
++                    }
++                    let start = Date.now();
++                    let res = false;
++                    while(start > (Date.now() - 30000)){
++                        res = await this.pupPage.evaluate(() => typeof window.Store !== 'undefined'
++                            && !!window.Store.Chat
++                            && !!window.Store.Msg
++                            && !!window.Store.AppState
++                            && !!window.Store.Conn
++                            && !!window.Store.User);
++                        if(res){break;}
++                        await new Promise(r => setTimeout(r, 200));
++                    }
++                    if(!res){
++                        throw new Error('Store injection timeout - ready event cannot be emitted');
++                    }
+ 
+-                this.interface = new InterfaceController(this);
++                    /**
++                         * Current connection information
++                         * @type {ClientInfo}
++                         */
++                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
++                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
++                    }));
+ 
+-                //Load util functions (serializers, helper functions)
+-                await this.pupPage.evaluate(LoadUtils);
++                    this.interface = new InterfaceController(this);
++                    await this.pupPage.evaluate(LoadUtils);
++                    await this.attachEventListeners();
++                }
+ 
+-                await this.attachEventListeners();
++                this._readyEmitted = true;
++                this.emit(Events.READY);
++                this.authStrategy.afterAuthReady();
++            } catch (err) {
++                const error = err instanceof Error ? err : new Error(String(err));
++                console.error('[wwebjs] Error in onAppStateHasSyncedEvent:', error.message);
++                this.emit(Events.AUTHENTICATION_FAILURE, error.message);
+             }
+-            /**
+-                 * Emitted when the client has initialized and is ready to receive messages.
+-                 * @event Client#ready
+-                 */
+-            this.emit(Events.READY);
+-            this.authStrategy.afterAuthReady();
+         });
+         let lastPercent = null;
+         await exposeFunctionIfAbsent(this.pupPage, 'onOfflineProgressUpdateEvent', async (percent) => {
+@@ -284,16 +316,38 @@ class Client extends EventEmitter {
+             this.lastLoggedOut = true;
+             await this.pupPage.waitForNavigation({waitUntil: 'load', timeout: 5000}).catch((_) => _);
+         });
+-        await this.pupPage.evaluate(() => {
+-            window.AuthStore.AppState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
+-            window.AuthStore.AppState.on('change:hasSynced', () => { window.onAppStateHasSyncedEvent(); });
+-            window.AuthStore.Cmd.on('offline_progress_update', () => {
+-                window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress()); 
+-            });
+-            window.AuthStore.Cmd.on('logout', async () => {
+-                await window.onLogoutEvent();
++        // Check if page lost its listener registration state (e.g., after page navigation/reload)
++        const pageHasListeners = await this.pupPage.evaluate(() => !!window._authListenersRegistered);
++        if (!pageHasListeners) {
++            this._authEventListenersInjected = false;
++        }
++
++        if (!this._authEventListenersInjected) {
++            await this.pupPage.evaluate(() => {
++                if (window._authListenersRegistered) return;
++                window._authListenersRegistered = true;
++
++                const appState = window.AuthStore.AppState;
++                if (appState.hasSynced) {
++                    window.onAppStateHasSyncedEvent();
++                }
++
++                appState.on('change:hasSynced', (_AppState, hasSynced) => {
++                    if (hasSynced) {
++                        window.onAppStateHasSyncedEvent();
++                    }
++                });
++
++                appState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
++                window.AuthStore.Cmd.on('offline_progress_update', () => {
++                    window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress());
++                });
++                window.AuthStore.Cmd.on('logout', async () => {
++                    await window.onLogoutEvent();
++                });
+             });
+-        });
++            this._authEventListenersInjected = true;
++        }
+     }
+ 
+     /**
+@@ -748,96 +802,116 @@ class Client extends EventEmitter {
+         });
+ 
+         await this.pupPage.evaluate(() => {
+-            window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
+-            window.Store.Msg.on('change:type', (msg) => { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); });
+-            window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
+-            window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); });
+-            window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
+-            window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
+-            window.Store.AppState.on('change:state', (_AppState, state) => { window.onAppStateChangedEvent(state); });
+-            window.Store.Conn.on('change:battery', (state) => { window.onBatteryStateChangedEvent(state); });
+-            const callCollection = (window.Store && window.Store.Call) || (window.Store && window.Store.WAWebCallCollection);
+-            if (callCollection && typeof callCollection.on === 'function') {
+-                callCollection.on('add', (call) => { window.onIncomingCall(call); });
++            if (!window.Store || !window.WWebJS) {
++                console.warn('[wwebjs] Store or WWebJS not available, skipping event listener registration');
++                return;
+             }
+-            window.Store.Chat.on('remove', async (chat) => { window.onRemoveChatEvent(await window.WWebJS.getChatModel(chat)); });
+-            window.Store.Chat.on('change:archive', async (chat, currState, prevState) => { window.onArchiveChatEvent(await window.WWebJS.getChatModel(chat), currState, prevState); });
+-            window.Store.Msg.on('add', (msg) => { 
+-                if (msg.isNewMsg) {
+-                    if(msg.type === 'ciphertext') {
+-                        // defer message event until ciphertext is resolved (type changed)
+-                        msg.once('change:type', (_msg) => window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)));
+-                        window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
+-                    } else {
+-                        window.onAddMessageEvent(window.WWebJS.getMessageModel(msg)); 
+-                    }
+-                }
+-            });
+-            window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
+-
+-            if (window.compareWwebVersions(window.Debug.VERSION, '>=', '2.3000.1014111620')) {
+-                const module = window.Store.AddonReactionTable;
+-                const ogMethod = module.bulkUpsert;
+-                module.bulkUpsert = ((...args) => {
+-                    window.onReaction(args[0].map(reaction => {
+-                        const msgKey = reaction.id;
+-                        const parentMsgKey = reaction.reactionParentKey;
+-                        const timestamp = reaction.reactionTimestamp / 1000;
+-                        const sender = reaction.author ?? reaction.from;
+-                        const senderUserJid = sender._serialized;
+-
+-                        return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
+-                    }));
+ 
+-                    return ogMethod(...args);
+-                }).bind(module);
++            if (window.Store.Msg) {
++                window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
++                window.Store.Msg.on('change:type', (msg) => { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); });
++                window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
++                window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); });
++                window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
++                window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
++                window.Store.Msg.on('add', (msg) => {
++                    if (msg.isNewMsg) {
++                        if(msg.type === 'ciphertext') {
++                            msg.once('change:type', (_msg) => window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)));
++                            window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
++                        } else {
++                            window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
++                        }
++                    }
++                });
++            }
+ 
+-                const pollVoteModule = window.Store.AddonPollVoteTable;
+-                const ogPollVoteMethod = pollVoteModule.bulkUpsert;
++            if (window.Store.AppState) {
++                window.Store.AppState.on('change:state', (_AppState, state) => { window.onAppStateChangedEvent(state); });
++            }
+ 
+-                pollVoteModule.bulkUpsert = (async (...args) => {
+-                    const votes = await Promise.all(args[0].map(async vote => {
+-                        const msgKey = vote.id;
+-                        const parentMsgKey = vote.pollUpdateParentKey;
+-                        const timestamp = vote.t / 1000;
+-                        const sender = vote.author ?? vote.from;
+-                        const senderUserJid = sender._serialized;
++            if (window.Store.Conn) {
++                window.Store.Conn.on('change:battery', (state) => { window.onBatteryStateChangedEvent(state); });
++            }
+ 
+-                        let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
+-                        if (!parentMessage) {
+-                            const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
+-                            parentMessage = fetched?.messages?.[0] || null;
+-                        }
++            if (window.Store.Call) {
++                window.Store.Call.on('add', (call) => { window.onIncomingCall(call); });
++            }
+ 
+-                        return {
+-                            ...vote,
+-                            msgKey,
+-                            sender,
+-                            parentMsgKey,
+-                            senderUserJid,
+-                            timestamp,
+-                            parentMessage
+-                        };
+-                    }));
++            if (window.Store.Chat) {
++                window.Store.Chat.on('remove', async (chat) => { window.onRemoveChatEvent(await window.WWebJS.getChatModel(chat)); });
++                window.Store.Chat.on('change:archive', async (chat, currState, prevState) => { window.onArchiveChatEvent(await window.WWebJS.getChatModel(chat), currState, prevState); });
++                window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
++            }
+ 
+-                    window.onPollVoteEvent(votes);
++            if (window.compareWwebVersions(window.Debug.VERSION, '>=', '2.3000.1014111620')) {
++                if (window.Store.AddonReactionTable) {
++                    const module = window.Store.AddonReactionTable;
++                    const ogMethod = module.bulkUpsert;
++                    module.bulkUpsert = ((...args) => {
++                        window.onReaction(args[0].map(reaction => {
++                            const msgKey = reaction.id;
++                            const parentMsgKey = reaction.reactionParentKey;
++                            const timestamp = reaction.reactionTimestamp / 1000;
++                            const sender = reaction.author ?? reaction.from;
++                            const senderUserJid = sender._serialized;
++
++                            return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
++                        }));
++
++                        return ogMethod(...args);
++                    }).bind(module);
++                }
+ 
+-                    return ogPollVoteMethod.apply(pollVoteModule, args);
+-                }).bind(pollVoteModule);
++                if (window.Store.AddonPollVoteTable) {
++                    const pollVoteModule = window.Store.AddonPollVoteTable;
++                    const ogPollVoteMethod = pollVoteModule.bulkUpsert;
++
++                    pollVoteModule.bulkUpsert = (async (...args) => {
++                        const votes = await Promise.all(args[0].map(async vote => {
++                            const msgKey = vote.id;
++                            const parentMsgKey = vote.pollUpdateParentKey;
++                            const timestamp = vote.t / 1000;
++                            const sender = vote.author ?? vote.from;
++                            const senderUserJid = sender._serialized;
++
++                            let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
++                            if (!parentMessage) {
++                                const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
++                                parentMessage = fetched?.messages?.[0] || null;
++                            }
++
++                            return {
++                                ...vote,
++                                msgKey,
++                                sender,
++                                parentMsgKey,
++                                senderUserJid,
++                                timestamp,
++                                parentMessage
++                            };
++                        }));
++
++                        window.onPollVoteEvent(votes);
++                        return ogPollVoteMethod.apply(pollVoteModule, args);
++                    }).bind(pollVoteModule);
++                }
+             } else {
+-                const module = window.Store.createOrUpdateReactionsModule;
+-                const ogMethod = module.createOrUpdateReactions;
+-                module.createOrUpdateReactions = ((...args) => {
+-                    window.onReaction(args[0].map(reaction => {
+-                        const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
+-                        const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
+-                        const timestamp = reaction.timestamp / 1000;
+-
+-                        return {...reaction, msgKey, parentMsgKey, timestamp };
+-                    }));
+-
+-                    return ogMethod(...args);
+-                }).bind(module);
++                if (window.Store.createOrUpdateReactionsModule) {
++                    const module = window.Store.createOrUpdateReactionsModule;
++                    const ogMethod = module.createOrUpdateReactions;
++                    module.createOrUpdateReactions = ((...args) => {
++                        window.onReaction(args[0].map(reaction => {
++                            const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
++                            const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
++                            const timestamp = reaction.timestamp / 1000;
++
++                            return {...reaction, msgKey, parentMsgKey, timestamp };
++                        }));
++
++                        return ogMethod(...args);
++                    }).bind(module);
++                }
+             }
+         });
+     }    
+diff --git a/node_modules/whatsapp-web.js/src/structures/GroupChat.js b/node_modules/whatsapp-web.js/src/structures/GroupChat.js
+index 95a58c3..451dc63 100644
+--- a/node_modules/whatsapp-web.js/src/structures/GroupChat.js
++++ b/node_modules/whatsapp-web.js/src/structures/GroupChat.js
+@@ -274,7 +274,7 @@ class GroupChat extends Chat {
+     async setDescription(description) {
+         const success = await this.client.pupPage.evaluate(async (chatId, description) => {
+             const chatWid = window.Store.WidFactory.createWid(chatId);
+-            let descId = window.Store.GroupMetadata.get(chatWid).descId;
++            let descId = window.Store.GroupMetadata?.get(chatWid)?.descId;
+             let newId = await window.Store.MsgKey.newId();
+             try {
+                 await window.Store.GroupUtils.setGroupDescription(chatWid, description, newId, descId);
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Store.js b/node_modules/whatsapp-web.js/src/util/Injected/Store.js
+index 8f56a56..8ab8569 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Store.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Store.js
+@@ -44,9 +44,25 @@ exports.ExposeStore = () => {
+     };
+ 
+     window.Store = Object.assign({}, window.require('WAWebCollections'));
+-    window.Store.AppState = window.require('WAWebSocketModel').Socket;
++
++    // AppState - critical for connection state events (disconnected, etc.)
++    // May have moved or changed structure in WWeb 2.3000.x
++    try {
++        const socketModel = window.require('WAWebSocketModel');
++        window.Store.AppState = socketModel?.Socket ?? socketModel?.AppState ?? socketModel?.default?.Socket;
++    } catch {
++        // Module doesn't exist or structure changed
++    }
++
+     window.Store.BlockContact = window.require('WAWebBlockContactAction');
+-    window.Store.Conn = window.require('WAWebConnModel').Conn;
++
++    // Conn - for connection/battery events
++    try {
++        const connModel = window.require('WAWebConnModel');
++        window.Store.Conn = connModel?.Conn ?? connModel?.default?.Conn ?? connModel?.default;
++    } catch {
++        // Module doesn't exist or structure changed
++    }
+     window.Store.Cmd = window.require('WAWebCmd').Cmd;
+     window.Store.DownloadManager = window.require('WAWebDownloadManager').downloadManager;
+     window.Store.GroupQueryAndUpdate = window.require('WAWebGroupQueryJob').queryAndUpdateGroupMetadataById;
+@@ -209,7 +225,77 @@ exports.ExposeStore = () => {
+         ...window.require('WAWebStatusGatingUtils')
+     };
+ 
+-    if (!window.Store.Chat._find || !window.Store.Chat.findImpl) {
++    // =====================================================
++    // Fallback loading for modules that may have moved in WWeb 2.3000.x
++    // These modules might no longer be in WAWebCollections
++    // =====================================================
++
++    // GroupMetadata moved to WAWebGroupMetadataCollection
++    if (!window.Store.GroupMetadata) {
++        try {
++            const mod = window.require('WAWebGroupMetadataCollection');
++            window.Store.GroupMetadata = mod?.GroupMetadata ?? mod?.default;
++        } catch {
++            // Module doesn't exist in older versions
++        }
++    }
++
++    // Msg collection - critical for message events
++    if (!window.Store.Msg) {
++        try {
++            const mod = window.require('WAWebMsgCollection');
++            window.Store.Msg = mod?.Msg ?? mod?.MsgCollection ?? mod?.default;
++        } catch {
++            try {
++                const mod = window.require('WAWebMessageCollection');
++                window.Store.Msg = mod?.Msg ?? mod?.default;
++            } catch {
++                // Module doesn't exist
++            }
++        }
++    }
++
++    // Chat collection - critical for chat events
++    if (!window.Store.Chat) {
++        try {
++            const mod = window.require('WAWebChatCollection');
++            window.Store.Chat = mod?.Chat ?? mod?.ChatCollection ?? mod?.default;
++        } catch {
++            // Module doesn't exist
++        }
++    }
++
++    // Call collection - for incoming call events
++    if (!window.Store.Call) {
++        try {
++            const mod = window.require('WAWebCallCollection');
++            window.Store.Call = mod?.Call ?? mod?.CallCollection ?? mod?.default;
++        } catch {
++            // Module doesn't exist
++        }
++    }
++
++    // AppState fallback - critical for disconnected event
++    if (!window.Store.AppState) {
++        try {
++            const mod = window.require('WAWebAppStateModel') ?? window.require('WAWebSocketAppState');
++            window.Store.AppState = mod?.Socket ?? mod?.AppState ?? mod?.default;
++        } catch {
++            // Module doesn't exist
++        }
++    }
++
++    // Conn fallback - for battery/connection events
++    if (!window.Store.Conn) {
++        try {
++            const mod = window.require('WAWebConnCollection');
++            window.Store.Conn = mod?.Conn ?? mod?.default;
++        } catch {
++            // Module doesn't exist
++        }
++    }
++
++    if (window.Store.Chat && (!window.Store.Chat._find || !window.Store.Chat.findImpl)) {
+         window.Store.Chat._find = e => {
+             const target = window.Store.Chat.get(e);
+             return target ? Promise.resolve(target) : Promise.resolve({
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+index 4fdc45d..009f545 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+@@ -13,10 +13,14 @@ exports.LoadUtils = () => {
+         const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+         if (chat) {
+             window.Store.WAWebStreamModel.Stream.markAvailable();
+-            await window.Store.SendSeen.sendSeen({
+-                chat: chat,
+-                threadId: undefined
+-            });         
++            try {
++                await window.Store.SendSeen.sendSeen({
++                    chat: chat,
++                    threadId: undefined
++                });
++            } catch {
++                await window.Store.SendSeen.sendSeen(chat);
++            }
+             window.Store.WAWebStreamModel.Stream.markUnavailable();
+             return true;
+         }
+@@ -215,7 +219,7 @@ exports.LoadUtils = () => {
+ 
+         let listOptions = {};
+         if (options.list) {
+-            if (window.Store.Conn.platform === 'smba' || window.Store.Conn.platform === 'smbi') {
++            if (window.Store.Conn?.platform === 'smba' || window.Store.Conn?.platform === 'smbi') {
+                 throw '[LT01] Whatsapp business can\'t send this yet';
+             }
+             listOptions = {
+@@ -646,7 +650,7 @@ exports.LoadUtils = () => {
+             model.isGroup = true;
+             const chatWid = window.Store.WidFactory.createWid(chat.id._serialized);
+             const groupMetadata = window.Store.GroupMetadata || window.Store.WAWebGroupMetadataCollection;
+-            await groupMetadata.update(chatWid);
++            await groupMetadata?.update(chatWid);
+             chat.groupMetadata.participants._models
+                 .filter(x => x.id?._serialized?.endsWith('@lid'))
+                 .forEach(x => x.contact?.phoneNumber && (x.id = x.contact.phoneNumber));
+@@ -656,7 +660,7 @@ exports.LoadUtils = () => {
+ 
+         if (chat.newsletterMetadata) {
+             const newsletterMetadata = window.Store.NewsletterMetadataCollection || window.Store.WAWebNewsletterMetadataCollection;
+-            await newsletterMetadata.update(chat.id);
++            await newsletterMetadata?.update(chat.id);
+             model.channelMetadata = chat.newsletterMetadata.serialize();
+             model.channelMetadata.createdAtTs = chat.newsletterMetadata.creationTime;
+         }
+diff --git a/node_modules/whatsapp-web.js/src/util/Puppeteer.js b/node_modules/whatsapp-web.js/src/util/Puppeteer.js
+index fcb8448..e97d90f 100644
+--- a/node_modules/whatsapp-web.js/src/util/Puppeteer.js
++++ b/node_modules/whatsapp-web.js/src/util/Puppeteer.js
+@@ -1,23 +1,35 @@
+ /**
+- * Expose a function to the page if it does not exist
+- *
+- * NOTE:
+- * Rewrite it to 'upsertFunction' after updating Puppeteer to 20.6 or higher
+- * using page.removeExposedFunction
+- * https://pptr.dev/api/puppeteer.page.removeexposedfunction
++ * Expose a function to the page, handling the case where the CDP binding
++ * already exists (e.g., after page navigation where the page context is
++ * cleared but the CDP binding persists).
+  *
+  * @param {object} page - Puppeteer Page instance
+  * @param {string} name
+  * @param {Function} fn
+  */
+ async function exposeFunctionIfAbsent(page, name, fn) {
+-    const exist = await page.evaluate((name) => {
++    const existsInPage = await page.evaluate((name) => {
+         return !!window[name];
+     }, name);
+-    if (exist) {
++
++    if (existsInPage) {
+         return;
+     }
+-    await page.exposeFunction(name, fn);
++
++    try {
++        await page.exposeFunction(name, fn);
++    } catch (err) {
++        if (err.message && err.message.includes('already exists')) {
++            try {
++                await page.removeExposedFunction(name);
++                await page.exposeFunction(name, fn);
++            } catch (_) {
++                // Older Puppeteer versions may keep the existing binding usable.
++            }
++        } else {
++            throw err;
++        }
++    }
+ }
+ 
+ module.exports = {exposeFunctionIfAbsent};

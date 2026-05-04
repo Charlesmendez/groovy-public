@@ -46,6 +46,8 @@ Customers bring their own provider credentials, such as:
 - Mistral
 - Datagran
 
+Datagran is required when you want Groovy Memory or Datagran-backed Data Integrations. Developers and enterprise customers who enable those features need a Datagran account and a `DATAGRAN_API_KEY`. If Datagran is not configured, memory and Datagran integrations should be disabled or treated as unavailable.
+
 Token-consumption billing is only available for authorized enterprise resellers or partners whose license explicitly enables it.
 
 ## Two Setup Paths
@@ -208,6 +210,26 @@ Run the local connector:
 npm run connector -- --relay ws://localhost:8787 --pair YOUR-CODE
 ```
 
+Run the Groovy CLI from source:
+
+```bash
+npm run groovy -- doctor --json --env-file .env.local
+```
+
+The publishable npm CLI package lives in:
+
+```text
+packages/groovy-cli
+```
+
+The intended public package name is:
+
+```text
+@gogroovy/cli
+```
+
+Publishing requires an npm account with access to the `@gogroovy` npm organization and a GitHub secret named `NPM_TOKEN`. The workflow is [Publish Groovy CLI to npm](.github/workflows/publish-cli-npm.yml).
+
 ## Required Infrastructure
 
 Groovy currently uses:
@@ -216,11 +238,15 @@ Groovy currently uses:
 - Supabase for auth, database, RLS, and private storage
 - Fly.io for the websocket relay
 - Stripe for personal yearly subscriptions
+- Datagran for Groovy Memory and Datagran-backed Data Integrations when those features are enabled
+- npm for publishing the Groovy CLI package
 - GitHub Releases for connector release artifacts
 
 See:
 
 - [docs/reference-infrastructure.md](docs/reference-infrastructure.md)
+- [docs/groovy-launch-readiness.md](docs/groovy-launch-readiness.md)
+- [docs/github-source-workflow.md](docs/github-source-workflow.md)
 - [docs/ai-agent-setup.md](docs/ai-agent-setup.md)
 - [docs/groovy-licensing-distribution-plan.md](docs/groovy-licensing-distribution-plan.md)
 

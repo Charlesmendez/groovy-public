@@ -1,0 +1,92 @@
+name: Connector Regression Gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/connector/**"
+      - "src/lib/connector/**"
+      - "src/components/onboarding/WelcomeOnboarding.tsx"
+      - "src/components/command-center/SettingsModal.tsx"
+      - ".github/workflows/connector-regression.yml"
+      - ".github/workflows/release-connector.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/connector/**"
+      - "src/lib/connector/**"
+      - "src/components/onboarding/WelcomeOnboarding.tsx"
+      - "src/components/command-center/SettingsModal.tsx"
+      - ".github/workflows/connector-regression.yml"
+      - ".github/workflows/release-connector.yml"
+
+jobs:
+  web-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install web deps
+        run: npm ci
+
+      - name: Lint connector-facing web files
+        run: npm run lint -- src/lib/connector src/components/onboarding/WelcomeOnboarding.tsx src/components/command-center/SettingsModal.tsx
+
+  build-macos-headless:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/connector/package-lock.json
+
+      - name: Install connector deps
+        run: |
+          cd apps/connector
+          npm ci
+
+      - name: Build connector headless bundle
+        run: |
+          cd apps/connector
+          npm run build:headless
+
+  build-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/connector/package-lock.json
+
+      - name: Install connector deps
+        run: |
+          cd apps/connector
+          npm ci
+
+      - name: Build Windows connector artifacts
+        run: |
+          cd apps/connector
+          npm run build:windows
+
+      - name: Verify installer artifacts
+        shell: pwsh
+        run: |
+          if (!(Test-Path "apps/connector/dist/Groovy-Connector-windows.exe")) { throw "Missing windows .exe artifact" }
+          if (!(Test-Path "apps/connector/dist/Groovy-Connector-windows.zip")) { throw "Missing windows .zip artifact" }

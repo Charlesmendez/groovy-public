@@ -1,7 +1,7 @@
 # Groovy Licensing and Distribution Implementation Plan
 
-Status: planning reference  
-Date: 2026-05-02  
+Status: planning reference
+Date: 2026-05-02
 Scope: move Groovy from a closed usage-billed app to a source-available licensed product with personal, enterprise, and authorized reseller paths.
 
 ## Final Decisions
@@ -682,13 +682,13 @@ Migration:
 
 ## Guiding Principle
 
-Public source for trust.  
-Paid license for use.  
-Personal users buy online.  
-Enterprise customers contact sales.  
-Token billing is disabled by default.  
-Customers bring their own provider keys.  
-Datagran Memory and Data Integrations are explicit setup surfaces.  
-Reseller billing requires written authorization.  
-No sudden shutdown.  
+Public source for trust.
+Paid license for use.
+Personal users buy online.
+Enterprise customers contact sales.
+Token billing is disabled by default.
+Customers bring their own provider keys.
+Datagran Memory and Data Integrations are explicit setup surfaces.
+Reseller billing requires written authorization.
+No sudden shutdown.
 No invasive tracking.

@@ -1,0 +1,21 @@
+{
+  "name": "@gogroovy/cli",
+  "version": "0.2.1",
+  "description": "Groovy CLI for license activation, setup checks, provider keys, Datagran memory, integrations, and connector commands.",
+  "type": "module",
+  "bin": {
+    "groovy": "bin/groovy.mjs"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "SEE LICENSE IN LICENSE.md"
+}
