@@ -48,6 +48,22 @@ Customers bring their own provider credentials, such as:
 
 Token-consumption billing is only available for authorized enterprise resellers or partners whose license explicitly enables it.
 
+## Easy Setup With An AI Agent
+
+Groovy includes a paste-ready setup guide for AI coding agents:
+
+- [docs/ai-agent-setup.md](docs/ai-agent-setup.md)
+
+Copy that document into Claude Code, Codex, Cursor, or another AI coding agent. The agent will ask the user for the missing values and then run the Groovy CLI to configure the setup step by step.
+
+The fastest way to get the setup prompt is:
+
+```bash
+npx @gogroovy/cli setup prompt
+```
+
+The setup flow covers local development, Vercel, Supabase, Fly.io, Stripe, provider API keys, Groovy license activation, Datagran Memory, Datagran-backed Data Integrations, and connector startup. Browser steps are only needed for account creation, OAuth, or provider dashboards that do not support full CLI setup.
+
 ## Repository Roles
 
 The private production repository is for:
