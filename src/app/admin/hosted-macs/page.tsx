@@ -116,14 +116,14 @@ export default function HostedMacAdminPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-zinc-950 text-white flex items-center justify-center">
+      <div className="app-scroll-page bg-zinc-950 text-white flex items-center justify-center">
         <Loader2 className="w-6 h-6 animate-spin text-cyan-400" />
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-white p-6">
+    <div className="app-scroll-page bg-zinc-950 text-white p-6">
       <div className="max-w-5xl mx-auto">
         <div className="flex items-center gap-3 mb-6">
           <div className="w-10 h-10 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center">

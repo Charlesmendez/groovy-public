@@ -645,7 +645,7 @@ export function SettingsModal({
   const [billingStatus, setBillingStatus] = useState<BillingStatus | null>(null);
   const [billingLoading, setBillingLoading] = useState(false);
   const [billingActionLoading, setBillingActionLoading] = useState<
-    null | "setup_card" | "topup" | "save_limit" | "save_auto_topup" | "reconcile_addons"
+    null | "setup_card" | "topup" | "save_limit" | "save_auto_topup" | "reconcile_addons" | "personal_portal"
   >(null);
   const [topupSuccess, setTopupSuccess] = useState(false);
   const [billingError, setBillingError] = useState<string | null>(null);
@@ -863,6 +863,22 @@ export function SettingsModal({
         e instanceof Error ? e.message : "Failed to resync addon billing"
       );
     } finally {
+      setBillingActionLoading(null);
+    }
+  };
+
+  const openPersonalBillingPortal = async () => {
+    setBillingActionLoading("personal_portal");
+    setBillingError(null);
+    try {
+      const res = await fetch("/api/licenses/personal/billing-portal", { method: "POST" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || typeof json?.url !== "string") {
+        throw new Error(typeof json?.error === "string" ? json.error : "Failed to open Stripe billing portal");
+      }
+      window.location.href = json.url;
+    } catch (e) {
+      setBillingError(e instanceof Error ? e.message : "Failed to open Stripe billing portal");
       setBillingActionLoading(null);
     }
   };
@@ -3209,6 +3225,43 @@ export function SettingsModal({
               {billingStatus.pricing.addonsExplanation}
             </p>
           ) : null}
+        </div>
+
+        <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/10 p-4">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex gap-3">
+              <div className="mt-0.5 flex h-9 w-9 flex-none items-center justify-center rounded-lg bg-cyan-400/15 text-cyan-200">
+                <CreditCard className="h-4 w-4" />
+              </div>
+              <div>
+                <div className="text-sm font-medium text-white">Personal license and Stripe billing</div>
+                <p className="mt-1 text-xs leading-relaxed text-zinc-400">
+                  Buy Groovy Personal, see your license key, manage activated devices, open invoices,
+                  or cancel renewal from the account portal. Company use still goes through enterprise sales.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={openPersonalBillingPortal}
+                disabled={billingActionLoading === "personal_portal"}
+                className="inline-flex items-center gap-2 rounded-lg bg-cyan-400 px-3 py-2 text-xs font-semibold text-zinc-950 hover:bg-cyan-300"
+              >
+                {billingActionLoading === "personal_portal" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : null}
+                Manage or cancel
+              </button>
+              <a
+                href="/account/license"
+                className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs font-semibold text-zinc-200 hover:bg-white/10"
+              >
+                Account portal
+                <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+            </div>
+          </div>
         </div>
 
         {billingLoading ? (

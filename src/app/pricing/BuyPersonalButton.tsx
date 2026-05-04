@@ -1,13 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowRight } from "lucide-react";
 
 export function BuyPersonalButton() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const autoStartedRef = useRef(false);
 
-  async function startCheckout() {
+  const startCheckout = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -16,7 +17,7 @@ export function BuyPersonalButton() {
         headers: { "Content-Type": "application/json" },
       });
       if (res.status === 401) {
-        window.location.href = "/login";
+        window.location.href = `/login?next=${encodeURIComponent("/pricing?checkout=personal")}`;
         return;
       }
       const json = await res.json().catch(() => null);
@@ -28,7 +29,15 @@ export function BuyPersonalButton() {
       setError(err instanceof Error ? err.message : "Unable to start checkout");
       setLoading(false);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    if (autoStartedRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("checkout") !== "personal") return;
+    autoStartedRef.current = true;
+    startCheckout();
+  }, [startCheckout]);
 
   return (
     <div className="mt-7">

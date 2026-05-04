@@ -5,7 +5,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { 
   Sparkles, Key, Check, Eye, EyeOff, ExternalLink, Loader2, ArrowRight,
   CheckCircle2, Download, WifiOff, MessageSquare, Send,
-  RefreshCw, AlertCircle, Building2, Smartphone, Server, Terminal, Copy
+  RefreshCw, AlertCircle, Building2, Smartphone, Server, Terminal, Copy,
+  CreditCard, ShieldCheck
 } from "lucide-react";
 import { BillingCardSetupForm } from "@/components/billing/BillingCardSetupForm";
 import { useConnectorInstallGuide } from "@/lib/connector/installGuide";
@@ -23,8 +24,22 @@ import { detectConnectorPlatformFromNavigator, type ConnectorClientPlatform } fr
 
 type Provider = "anthropic" | "openai" | "google";
 type LlmKeyMode = "groovy" | "user";
-type OnboardingStep = "welcome" | "connector" | "whatsapp" | "telegram" | "api_keys" | "chat_agent" | "claude_cli" | "done";
+type OnboardingStep = "welcome" | "license" | "connector" | "whatsapp" | "telegram" | "api_keys" | "chat_agent" | "claude_cli" | "done";
 type PendingPaidAction = "groovy_mac" | "kapso";
+
+type OnboardingLicenseStatus = {
+  licensed?: boolean;
+  status?: string;
+  canManageLicense?: boolean;
+  license?: {
+    payload?: {
+      license_type?: string;
+      status?: string;
+      valid_until?: string;
+      max_devices?: number | null;
+    };
+  };
+};
 
 const PROVIDER_INFO: Record<Provider, { name: string; placeholder: string; helpUrl: string; description: string }> = {
   anthropic: {
@@ -49,13 +64,25 @@ const PROVIDER_INFO: Record<Provider, { name: string; placeholder: string; helpU
 
 // Step configuration for progress
 const STEPS: { id: OnboardingStep; label: string; number: number }[] = [
-  { id: "connector", label: "Connector", number: 1 },
-  { id: "whatsapp", label: "WhatsApp", number: 2 },
-  { id: "telegram", label: "Telegram", number: 3 },
-  { id: "api_keys", label: "API Keys", number: 4 },
-  { id: "chat_agent", label: "Quick Win", number: 5 },
-  { id: "claude_cli", label: "Claude CLI", number: 6 },
+  { id: "license", label: "License", number: 1 },
+  { id: "connector", label: "Connector", number: 2 },
+  { id: "whatsapp", label: "WhatsApp", number: 3 },
+  { id: "telegram", label: "Telegram", number: 4 },
+  { id: "api_keys", label: "API Keys", number: 5 },
+  { id: "chat_agent", label: "Quick Win", number: 6 },
+  { id: "claude_cli", label: "Claude CLI", number: 7 },
 ];
+
+function formatOnboardingDate(value?: string | null) {
+  if (!value) return "Not available";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "Not available";
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
 
 type WelcomeOnboardingProps = {
   initialStep?: OnboardingStep;
@@ -122,6 +149,10 @@ export function WelcomeOnboarding({
   const [showKeys, setShowKeys] = useState<Partial<Record<Provider, boolean>>>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [licenseStatus, setLicenseStatus] = useState<OnboardingLicenseStatus | null>(null);
+  const [licenseLoading, setLicenseLoading] = useState(false);
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(!!initialStep);
   const [refreshingConnector, setRefreshingConnector] = useState(false);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
@@ -142,7 +173,7 @@ export function WelcomeOnboarding({
       try {
         const res = await fetch("/api/user-preferences");
         const json = await res.json().catch(() => ({}));
-        const validSteps: OnboardingStep[] = ["welcome", "connector", "whatsapp", "telegram", "api_keys", "chat_agent", "claude_cli", "done"];
+        const validSteps: OnboardingStep[] = ["welcome", "license", "connector", "whatsapp", "telegram", "api_keys", "chat_agent", "claude_cli", "done"];
         if (json.onboardingStep && validSteps.includes(json.onboardingStep)) {
           setStep(json.onboardingStep);
           // Restore saved data
@@ -278,6 +309,46 @@ export function WelcomeOnboarding({
     }
   }, []);
 
+  const refreshLicenseStatus = useCallback(async () => {
+    setLicenseLoading(true);
+    setCheckoutError(null);
+    try {
+      const res = await fetch("/api/licenses/status", { cache: "no-store" });
+      const json = (await res.json().catch(() => ({}))) as OnboardingLicenseStatus & { error?: string };
+      if (!res.ok) {
+        throw new Error(typeof json?.error === "string" ? json.error : "Failed to load license");
+      }
+      setLicenseStatus(json);
+    } catch (e) {
+      setCheckoutError(e instanceof Error ? e.message : "Failed to load license");
+    } finally {
+      setLicenseLoading(false);
+    }
+  }, []);
+
+  const startPersonalCheckout = useCallback(async () => {
+    setCheckoutLoading(true);
+    setCheckoutError(null);
+    try {
+      const res = await fetch("/api/licenses/personal/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (res.status === 401) {
+        window.location.href = `/login?next=${encodeURIComponent("/dashboard")}`;
+        return;
+      }
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || typeof json?.url !== "string") {
+        throw new Error(typeof json?.error === "string" ? json.error : "Unable to start checkout");
+      }
+      window.location.href = json.url;
+    } catch (e) {
+      setCheckoutError(e instanceof Error ? e.message : "Unable to start checkout");
+      setCheckoutLoading(false);
+    }
+  }, []);
+
   const startCardSetup = useCallback(async (): Promise<boolean> => {
     setError(null);
     try {
@@ -332,13 +403,18 @@ export function WelcomeOnboarding({
     refreshBillingStatus().catch(() => {});
   }, [loaded, refreshBillingStatus]);
 
+  useEffect(() => {
+    if (!loaded) return;
+    refreshLicenseStatus().catch(() => {});
+  }, [loaded, refreshLicenseStatus]);
+
   // Auto-advance from welcome
   useEffect(() => {
     if (!loaded) return;
     if (step === "welcome") {
       const t = setTimeout(() => {
-        setStep("connector");
-        saveStep("connector");
+        setStep("license");
+        saveStep("license");
       }, 2500);
       return () => clearTimeout(t);
     }
@@ -556,6 +632,8 @@ export function WelcomeOnboarding({
 
   const hasAtLeastOneKey = Object.values(keys).some((v) => v && v.trim());
   const currentStepIndex = STEPS.findIndex((s) => s.id === step);
+  const activeLicensePayload = licenseStatus?.license?.payload;
+  const hasActiveLicense = Boolean(licenseStatus?.licensed && activeLicensePayload);
 
   if (!loaded) {
     return (
@@ -574,15 +652,15 @@ export function WelcomeOnboarding({
 
       {/* Progress - show after welcome */}
       {step !== "welcome" && step !== "done" && (
-        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-20">
-          <div className="flex items-center gap-1">
+        <div className="fixed left-0 right-0 top-6 z-20 flex justify-center px-4">
+          <div className="flex max-w-full items-center gap-1 overflow-x-auto pb-1">
             {STEPS.map((s, i) => {
               const isActive = s.id === step;
               const isCompleted = i < currentStepIndex;
               return (
                 <div key={s.id} className="flex items-center">
                   {i > 0 && (
-                    <div className={`w-12 h-0.5 transition-colors ${isCompleted ? "bg-cyan-500" : "bg-zinc-700"}`} />
+                    <div className={`h-0.5 w-7 transition-colors sm:w-12 ${isCompleted ? "bg-cyan-500" : "bg-zinc-700"}`} />
                   )}
                   <div className="flex flex-col items-center gap-1">
                     <div
@@ -646,7 +724,194 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 1: Connector */}
+          {/* Step 1: License */}
+          {step === "license" && (
+            <motion.div
+              key="license"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="relative z-10"
+            >
+              <div className="text-center mb-8">
+                <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-cyan-500/20 bg-cyan-500/10">
+                  <CreditCard className="h-7 w-7 text-cyan-300" />
+                </div>
+                <h2 className="text-2xl font-semibold text-white mb-2">
+                  Step 1: Activate your Groovy license
+                </h2>
+                <p className="mx-auto max-w-xl text-sm leading-relaxed text-zinc-500">
+                  Groovy is source-available and paid for use. Personal users buy yearly online;
+                  companies use an enterprise license. Token-consumption billing stays off by default.
+                </p>
+              </div>
+
+              {checkoutError ? (
+                <div className="mb-4 rounded-xl border border-red-500/20 bg-red-500/10 p-3 text-sm text-red-200">
+                  {checkoutError}
+                </div>
+              ) : null}
+
+              {hasActiveLicense ? (
+                <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <div className="flex items-center gap-2 text-sm font-medium text-emerald-100">
+                        <ShieldCheck className="h-4 w-4" />
+                        License found
+                      </div>
+                      <div className="mt-2 text-lg font-semibold text-white">
+                        {activeLicensePayload?.license_type === "personal"
+                          ? "Groovy Personal"
+                          : activeLicensePayload?.license_type || "Groovy License"}
+                      </div>
+                      <p className="mt-1 text-sm text-emerald-100/80">
+                        Status: {activeLicensePayload?.status || licenseStatus?.status || "active"} · Valid until{" "}
+                        {formatOnboardingDate(activeLicensePayload?.valid_until)}
+                      </p>
+                      <p className="mt-2 text-xs text-emerald-100/70">
+                        You can manage your license key, devices, downloads, source snapshots, and Stripe
+                        billing from the account portal.
+                      </p>
+                    </div>
+                    <a
+                      href="/account/license"
+                      className="inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-400/30 px-4 py-2 text-sm font-medium text-emerald-100 hover:bg-emerald-400/10"
+                    >
+                      Open license
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => goToStep("connector")}
+                    className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-cyan-300 sm:w-auto"
+                  >
+                    Continue setup
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
+              ) : (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="rounded-2xl border border-cyan-500/25 bg-cyan-500/10 p-5">
+                    <div className="text-xs uppercase tracking-wider text-cyan-200/80">
+                      Personal
+                    </div>
+                    <h3 className="mt-2 text-xl font-semibold text-white">Groovy Personal</h3>
+                    <div className="mt-3 flex items-baseline gap-2">
+                      <span className="text-3xl font-semibold text-white">$49.99</span>
+                      <span className="text-sm text-zinc-400">per year</span>
+                    </div>
+                    <p className="mt-3 text-sm leading-relaxed text-zinc-300">
+                      For one individual using Groovy on personal, non-commercial projects.
+                    </p>
+                    <ul className="mt-4 space-y-2 text-sm text-zinc-300">
+                      {[
+                        "1 personal user",
+                        "2 activated devices",
+                        "Downloads and current source while active",
+                        "Bring your own OpenAI, Anthropic, Google, Azure, Bedrock, Groq, or Mistral keys",
+                      ].map((item) => (
+                        <li key={item} className="flex gap-2">
+                          <Check className="mt-0.5 h-4 w-4 flex-none text-cyan-300" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <button
+                      type="button"
+                      onClick={startPersonalCheckout}
+                      disabled={checkoutLoading}
+                      className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-70"
+                    >
+                      {checkoutLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                      {checkoutLoading ? "Opening Checkout..." : "Buy Personal"}
+                    </button>
+                  </div>
+
+                  <div className="rounded-2xl border border-white/10 bg-black/30 p-5">
+                    <div className="text-xs uppercase tracking-wider text-zinc-500">
+                      Company use
+                    </div>
+                    <h3 className="mt-2 text-xl font-semibold text-white">Groovy Enterprise</h3>
+                    <p className="mt-3 text-sm leading-relaxed text-zinc-400">
+                      Use this path for employers, teams, client work, revenue-generating projects,
+                      private deployments, source access terms, or reseller rights.
+                    </p>
+                    <ul className="mt-4 space-y-2 text-sm text-zinc-300">
+                      {[
+                        "Commercial license by agreement",
+                        "Self-hosting and internal modification rights",
+                        "Optional source snapshots and support",
+                        "Reseller billing only when explicitly authorized",
+                      ].map((item) => (
+                        <li key={item} className="flex gap-2">
+                          <Check className="mt-0.5 h-4 w-4 flex-none text-zinc-400" />
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <a
+                      href="/enterprise"
+                      className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-white/15 px-4 py-3 text-sm font-semibold text-white hover:bg-white/10"
+                    >
+                      Contact Sales
+                      <ExternalLink className="h-4 w-4" />
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-5 rounded-2xl border border-white/10 bg-black/30 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-white">Already paid?</div>
+                    <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                      Refresh the license status or open the account portal to see your key, devices,
+                      downloads, billing, and source snapshots.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={refreshLicenseStatus}
+                      disabled={licenseLoading}
+                      className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-200 hover:bg-white/10 disabled:opacity-60"
+                    >
+                      {licenseLoading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-4 w-4" />
+                      )}
+                      Refresh
+                    </button>
+                    <a
+                      href="/account/license"
+                      className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm text-zinc-200 hover:bg-white/10"
+                    >
+                      Account portal
+                      <ExternalLink className="h-3.5 w-3.5" />
+                    </a>
+                  </div>
+                </div>
+              </div>
+
+              {!hasActiveLicense ? (
+                <div className="mt-5 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => goToStep("connector")}
+                    className="inline-flex items-center gap-2 text-sm text-zinc-400 hover:text-white"
+                  >
+                    Set up connector now, activate later
+                    <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
+              ) : null}
+            </motion.div>
+          )}
+
+          {/* Step 2: Connector */}
           {step === "connector" && (
             <motion.div
               key="connector"
@@ -657,7 +922,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 1: Install Groovy Connector
+                  Step 2: Install Groovy Connector
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   Choose where Groovy runs tools (Browser/Files/Code)
@@ -1100,7 +1365,7 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 2: WhatsApp */}
+          {/* Step 3: WhatsApp */}
           {step === "whatsapp" && (
             <motion.div
               key="whatsapp"
@@ -1111,7 +1376,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 2: Connect WhatsApp (optional)
+                  Step 3: Connect WhatsApp (optional)
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   Choose how your team chats with Groovy
@@ -1387,7 +1652,7 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 3: Telegram */}
+          {/* Step 4: Telegram */}
           {step === "telegram" && (
             <motion.div
               key="telegram"
@@ -1398,7 +1663,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 3: Connect Telegram (optional)
+                  Step 4: Connect Telegram (optional)
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   Connect a Telegram bot to chat with Groovy and receive heartbeats
@@ -1537,7 +1802,7 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 4: API Keys */}
+          {/* Step 5: API Keys */}
           {step === "api_keys" && (
             <motion.div
               key="api_keys"
@@ -1548,7 +1813,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 4: Choose your API keys
+                  Step 5: Choose your API keys
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   You can change this anytime in settings.
@@ -1701,7 +1966,7 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 3: Create AI Chat Agent */}
+          {/* Step 6: Create AI Chat Agent */}
           {step === "chat_agent" && (
             <motion.div
               key="chat_agent"
@@ -1712,7 +1977,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 5: Create your first AI agent
+                  Step 6: Create your first AI agent
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   Quick win! Create an AI Chat agent and start chatting right away.
@@ -1779,7 +2044,7 @@ export function WelcomeOnboarding({
             </motion.div>
           )}
 
-          {/* Step 6: Claude CLI */}
+          {/* Step 7: Claude CLI */}
           {step === "claude_cli" && (
             <motion.div
               key="claude_cli"
@@ -1790,7 +2055,7 @@ export function WelcomeOnboarding({
             >
               <div className="text-center mb-8">
                 <h2 className="text-2xl font-semibold text-white mb-2">
-                  Step 6: Install Claude CLI
+                  Step 7: Install Claude CLI
                 </h2>
                 <p className="text-zinc-500 text-sm">
                   Required for Code Agent and Browser Agent to work

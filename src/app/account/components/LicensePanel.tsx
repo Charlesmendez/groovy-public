@@ -10,7 +10,29 @@ export function LicensePanel() {
   if (loading) return <LoadingState label="Loading license..." />;
   if (error) return <ErrorState error={error} />;
   if (!data?.licensed || !payload) {
-    return <p className="mt-6 text-sm text-zinc-400">No Groovy license is attached to this account yet.</p>;
+    return (
+      <div className="mt-8 rounded-lg border border-white/10 bg-white/[0.03] p-5">
+        <div className="text-sm font-medium text-white">No Groovy license is attached yet.</div>
+        <p className="mt-2 text-sm leading-relaxed text-zinc-400">
+          Buy Groovy Personal for individual, non-commercial use, or contact sales for company use,
+          source access terms, and enterprise deployment rights.
+        </p>
+        <div className="mt-4 flex flex-wrap gap-3">
+          <a
+            href="/pricing"
+            className="rounded-lg bg-cyan-400 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
+          >
+            Buy Groovy Personal
+          </a>
+          <a
+            href="/enterprise"
+            className="rounded-lg border border-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/10"
+          >
+            Contact Sales
+          </a>
+        </div>
+      </div>
+    );
   }
 
   return (

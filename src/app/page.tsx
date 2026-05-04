@@ -1550,22 +1550,32 @@ export default function LandingPage() {
             initial={{ opacity: 0, y: 20 }}
             whileInView={{ opacity: 1, y: 0 }}
             viewport={{ once: true }}
-            className="mt-6 rounded-lg border border-white/10 bg-black/25 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4"
+            className="mt-6 rounded-lg border border-white/10 bg-black/25 p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4"
           >
-            <div>
+            <div className="max-w-3xl">
               <div className="text-sm font-medium text-white">Yearly licensing, provider keys you control</div>
               <p className="text-sm text-zinc-500 mt-1">
-                Personal users buy online. Enterprise customers contact sales. Reseller
-                token billing is only available with written authorization.
+                Click Buy Personal, sign in, pay through Stripe, and your Groovy account gets a
+                license automatically. The account portal then shows your license, downloads,
+                source snapshots, devices, and billing. Onboarding reads that license and lets you
+                continue setup.
               </p>
             </div>
-            <Link
-              href="/pricing"
-              className="shrink-0 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-cyan-500 text-black text-sm font-semibold hover:bg-cyan-400 transition-colors"
-            >
-              View Plans
-              <ArrowRight className="w-4 h-4" />
-            </Link>
+            <div className="flex flex-col sm:flex-row gap-3">
+              <Link
+                href="/pricing?checkout=personal"
+                className="shrink-0 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-cyan-500 text-black text-sm font-semibold hover:bg-cyan-400 transition-colors"
+              >
+                Buy Personal
+                <ArrowRight className="w-4 h-4" />
+              </Link>
+              <Link
+                href="/enterprise"
+                className="shrink-0 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg border border-white/15 text-white text-sm font-semibold hover:bg-white/10 transition-colors"
+              >
+                Contact Sales
+              </Link>
+            </div>
           </motion.div>
         </div>
       </section>
@@ -1630,7 +1640,7 @@ export default function LandingPage() {
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <Link
-              href="/pricing"
+              href="/pricing?checkout=personal"
               className="group flex items-center gap-3 px-10 py-5 rounded-2xl bg-gradient-to-r from-cyan-500 to-cyan-600 text-black font-semibold text-xl shadow-xl shadow-cyan-500/30 hover:shadow-cyan-500/50 transition-all"
             >
               <CreditCard className="w-6 h-6" />

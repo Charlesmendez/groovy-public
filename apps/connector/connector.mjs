@@ -1238,6 +1238,12 @@ function isAutoUpdateDisabledByConfig() {
   if (process.env.GROOVY_NO_AUTO_UPDATE === "1") {
     return { disabled: true, source: "GROOVY_NO_AUTO_UPDATE=1" };
   }
+  if (process.env.GROOVY_CONNECTOR_ENABLE_PUBLIC_AUTO_UPDATE !== "1") {
+    return {
+      disabled: true,
+      source: "licensed_account_downloads_required",
+    };
+  }
   return { disabled: false, source: "" };
 }
 

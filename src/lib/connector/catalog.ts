@@ -17,8 +17,7 @@ const MAC_GUIDE: ConnectorInstallGuide = {
   platform: "macos",
   title: "macOS Download",
   ctaLabel: "Download for macOS",
-  downloadUrl:
-    "https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-macOS.dmg",
+  downloadUrl: "/account/downloads",
   downloadFileLabel: "Groovy-Connector-macOS.dmg",
   requirements: "macOS 12+ required • Apple Silicon only",
   installSteps: [
@@ -41,8 +40,7 @@ const WINDOWS_GUIDE: ConnectorInstallGuide = {
   platform: "windows",
   title: "Windows Download",
   ctaLabel: "Download for Windows",
-  downloadUrl:
-    "https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-windows.exe",
+  downloadUrl: "/account/downloads",
   downloadFileLabel: "Groovy-Connector-windows.exe",
   requirements: "Windows 10+ required • x64",
   installSteps: [

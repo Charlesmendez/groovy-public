@@ -27,6 +27,7 @@ export function BillingPanel() {
   if (error) return <ErrorState error={error} />;
 
   const payload = data?.license?.payload;
+  const isPersonal = payload?.license_type === "personal";
   return (
     <div className="mt-8 space-y-4">
       <div className="grid gap-3 sm:grid-cols-2">
@@ -35,16 +36,46 @@ export function BillingPanel() {
         <Field label="Renewal / valid until" value={formatDate(payload?.valid_until)} />
         <Field label="Token-consumption billing" value={payload?.token_consumption_billing_enabled ? "Enabled" : "Disabled"} />
       </div>
-      <button
-        type="button"
-        onClick={openPortal}
-        disabled={portalLoading || !data?.licensed || !data?.canManageLicense}
-        className="rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
-      >
-        {portalLoading ? "Opening Stripe..." : "Manage Stripe Billing"}
-      </button>
+      {!data?.licensed ? (
+        <div className="rounded-lg border border-cyan-400/20 bg-cyan-400/10 p-4">
+          <div className="text-sm font-medium text-cyan-100">Start with Groovy Personal</div>
+          <p className="mt-1 text-sm text-zinc-300">
+            Personal licenses are $49.99 per year and are managed through Stripe. Company use
+            requires an enterprise license.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            <a
+              href="/pricing"
+              className="rounded-lg bg-cyan-400 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
+            >
+              Buy Personal
+            </a>
+            <a
+              href="/enterprise"
+              className="rounded-lg border border-white/15 px-4 py-2 text-sm font-semibold text-white hover:bg-white/10"
+            >
+              Contact Sales
+            </a>
+          </div>
+        </div>
+      ) : null}
+      {isPersonal ? (
+        <button
+          type="button"
+          onClick={openPortal}
+          disabled={portalLoading || !data?.canManageLicense}
+          className="rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {portalLoading ? "Opening Stripe..." : "Manage or cancel Stripe Billing"}
+        </button>
+      ) : data?.licensed ? (
+        <p className="rounded-lg border border-white/10 bg-white/[0.03] p-4 text-sm text-zinc-400">
+          Enterprise billing is handled by your Groovy agreement. Contact sales@gogroovy.ai for
+          renewals, invoices, or contract changes.
+        </p>
+      ) : null}
       {portalError ? <p className="text-sm text-red-300">{portalError}</p> : null}
-      {!data?.canManageLicense ? <p className="text-sm text-zinc-500">Only account admins can manage billing.</p> : null}
+      {data?.licensed && !data?.canManageLicense ? <p className="text-sm text-zinc-500">Only account admins can manage billing.</p> : null}
       {data?.canManageLicense && payload?.license_type !== "personal" ? (
         <div className="flex flex-wrap gap-3">
           <a

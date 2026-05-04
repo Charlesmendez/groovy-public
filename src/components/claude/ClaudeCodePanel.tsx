@@ -727,7 +727,7 @@ security delete-generic-password -s "groovy-connector" 2>/dev/null`}
                   If you installed before Jan 2026, please reinstall the latest DMG.
                 </p>
                 <a
-                  href="https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-macOS.dmg"
+                  href="/account/downloads"
                   target="_blank"
                   rel="noreferrer"
                   className="inline-flex items-center gap-2 px-4 py-2 bg-white/10 text-white rounded-lg hover:bg-white/20 transition-colors"

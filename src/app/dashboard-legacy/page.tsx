@@ -4799,7 +4799,7 @@ done
                                   <a
                                     href={
                                       process.env.NEXT_PUBLIC_CONNECTOR_DOWNLOAD_URL ||
-                                      "https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-macOS.dmg"
+                                      "/account/downloads"
                                     }
                                     target="_blank"
                                     rel="noreferrer"
@@ -5282,7 +5282,7 @@ done
                                         <a
                                           href={
                                             process.env.NEXT_PUBLIC_CONNECTOR_DOWNLOAD_URL ||
-                                            "https://github.com/Charlesmendez/groovy-releases/releases/latest/download/Groovy-Connector-macOS.dmg"
+                                            "/account/downloads"
                                           }
                                           target="_blank"
                                           rel="noreferrer"
