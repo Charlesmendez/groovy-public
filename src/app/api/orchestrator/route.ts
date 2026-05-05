@@ -67,6 +67,7 @@ import {
   buildAssignedSkillsPromptContext,
   preflightAgentSkills,
 } from "@/lib/skills-manager/service";
+import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 
 // Keep orchestrator rounds alive for long data/browser workflows on Vercel.
 export const runtime = "nodejs";
@@ -942,7 +943,7 @@ export async function POST(req: Request) {
       .eq("user_id", user.id)
       .maybeSingle();
     if (tgConfig?.bot_token_encrypted) {
-      telegramBotToken = tgConfig.bot_token_encrypted;
+      telegramBotToken = decryptTelegramBotToken(tgConfig.bot_token_encrypted);
     }
   } catch {
     // ignore - telegram not configured
@@ -954,8 +955,7 @@ export async function POST(req: Request) {
     traceId,
     turnId: effectiveTurnId,
     billingWorkspaceId,
-    // Internal self-calls (e.g. /api/datagran/chat) must stay on the live request origin.
-    appBaseUrl: new URL(req.url).origin,
+    appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
     deviceId,
     connectorPlatform,
     obsidianVaultPath,

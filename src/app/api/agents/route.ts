@@ -375,16 +375,6 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ error: "Agent not found" }, { status: 404 });
   }
 
-  // Delete associated configs based on agent type
-  if (agent.type === "datagran") {
-    await supabase.from("datagran_agent_configs").delete().eq("agent_id", agentId);
-  } else if (agent.type === "cursor") {
-    await supabase.from("cursor_agent_configs").delete().eq("agent_id", agentId);
-  }
-
-  // Delete chat sessions (messages will cascade)
-  await supabase.from("chat_sessions").delete().eq("agent_id", agentId);
-
   try {
     await rehomeScheduledJobsForDeletedAgent({
       supabase,
@@ -392,18 +382,15 @@ export async function DELETE(req: Request) {
       deletedAgentId: agentId,
     });
   } catch (error) {
+    console.error("[agents] schedule rehome error:", error);
     return NextResponse.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to preserve scheduled jobs for this agent",
-      },
+      { error: "Failed to preserve scheduled jobs for this agent" },
       { status: 500 }
     );
   }
 
-  // Delete the agent
+  // Configs and chat sessions reference agents with ON DELETE CASCADE. Delete the
+  // parent row only after scheduled jobs have been safely rehomed.
   const { error: deleteError } = await supabase
     .from("agents")
     .delete()
@@ -411,7 +398,8 @@ export async function DELETE(req: Request) {
     .eq("user_id", user.id);
 
   if (deleteError) {
-    return NextResponse.json({ error: deleteError.message }, { status: 500 });
+    console.error("[agents] delete error:", deleteError);
+    return NextResponse.json({ error: "Failed to delete agent" }, { status: 500 });
   }
 
   return NextResponse.json({ success: true, deleted: agentId });

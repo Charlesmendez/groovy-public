@@ -1,3 +1,5 @@
+import dns from "node:dns/promises";
+import net from "node:net";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
 import type { ToolExecutionContext, ToolResult } from "@/lib/orchestrator/toolExecutor";
 import type {
@@ -213,6 +215,114 @@ function appendQueryParams(url: URL, query: Record<string, unknown>) {
   }
 }
 
+function normalizeHostname(hostname: string): string {
+  return hostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function isPrivateIpAddress(ip: string): boolean {
+  const normalized = normalizeHostname(ip);
+  const version = net.isIP(normalized);
+  if (version === 4) {
+    const parts = normalized.split(".").map((part) => Number(part));
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+      return true;
+    }
+    const [a, b] = parts;
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+
+  if (version === 6) {
+    if (
+      normalized === "::" ||
+      normalized === "::1" ||
+      normalized.startsWith("fe80:") ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      normalized.startsWith("ff") ||
+      normalized === "fd00:ec2::254"
+    ) {
+      return true;
+    }
+    const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateIpAddress(mapped[1]);
+  }
+
+  return version === 0;
+}
+
+function isBlockedHostname(hostname: string): boolean {
+  const normalized = normalizeHostname(hostname);
+  return (
+    !normalized ||
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized.endsWith(".local") ||
+    normalized.endsWith(".internal") ||
+    normalized.endsWith(".flycast") ||
+    normalized === "metadata.google.internal" ||
+    normalized === "metadata.azure.com" ||
+    normalized.split(".").length < 2
+  );
+}
+
+async function assertPublicHttpsUrl(url: URL): Promise<void> {
+  if (url.protocol !== "https:") {
+    throw new Error("Extension outbound requests require https URLs");
+  }
+
+  const hostname = normalizeHostname(url.hostname);
+  if (isBlockedHostname(hostname)) {
+    throw new Error("Extension outbound request host is not allowed");
+  }
+
+  if (net.isIP(hostname)) {
+    if (isPrivateIpAddress(hostname)) {
+      throw new Error("Extension outbound request IP is not allowed");
+    }
+    return;
+  }
+
+  let addresses: Array<{ address: string }> = [];
+  try {
+    addresses = await dns.lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw new Error("Extension outbound request host could not be resolved");
+  }
+
+  if (!addresses.length || addresses.some((item) => isPrivateIpAddress(item.address))) {
+    throw new Error("Extension outbound request resolved to a blocked address");
+  }
+}
+
+function buildRunnerExecuteUrl(endpoint: string, executePath: string): URL {
+  const base = new URL(endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
+  if (base.protocol !== "https:") {
+    throw new Error("Runner endpoint must use https");
+  }
+
+  const trimmedPath = executePath.trim() || "v1/execute";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmedPath) || trimmedPath.startsWith("//")) {
+    throw new Error("Runner execute_path must be a relative path");
+  }
+
+  const relativePath = trimmedPath.startsWith("/") ? trimmedPath.slice(1) : trimmedPath;
+  const url = new URL(relativePath, base);
+  if (url.origin !== base.origin) {
+    throw new Error("Runner execute_path cannot change hosts");
+  }
+  return url;
+}
+
 async function executeHttpAction(args: {
   tool: ExtensionRuntimeTool;
   params: Record<string, unknown>;
@@ -248,6 +358,7 @@ async function executeHttpAction(args: {
     const url = new URL(resolvedUrl);
     const resolvedQuery = asRecord(resolveTemplateValue(action.query || {}, scope));
     appendQueryParams(url, resolvedQuery);
+    await assertPublicHttpsUrl(url);
 
     const resolvedHeaders = asRecord(resolveTemplateValue(action.headers || {}, scope));
     const headers: Record<string, string> = {};
@@ -280,6 +391,7 @@ async function executeHttpAction(args: {
         headers,
         body,
         signal: controller.signal,
+        redirect: "manual",
       });
 
       const contentType = response.headers.get("content-type") || "";
@@ -481,7 +593,8 @@ async function executeRunnerAction(args: {
     }
 
     const executePath = asTrimmed(args.runner.metadata.execute_path) || "v1/execute";
-    const url = new URL(executePath, endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
+    const url = buildRunnerExecuteUrl(endpoint, executePath);
+    await assertPublicHttpsUrl(url);
     const timeoutMs = Number.isFinite(action.timeoutMs) ? Number(action.timeoutMs) : 30000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs + 2000);
@@ -491,6 +604,7 @@ async function executeRunnerAction(args: {
         method: "POST",
         headers,
         signal: controller.signal,
+        redirect: "manual",
         body: JSON.stringify({
           traceId: args.context.traceId || null,
           turnId: args.context.turnId || null,

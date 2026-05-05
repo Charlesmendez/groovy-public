@@ -778,7 +778,16 @@ export async function siteTunnelRequest({ nonce, reqPath, method, headers: reqHe
     for (const [k, v] of Object.entries(reqHeaders)) {
       if (typeof v !== "string") continue;
       const key = k.toLowerCase();
-      if (key === "host" || key === "content-length" || key === "connection") continue;
+      if (
+        key === "host" ||
+        key === "content-length" ||
+        key === "connection" ||
+        key === "authorization" ||
+        key === "cookie" ||
+        key.startsWith("x-forwarded-")
+      ) {
+        continue;
+      }
       safeHeaders[key] = v;
     }
   }
@@ -796,7 +805,7 @@ export async function siteTunnelRequest({ nonce, reqPath, method, headers: reqHe
         host: `127.0.0.1:${target.port}`,
       },
       signal: controller.signal,
-      redirect: "follow",
+      redirect: "manual",
     });
 
     clearTimeout(timeout);

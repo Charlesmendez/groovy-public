@@ -12,6 +12,7 @@ import {
 import { runHeartbeat, type HeartbeatTaskConfig } from "@/lib/heartbeat/runHeartbeat";
 import { normalizeConnectorPlatform, type ConnectorClientPlatform } from "@/lib/connector/platform";
 import { sendTelegramText } from "@/lib/telegram/client";
+import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 
 // Ensure long-running scheduled jobs don't get cut off by Edge defaults.
 export const runtime = "nodejs";
@@ -544,7 +545,7 @@ export async function POST(req: Request) {
                   ? `${hbResult.text.slice(0, 4076).trimEnd()}\n...(truncated)`
                   : hbResult.text;
               await sendTelegramText({
-                botToken: tgConfig.bot_token_encrypted,
+                botToken: decryptTelegramBotToken(tgConfig.bot_token_encrypted),
                 chatId: Number(tgChatId),
                 text: tgText,
               });
@@ -757,8 +758,7 @@ export async function POST(req: Request) {
   // silent for minutes. Some HTTP stacks/CDNs enforce idle body timeouts. To keep the connection
   // alive without changing the client contract (still JSON), we stream *whitespace* heartbeats
   // and then emit a single JSON object at the end. Leading whitespace is valid JSON.
-  // Scheduled internal self-calls should stay on the live request origin.
-  const origin = new URL(req.url).origin;
+  const origin = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
   const encoder = new TextEncoder();
   const KEEPALIVE_MS = 10_000;
   const KEEPALIVE_CHUNK = " ".repeat(1024) + "\n";
@@ -1008,4 +1008,3 @@ export async function POST(req: Request) {
     },
   });
 }
-

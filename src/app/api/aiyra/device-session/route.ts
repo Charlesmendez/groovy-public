@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
@@ -99,29 +99,23 @@ function base64UrlEncode(value: string): string {
 }
 
 function getMaterialQueryAuthSecret(): string {
-  const secret =
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET) ||
-    trimmed(process.env.RELAY_JWT_SECRET) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_BEARER) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_AUTH_BEARER);
+  const secret = trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET);
   if (!secret) {
     throw new Error("Missing material-query auth secret");
   }
   return secret;
 }
 
-function resolveManagedMaterialQueryOrigin(req: Request): string | null {
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function resolveManagedMaterialQueryOrigin(_req: Request): string | null {
   const envOrigin = normalizeOrigin(process.env.NEXT_PUBLIC_APP_URL || "");
   if (envOrigin) return envOrigin;
-
-  const headerOrigin = normalizeOrigin(req.headers.get("origin") || "");
-  if (headerOrigin) return headerOrigin;
-
-  try {
-    return normalizeOrigin(new URL(req.url).origin);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 function buildManagedMaterialQueryEndpoint(
@@ -151,7 +145,7 @@ function verifyMaterialQueryToolToken(
   const expectedSignature = createHmac("sha256", getMaterialQueryAuthSecret())
     .update(encodedPayload)
     .digest("base64url");
-  if (expectedSignature !== encodedSignature) return null;
+  if (!timingSafeStringEqual(expectedSignature, encodedSignature)) return null;
   try {
     const payload = JSON.parse(
       Buffer.from(encodedPayload, "base64url").toString("utf8")

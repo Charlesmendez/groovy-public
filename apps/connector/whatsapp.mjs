@@ -223,6 +223,89 @@ async function fetchWithSafeRedirects({ startUrl, method, timeoutMs = 8000, maxR
   return { ok: false, error: "redirect_loop", finalUrl: currentUrl };
 }
 
+async function fetchPublicUrlBuffer({ startUrl, timeoutMs = 10000, maxRedirects = 3, maxBytes = 15 * 1024 * 1024 }) {
+  let currentUrl = String(startUrl || "").trim();
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    let parsed;
+    try {
+      parsed = new URL(currentUrl);
+    } catch {
+      return { ok: false, error: "invalid_url" };
+    }
+    if (parsed.protocol !== "https:") return { ok: false, error: "url_must_be_https" };
+    try {
+      await assertPublicHostname(parsed.hostname);
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : "host_blocked" };
+    }
+
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        signal: ac.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      if (hop >= maxRedirects) return { ok: false, error: "redirect_limit_exceeded" };
+      const location = res.headers.get("location");
+      if (!location) return { ok: false, error: "redirect_missing_location" };
+      try {
+        currentUrl = new URL(location, currentUrl).toString();
+      } catch {
+        return { ok: false, error: "redirect_invalid_location" };
+      }
+      continue;
+    }
+
+    if (!res.ok) return { ok: false, error: "download_failed", status: res.status };
+    const contentLength = Number(res.headers.get("content-length") || "0");
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      return { ok: false, error: "file_too_large" };
+    }
+
+    const chunks = [];
+    let total = 0;
+    const reader = res.body?.getReader?.();
+    if (!reader) {
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > maxBytes) return { ok: false, error: "file_too_large" };
+      return {
+        ok: true,
+        buffer: Buffer.from(ab),
+        contentType: String(res.headers.get("content-type") || "").trim(),
+        finalUrl: currentUrl,
+      };
+    }
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch {}
+        return { ok: false, error: "file_too_large" };
+      }
+      chunks.push(chunk);
+    }
+
+    return {
+      ok: true,
+      buffer: Buffer.concat(chunks),
+      contentType: String(res.headers.get("content-type") || "").trim(),
+      finalUrl: currentUrl,
+    };
+  }
+  return { ok: false, error: "redirect_loop" };
+}
+
 async function executeLocalUnsubscribe({ unsubscribeUrl, unsubscribeMailto }) {
   const urlRaw = String(unsubscribeUrl || "").trim();
   const mailto = parseMailtoUnsubscribe(unsubscribeMailto);
@@ -3225,17 +3308,10 @@ export async function startWhatsAppBridge(opts = {}) {
       fallbackName = path.basename(canonicalLocalPath) || "file";
       detectedContentType = inferMediaTypeFromFilename(fallbackName);
     } else {
-      let resp = null;
-      try {
-        resp = await fetch(mediaUrl);
-      } catch {
-        resp = null;
-      }
-      if (!resp || !resp.ok) return { ok: false, error: "download_failed" };
-      detectedContentType = String(resp.headers.get("content-type") || "").trim();
-      const ab = await resp.arrayBuffer();
-      buf = Buffer.from(ab);
-      if (buf.length > 15 * 1024 * 1024) return { ok: false, error: "file_too_large" };
+      const fetched = await fetchPublicUrlBuffer({ startUrl: mediaUrl });
+      if (!fetched.ok) return { ok: false, error: fetched.error || "download_failed" };
+      detectedContentType = fetched.contentType || "";
+      buf = fetched.buffer;
       fallbackName = filenameFromUrl(mediaUrl) || "file";
     }
 

@@ -145,51 +145,28 @@ export async function activateLicenseDevice(args: {
   const activationAllowed = canActivateLicense(args.licenseRow);
   if (!activationAllowed.ok) return { ok: false, reason: activationAllowed.reason || "not_active" };
 
-  const maxDevices = asNumber(args.licenseRow.max_devices);
-  const { data: existing } = await admin
-    .from("license_devices")
-    .select("id")
-    .eq("license_id", licenseId)
-    .eq("device_hash", args.deviceHash)
-    .is("deactivated_at", null)
-    .maybeSingle();
-
-  let activationId = asString((existing as Record<string, unknown> | null)?.id);
-  if (!activationId) {
-    if (typeof maxDevices === "number" && maxDevices > 0) {
-      const { count, error: countErr } = await admin
-        .from("license_devices")
-        .select("id", { count: "exact", head: true })
-        .eq("license_id", licenseId)
-        .is("deactivated_at", null);
-      if (countErr) return { ok: false, reason: "device_count_failed" };
-      if ((count || 0) >= maxDevices) return { ok: false, reason: "device_limit_reached" };
+  const { data: activationData, error: activationError } = await admin.rpc(
+    "activate_license_device_atomic",
+    {
+      p_license_id: licenseId,
+      p_device_hash: args.deviceHash,
+      p_device_name: args.deviceName || null,
+      p_platform: args.platform || null,
+      p_app_version: args.appVersion || null,
     }
+  );
+  if (activationError) return { ok: false, reason: "device_activation_failed" };
 
-    const { data: inserted, error: insertErr } = await admin
-      .from("license_devices")
-      .insert({
-        license_id: licenseId,
-        device_hash: args.deviceHash,
-        device_name: args.deviceName || null,
-        platform: args.platform || null,
-        app_version: args.appVersion || null,
-      })
-      .select("id")
-      .single();
-    if (insertErr || !inserted) return { ok: false, reason: "device_insert_failed" };
-    activationId = String((inserted as Record<string, unknown>).id);
-  } else {
-    await admin
-      .from("license_devices")
-      .update({
-        device_name: args.deviceName || null,
-        platform: args.platform || null,
-        app_version: args.appVersion || null,
-        last_seen_at: new Date().toISOString(),
-      })
-      .eq("id", activationId);
+  const activationResult =
+    activationData && typeof activationData === "object" && !Array.isArray(activationData)
+      ? (activationData as Record<string, unknown>)
+      : null;
+  if (activationResult?.ok !== true) {
+    return { ok: false, reason: asString(activationResult?.reason) || "device_activation_failed" };
   }
+
+  const activationId = asString(activationResult.activation_id);
+  if (!activationId) return { ok: false, reason: "device_activation_failed" };
 
   const licenseType = normalizeLicenseType(args.licenseRow.license_type) || "personal";
   const status = normalizeLicenseStatus(args.licenseRow.status) || "active";

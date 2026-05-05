@@ -43,6 +43,28 @@ function execCommand(conn: Client, command: string) {
   });
 }
 
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function validHostedMacValue(value: unknown, maxLength: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  if (text.length > maxLength || /[\u0000-\u001f\u007f]/.test(text)) {
+    throw new Error("Invalid hosted Mac bootstrap value");
+  }
+  return text;
+}
+
 type Body = {
   request_id?: string;
   enable_whatsapp?: boolean;
@@ -90,9 +112,11 @@ export async function POST(req: Request) {
       ? decryptLlmApiKey(assignment.ssh_password_enc)
       : null;
 
-    const relayUrl =
-      body.relay_url || process.env.GROOVY_RELAY_URL || "wss://groovy-relay.fly.dev";
-    const appUrl = body.app_url || process.env.NEXT_PUBLIC_APP_URL || "";
+    const relayUrl = process.env.GROOVY_RELAY_URL || "wss://groovy-relay.fly.dev";
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "";
+    const pairingCode = validHostedMacValue(body.pairing_code, 128);
+    const requestId = validHostedMacValue(body.request_id, 128);
+    const sharedRoot = validHostedMacValue(body.shared_root, 512);
     const tarballRef = process.env.HOSTED_MAC_BOOTSTRAP_TARBALL_URL || "";
     const tarballUrl = await signedArtifactUrl(supabase, tarballRef, 60 * 60);
     if (!tarballUrl) {
@@ -136,21 +160,8 @@ export async function POST(req: Request) {
 
     const installDir = "$HOME/.groovy/connector-headless";
     const plistPath = "/Library/LaunchDaemons/ai.gogroovy.connector.plist";
-    const enableWhatsapp = body.enable_whatsapp === true ? "--whatsapp" : "";
-
-    const command = `
-set -e
-mkdir -p ${installDir}
-cd ${installDir}
-curl -fsSL "${tarballUrl}" -o connector.tgz
-tar -xzf connector.tgz
-NODE_BIN="$(command -v node || true)"
-if [ -z "$NODE_BIN" ]; then
-  echo "node not found" >&2
-  exit 1
-fi
-sudo tee ${plistPath} >/dev/null <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
+    const enableWhatsapp = body.enable_whatsapp === true ? " --whatsapp" : "";
+    const plistXml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -160,20 +171,20 @@ sudo tee ${plistPath} >/dev/null <<PLIST
   <array>
     <string>/bin/sh</string>
     <string>-lc</string>
-    <string>exec "$NODE_BIN" "${installDir}/connector.mjs" --relay "${relayUrl}" ${enableWhatsapp}</string>
+    <string>exec "$(command -v node)" "${installDir}/connector.mjs" --relay "${xmlEscape(relayUrl)}"${enableWhatsapp}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>GROOVY_APP_URL</key>
-    <string>${appUrl}</string>
+    <string>${xmlEscape(appUrl)}</string>
     <key>GROOVY_PAIRING_CODE</key>
-    <string>${body.pairing_code || ""}</string>
+    <string>${xmlEscape(pairingCode)}</string>
     <key>GROOVY_HOSTED_MAC_REQUEST_ID</key>
-    <string>${body.request_id || ""}</string>
+    <string>${xmlEscape(requestId)}</string>
     <key>GROOVY_HOSTED_TARBALL_URL</key>
-    <string>${tarballUrl}</string>
+    <string>${xmlEscape(tarballUrl)}</string>
     <key>GROOVY_SHARED_ROOT</key>
-    <string>${body.shared_root || ""}</string>
+    <string>${xmlEscape(sharedRoot)}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -185,7 +196,21 @@ sudo tee ${plistPath} >/dev/null <<PLIST
   <string>/var/log/groovy-connector.log</string>
 </dict>
 </plist>
-PLIST
+`;
+    const plistB64 = Buffer.from(plistXml, "utf8").toString("base64");
+
+    const command = `
+set -e
+mkdir -p ${installDir}
+cd ${installDir}
+curl -fsSL ${shQuote(tarballUrl)} -o connector.tgz
+tar -xzf connector.tgz
+NODE_BIN="$(command -v node || true)"
+if [ -z "$NODE_BIN" ]; then
+  echo "node not found" >&2
+  exit 1
+fi
+printf %s ${shQuote(plistB64)} | base64 -d | sudo tee ${shQuote(plistPath)} >/dev/null
 sudo launchctl unload ${plistPath} 2>/dev/null || true
 sudo launchctl load ${plistPath}
 `;

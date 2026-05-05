@@ -203,26 +203,14 @@ function base64UrlEncode(value: string): string {
 }
 
 function getMaterialQueryAuthSecret(): string | null {
-  const secret =
-    asTrimmedString(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET) ||
-    asTrimmedString(process.env.RELAY_JWT_SECRET) ||
-    asTrimmedString(process.env.AIYRA_MATERIAL_QUERY_BEARER) ||
-    asTrimmedString(process.env.AIYRA_MATERIAL_QUERY_AUTH_BEARER);
+  const secret = asTrimmedString(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET);
   return secret || null;
 }
 
-function resolveManagedMaterialQueryOrigin(req: Request): string | null {
+function resolveManagedMaterialQueryOrigin(_req: Request): string | null {
   const envOrigin = normalizeOrigin(process.env.NEXT_PUBLIC_APP_URL || "");
   if (envOrigin) return envOrigin;
-
-  const headerOrigin = normalizeOrigin(req.headers.get("origin") || "");
-  if (headerOrigin) return headerOrigin;
-
-  try {
-    return normalizeOrigin(new URL(req.url).origin);
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 function buildManagedMaterialQueryEndpoint(

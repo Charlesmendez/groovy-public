@@ -135,6 +135,35 @@ function isIncomingMessage(value: unknown): value is IncomingMessage {
   return okRole && typeof content === "string";
 }
 
+function sanitizeDatagranEndpoint(endpoint: string): string | null {
+  const trimmed = endpoint.trim();
+  if (!trimmed.startsWith("/api/")) return null;
+  if (trimmed.startsWith("//") || trimmed.includes("://")) return null;
+  return trimmed;
+}
+
+function sanitizeDatagranHeaders(headers?: Record<string, string>): Record<string, string> {
+  const safe: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(headers || {})) {
+    const key = rawKey.trim();
+    const lower = key.toLowerCase();
+    if (!key) continue;
+    if (
+      lower === "x-api-key" ||
+      lower === "authorization" ||
+      lower === "host" ||
+      lower === "connection" ||
+      lower === "content-length" ||
+      lower.startsWith("proxy-") ||
+      lower.startsWith("sec-")
+    ) {
+      continue;
+    }
+    safe[key] = String(rawValue);
+  }
+  return safe;
+}
+
 // Execute Datagran API call server-side
 async function executeDatagranApiCall(
   apiKey: string,
@@ -146,10 +175,14 @@ async function executeDatagranApiCall(
   provider?: string
 ): Promise<{ success: boolean; data?: unknown; error?: string; status?: number; needsReauth?: boolean }> {
   try {
-    const url = new URL(endpoint, "https://www.datagran.io");
+    const safeEndpoint = sanitizeDatagranEndpoint(endpoint);
+    if (!safeEndpoint) {
+      return { success: false, error: "Invalid Datagran API endpoint", status: 400 };
+    }
+    const url = new URL(safeEndpoint, "https://www.datagran.io");
     
     // For web_pixel provider, inject site_id instead of connection_id for pixel endpoints
-    if (provider === "web_pixel" && endpoint.includes("/api/pixel/")) {
+    if (provider === "web_pixel" && safeEndpoint.includes("/api/pixel/")) {
       if (!url.searchParams.has("site_id")) {
         url.searchParams.set("site_id", connectionId);
       }
@@ -161,7 +194,7 @@ async function executeDatagranApiCall(
     const fetchHeaders: Record<string, string> = {
       "x-api-key": apiKey,
       "Content-Type": "application/json",
-      ...headers,
+      ...sanitizeDatagranHeaders(headers),
     };
 
     // Timeout individual Datagran/Firecrawl API calls so a stalled upstream doesn't hang
@@ -174,6 +207,7 @@ async function executeDatagranApiCall(
       method: method.toUpperCase(),
       headers: fetchHeaders,
       signal: ac.signal,
+      redirect: "error",
     };
 
     if (body && method.toUpperCase() !== "GET") {
@@ -581,6 +615,7 @@ export async function POST(req: Request) {
     .from("agents")
     .select("id, name, type, flag_key")
     .eq("id", agentId)
+    .eq("user_id", user.id)
     .single();
 
   if (agentError || !agent) {
@@ -594,7 +629,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const cookie = req.headers.get("cookie") || "";
+  const cookie = verified || verifiedInternal ? "" : req.headers.get("cookie") || "";
   const resolved = await resolveKeys(user.id, supabase, cookie);
   const keyMode = resolved.keyModes.anthropic || resolved.globalMode;
 
@@ -603,6 +638,7 @@ export async function POST(req: Request) {
     .from("datagran_agent_configs")
     .select("provider, connection_id, datagran_api_key_enc")
     .eq("agent_id", agentId)
+    .eq("user_id", user.id)
     .single();
 
   if (cfgError || !config) {
@@ -652,6 +688,16 @@ export async function POST(req: Request) {
     );
   }
 
+  const { data: sessionRow } = await supabase
+    .from("chat_sessions")
+    .select("id")
+    .eq("id", sessionId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (!sessionRow) {
+    return NextResponse.json({ error: "Session not found" }, { status: 404 });
+  }
+
   const usageChargeType = usageChargeTypeForKeyMode(keyMode);
   if (billingWorkspaceId) {
     const preflight = await preflightGroovyUsage({
@@ -682,7 +728,8 @@ export async function POST(req: Request) {
     const { count } = await supabase
       .from("chat_messages")
       .select("id", { count: "exact", head: true })
-      .eq("session_id", sessionId);
+      .eq("session_id", sessionId)
+      .eq("user_id", user.id);
 
     await supabase.from("chat_messages").insert({
       user_id: user.id,
@@ -725,7 +772,8 @@ export async function POST(req: Request) {
     await supabase
       .from("chat_sessions")
       .update(updateData)
-      .eq("id", sessionId);
+      .eq("id", sessionId)
+      .eq("user_id", user.id);
   }
 
   // Create Anthropic client
@@ -1232,7 +1280,7 @@ export async function POST(req: Request) {
               console.log("[datagran-chat] Authorization required, generating link token...");
               // Generate a fresh link token for re-auth
               try {
-                const origin = req.headers.get("origin") || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+                const origin = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
                 const providerNorm = String(config.provider || "").trim().toLowerCase();
                 const scopes = providerNorm === "gmail" ? GMAIL_REQUIRED_SCOPES : undefined;
                 const linkTokenRes = await fetch("https://www.datagran.io/api/link/token", {

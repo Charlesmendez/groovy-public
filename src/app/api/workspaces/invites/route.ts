@@ -3,8 +3,8 @@ import { randomUUID } from "crypto";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 
-function safeOrigin(req: Request) {
-  const o = req.headers.get("origin") || process.env.NEXT_PUBLIC_APP_URL || "";
+function safeOrigin() {
+  const o = process.env.NEXT_PUBLIC_APP_URL || "";
   return String(o || "").replace(/\/+$/, "");
 }
 
@@ -146,7 +146,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: error?.message || "Failed to create invite" }, { status: 500 });
     }
 
-    const origin = safeOrigin(req);
+    const origin = safeOrigin();
     const inviteUrl = origin ? `${origin}/invite/${invite.token}` : `/invite/${invite.token}`;
 
     let emailSent = false;

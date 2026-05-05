@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { sendTelegramText, sendTelegramDocument, sendTelegramPhoto } from "@/lib/telegram/client";
+import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,7 +37,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "No Telegram bot configured" }, { status: 404 });
   }
 
-  const botToken = botConfig.bot_token_encrypted;
+  const botToken = decryptTelegramBotToken(botConfig.bot_token_encrypted);
   const results: Array<{ type: string; ok: boolean; error?: string }> = [];
 
   for (const item of media) {

@@ -2596,8 +2596,7 @@ export async function POST(req: Request) {
     branchCurrentTurnCount: runtimeScope?.branchTurnCount ?? null,
     branchActiveCount: runtimeScope?.activeBranchCount ?? null,
     turnId: incomingTraceId || undefined,
-    // Internal self-calls must use the current request origin, not a stale public URL.
-    appBaseUrl: new URL(req.url).origin,
+    appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
     deviceId: verified.deviceId,
     connectorPlatform,
     obsidianVaultPath,

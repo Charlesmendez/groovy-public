@@ -1,4 +1,4 @@
-import { createHmac } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 
 const INTERNAL_AUTH_MAX_AGE_MS = 60_000;
 const INTERNAL_USER_ID_HEADER = "x-groovy-internal-user-id";
@@ -14,8 +14,14 @@ function getInternalAuthSecret(): string {
 
 function signInternalScope(scope: string, userId: string, ts: string): string {
   return createHmac("sha256", getInternalAuthSecret())
-    .update(`${scope}:${userId}:${ts}`)
+    .update(JSON.stringify({ scope, userId, ts }))
     .digest("base64url");
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 export function buildInternalRouteAuthHeaders(args: {
@@ -51,7 +57,7 @@ export function verifyInternalRouteAuth(
   if (Math.abs(Date.now() - tsMs) > INTERNAL_AUTH_MAX_AGE_MS) return null;
 
   const expectedSig = signInternalScope(normalizedScope, userId, ts);
-  if (expectedSig !== providedSig) return null;
+  if (!timingSafeStringEqual(expectedSig, providedSig)) return null;
 
   return { userId };
 }

@@ -66,10 +66,12 @@ function getHostOrigin(req: Request): string | null {
 }
 
 export function resolveAppBaseUrl(req: Request): string | null {
+  const envOrigin = parseOrigin(process.env.NEXT_PUBLIC_APP_URL || "")?.origin ?? null;
+  if (envOrigin) return envOrigin;
+
   const requestOrigin = getRequestOrigin(req);
   const forwardedOrigin = getForwardedOrigin(req);
   const hostOrigin = getHostOrigin(req);
-  const envOrigin = parseOrigin(process.env.NEXT_PUBLIC_APP_URL || "")?.origin ?? null;
   const hasProxyHints = Boolean(
     trimmed(req.headers.get("x-forwarded-host") || "") ||
       trimmed(req.headers.get("x-forwarded-proto") || "")
@@ -81,5 +83,5 @@ export function resolveAppBaseUrl(req: Request): string | null {
     if (hasProxyHints && envOrigin) return envOrigin;
   }
 
-  return requestOrigin || forwardedOrigin || hostOrigin || envOrigin;
+  return requestOrigin || forwardedOrigin || hostOrigin || null;
 }

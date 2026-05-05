@@ -31,6 +31,7 @@ export async function POST(req: Request) {
       .from("claude_code_agent_configs")
       .select("device_id, workspace_id")
       .eq("agent_id", body.agentId)
+      .eq("user_id", user.id)
       .single();
 
     if (configErr || !agentConfig) {
@@ -48,6 +49,7 @@ export async function POST(req: Request) {
         .from("device_workspaces")
         .select("root_path")
         .eq("id", workspaceId)
+        .eq("user_id", user.id)
         .single();
       rootPath = workspace?.root_path ? String(workspace.root_path) : "";
     }
@@ -61,14 +63,14 @@ export async function POST(req: Request) {
       ? null
       : anthropicMode === "user"
         ? (resolved.userKeys.anthropic || null)
-        : (process.env.ANTHROPIC_API_KEY || null);
+        : null;
 
     if (!apiKey && !resolved.claudeCliToken) {
       return NextResponse.json({
         error:
           anthropicMode === "user"
-            ? "Missing Anthropic API key. Add it in Settings, or switch Anthropic to Groovy."
-            : "No API key or CLI token configured. Add your Claude CLI token or configure Groovy Anthropic key on server.",
+            ? "Missing Anthropic API key. Add it in Settings, or connect a Claude CLI token."
+            : "Claude command discovery requires your own Anthropic API key or Claude CLI token. Groovy server keys are never sent to connectors.",
       }, { status: 400 });
     }
 

@@ -253,52 +253,11 @@ async function autoLoginIfNeeded({ pageId, page }) {
         if (fillUser && userEl && username) setValue(userEl, username);
         if (fillPw && pwEl && password) setValue(pwEl, password);
 
-        const submitSelectors = [
-          '#oneroster-login',
-          '#btn-finallogin',
-          'button[type="submit"]',
-          'input[type="submit"]',
-          'button',
-          '[role="button"]',
-        ];
-        let clicked = false;
-
-        const form = (pwEl && pwEl.form) || (userEl && userEl.form) || null;
-        if (form) {
-          for (const sel of submitSelectors) {
-            const cand = form.querySelector(sel);
-            if (cand && isVisible(cand)) {
-              try {
-                cand.click();
-                clicked = true;
-                break;
-              } catch {
-                // ignore
-              }
-            }
-          }
-        }
-
-        if (!clicked) {
-          for (const sel of submitSelectors) {
-            const cand = Array.from(document.querySelectorAll(sel)).find(isVisible);
-            if (cand) {
-              try {
-                cand.click();
-                clicked = true;
-                break;
-              } catch {
-                // ignore
-              }
-            }
-          }
-        }
-
         return {
           ok: true,
           filledUser: !!(fillUser && userEl && username),
           filledPw: !!(fillPw && pwEl && password),
-          clickedSubmit: clicked,
+          clickedSubmit: false,
         };
       },
       { username, password, fillUser, fillPw }
@@ -306,41 +265,19 @@ async function autoLoginIfNeeded({ pageId, page }) {
   };
 
   // Attempt flow:
-  // 1) If password present: fill pw (+ user if visible) and submit
-  // 2) Else: fill user and submit, wait for pw, then fill pw and submit
+  // Fill credentials locally, but never auto-submit them. Submitting a login
+  // form sends the password to whatever action URL the page controls.
   let det = det0;
   let stage = det.hasPw ? "password" : det.hasUserish ? "user_only" : "unknown";
 
   if (!det.hasPw && det.hasUserish) {
     await fillAndSubmit({ fillUser: true, fillPw: false }).catch(() => null);
-    await maybeWaitForNavigation(page);
-    // Give the SPA a moment to transition to password step
-    await new Promise((r) => setTimeout(r, 900));
-    det = await waitForLoginDomChange(page, { timeoutMs: 5000 });
-    stage = det?.ok && det.hasPw ? "password_after_user" : "user_only";
+    stage = "user_only_filled";
   }
 
   if (det?.ok && det.hasPw) {
     await fillAndSubmit({ fillUser: true, fillPw: true }).catch(() => null);
-    await maybeWaitForNavigation(page);
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
-  const after = await detectLoginState(page);
-  const stillLikelyLogin = after?.ok && after.likely;
-
-  if (stillLikelyLogin) {
-    return {
-      attempted: true,
-      ok: false,
-      auto_login_attempted: true,
-      auto_login_failed: true,
-      note:
-        `Auto-login attempted locally for ${domain} but we are still on a login screen. ` +
-        `This site may require additional steps (MFA/OTP/CAPTCHA) or the stored password is wrong. ` +
-        `Do NOT keep trying to type passwords via Computer Use; stop and tell the user what you see.`,
-      stage,
-    };
+    stage = "password_filled";
   }
 
   return {
@@ -348,8 +285,8 @@ async function autoLoginIfNeeded({ pageId, page }) {
     ok: true,
     auto_login_attempted: true,
     note:
-      `Credentials were automatically filled and submitted locally for ${domain}. ` +
-      `If you still see a login form, the site may require extra steps (OTP/MFA/CAPTCHA).`,
+      `Credentials were filled locally for ${domain}, but not submitted. ` +
+      `Submit only after verifying the page and destination are legitimate.`,
     stage,
   };
 }

@@ -8,6 +8,11 @@ type Body = {
   user_id?: string;
 };
 
+function normalizeE164(value: unknown): string | null {
+  const phone = typeof value === "string" ? value.trim() : "";
+  return /^\+[1-9][0-9]{6,14}$/.test(phone) ? phone : null;
+}
+
 export async function GET() {
   try {
     const user = await getAuthedUser();
@@ -41,8 +46,9 @@ export async function POST(req: Request) {
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as Body | null;
-    if (!body?.phone_e164) {
-      return NextResponse.json({ error: "phone_e164 required" }, { status: 400 });
+    const phone = normalizeE164(body?.phone_e164);
+    if (!phone) {
+      return NextResponse.json({ error: "Valid E.164 phone_e164 required" }, { status: 400 });
     }
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin
@@ -57,12 +63,29 @@ export async function POST(req: Request) {
     if (membership.role !== "admin") {
       return NextResponse.json({ error: "Only admins can update allowlist" }, { status: 403 });
     }
+    const targetUserId = typeof body?.user_id === "string" && body.user_id.trim()
+      ? body.user_id.trim()
+      : null;
+    if (targetUserId) {
+      const { data: targetMember } = await admin
+        .from("workspace_members")
+        .select("user_id")
+        .eq("workspace_id", membership.workspace_id)
+        .eq("user_id", targetUserId)
+        .maybeSingle();
+      if (!targetMember) {
+        return NextResponse.json(
+          { error: "Allowlist user must be a member of this workspace" },
+          { status: 400 }
+        );
+      }
+    }
     const { data, error } = await admin
       .from("workspace_whatsapp_allowlist")
       .upsert({
         workspace_id: membership.workspace_id,
-        phone_e164: body.phone_e164,
-        user_id: body.user_id || null,
+        phone_e164: phone,
+        user_id: targetUserId,
         created_by_user_id: user.id,
       })
       .select("workspace_id, phone_e164, user_id, created_at")
@@ -89,9 +112,9 @@ export async function DELETE(req: Request) {
   try {
     const user = await getAuthedUser();
     const { searchParams } = new URL(req.url);
-    const phone = searchParams.get("phone");
+    const phone = normalizeE164(searchParams.get("phone"));
     if (!phone) {
-      return NextResponse.json({ error: "phone required" }, { status: 400 });
+      return NextResponse.json({ error: "Valid phone required" }, { status: 400 });
     }
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin

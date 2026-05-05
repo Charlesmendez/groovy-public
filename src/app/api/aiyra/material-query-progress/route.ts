@@ -1,4 +1,4 @@
-import { createHmac } from "crypto";
+import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
@@ -39,15 +39,17 @@ function sanitizeProgressText(value: string): string {
 }
 
 function getMaterialQueryPollSecret(): string {
-  const secret =
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET) ||
-    trimmed(process.env.RELAY_JWT_SECRET) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_BEARER) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_AUTH_BEARER);
+  const secret = trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET);
   if (!secret) {
     throw new Error("Missing material-query poll secret");
   }
   return secret;
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function verifyMaterialQueryPollToken(token: string): PollTokenPayload | null {
@@ -56,7 +58,7 @@ function verifyMaterialQueryPollToken(token: string): PollTokenPayload | null {
   const expectedSignature = createHmac("sha256", getMaterialQueryPollSecret())
     .update(encodedPayload)
     .digest("base64url");
-  if (expectedSignature !== encodedSignature) return null;
+  if (!timingSafeStringEqual(expectedSignature, encodedSignature)) return null;
   try {
     const payload = JSON.parse(
       Buffer.from(encodedPayload, "base64url").toString("utf8")

@@ -1,4 +1,4 @@
-import { createHash, createHmac } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import { after, NextResponse } from "next/server";
 import { generateText, type ModelMessage } from "ai";
 import { resolveAppBaseUrl } from "@/lib/appBaseUrl";
@@ -99,15 +99,17 @@ function base64UrlEncode(value: string): string {
 }
 
 function getMaterialQueryPollSecret(): string {
-  const secret =
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET) ||
-    trimmed(process.env.RELAY_JWT_SECRET) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_BEARER) ||
-    trimmed(process.env.AIYRA_MATERIAL_QUERY_AUTH_BEARER);
+  const secret = trimmed(process.env.AIYRA_MATERIAL_QUERY_POLL_SECRET);
   if (!secret) {
     throw new Error("Missing material-query poll secret");
   }
   return secret;
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 function verifyMaterialQueryToolToken(
@@ -118,7 +120,7 @@ function verifyMaterialQueryToolToken(
   const expectedSignature = createHmac("sha256", getMaterialQueryPollSecret())
     .update(encodedPayload)
     .digest("base64url");
-  if (expectedSignature !== encodedSignature) return null;
+  if (!timingSafeStringEqual(expectedSignature, encodedSignature)) return null;
   try {
     const payload = JSON.parse(
       Buffer.from(encodedPayload, "base64url").toString("utf8")
@@ -1574,8 +1576,7 @@ async function processClaimedMaterialQuery(args: {
   );
 
   const roundStartedAtMs = Date.now();
-  // Orchestrator self-calls should use the live request origin for this server instance.
-  const appBaseUrl = new URL(req.url).origin;
+  const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
   const runRound = (
     toolResults?:
       | Array<{
@@ -1784,7 +1785,8 @@ export async function POST(req: Request) {
     }
 
     const providedBearer = normalizeBearer(req.headers.get("authorization") || "");
-    const bearerAuthorized = !!expectedBearer && providedBearer === expectedBearer;
+    const bearerAuthorized =
+      !!expectedBearer && timingSafeStringEqual(providedBearer, expectedBearer);
     const toolTokenAuthorized = !!toolTokenPayload;
     const authorized = bearerAuthorized || toolTokenAuthorized;
     if (!authorized && !allowUnauthenticatedDev) {

@@ -81,63 +81,24 @@ export async function recordWorkspaceTopupCredit(args: {
   idempotencyKey: string;
 }): Promise<void> {
   const admin = createSupabaseAdminClient();
-  const nowIso = new Date().toISOString();
   const roundedAmount = roundUsd(args.amountUsd);
   if (!(roundedAmount > 0)) throw new Error("Topup amount must be positive");
 
-  const { data: existing } = await admin
-    .from("billing_wallet_ledger")
-    .select("id")
-    .eq("idempotency_key", args.idempotencyKey)
-    .maybeSingle();
-  if (existing?.id) return;
-
-  const { data: ws, error: wsErr } = await admin
-    .from("workspaces")
-    .select("billing_paid_credit_usd_balance")
-    .eq("id", args.workspaceId)
-    .single();
-  if (wsErr || !ws) throw new Error(wsErr?.message || "Workspace not found");
-
-  const currentPaid = toFiniteNumber(
-    (ws as Record<string, unknown>).billing_paid_credit_usd_balance,
-    0
-  );
-  const nextPaid = roundUsd(currentPaid + roundedAmount);
-
-  const { error: upErr } = await admin
-    .from("workspaces")
-    .update({
-      billing_paid_credit_usd_balance: nextPaid,
-      billing_initial_topup_completed: true,
-      billing_updated_at: nowIso,
-    })
-    .eq("id", args.workspaceId);
-  if (upErr) throw new Error(upErr.message);
-
-  const { error: insertErr } = await admin.from("billing_wallet_ledger").insert({
-    workspace_id: args.workspaceId,
-    user_id: args.userId,
-    kind: args.kind,
-    amount_usd: roundedAmount,
-    model_cost_usd: roundUsd(args.modelCostUsd),
-    groovy_fee_usd: roundUsd(args.groovyFeeUsd),
-    total_charge_usd: roundedAmount,
-    fee_rate_bps: args.feeRateBps,
-    stripe_invoice_id: args.stripeInvoiceId,
-    stripe_payment_intent_id: args.stripePaymentIntentId,
-    stripe_invoice_status: args.stripeInvoiceStatus,
-    source: args.source,
-    idempotency_key: args.idempotencyKey,
-    meta: {
-      topup_kind: args.kind,
-      source: args.source,
-    },
+  const { error } = await admin.rpc("record_workspace_topup_credit_atomic", {
+    p_workspace_id: args.workspaceId,
+    p_user_id: args.userId,
+    p_kind: args.kind,
+    p_amount_usd: roundedAmount,
+    p_model_cost_usd: roundUsd(args.modelCostUsd),
+    p_groovy_fee_usd: roundUsd(args.groovyFeeUsd),
+    p_fee_rate_bps: args.feeRateBps,
+    p_stripe_invoice_id: args.stripeInvoiceId,
+    p_stripe_payment_intent_id: args.stripePaymentIntentId,
+    p_stripe_invoice_status: args.stripeInvoiceStatus,
+    p_source: args.source,
+    p_idempotency_key: args.idempotencyKey,
   });
-
-  if (insertErr && !insertErr.message.toLowerCase().includes("duplicate")) {
-    throw new Error(insertErr.message);
-  }
+  if (error) throw new Error(error.message);
 }
 
 export async function preflightGroovyUsage(args: {
@@ -332,64 +293,8 @@ export async function settleGroovyUsageDebitBestEffort(args: {
   });
   if (!breakdown) return;
 
-  const admin = createSupabaseAdminClient();
   const spanId = args.spanId || "main";
-  const { data: existing } = await admin
-    .from("billing_wallet_ledger")
-    .select("id")
-    .eq("workspace_id", args.workspaceId)
-    .eq("trace_id", args.traceId)
-    .eq("source", args.source)
-    .eq("span_id", spanId)
-    .eq("kind", "usage_debit")
-    .maybeSingle();
-  if (existing?.id) return;
-
-  const { data: ws, error: wsErr } = await admin
-    .from("workspaces")
-    .select("billing_free_credit_usd_remaining, billing_paid_credit_usd_balance")
-    .eq("id", args.workspaceId)
-    .single();
-  if (wsErr || !ws) return;
-
-  let free = roundUsd(
-    toFiniteNumber((ws as Record<string, unknown>).billing_free_credit_usd_remaining, 0)
-  );
-  let paid = roundUsd(
-    toFiniteNumber((ws as Record<string, unknown>).billing_paid_credit_usd_balance, 0)
-  );
-
-  let remaining = breakdown.totalChargeUsd;
-  const freeUsed = Math.min(free, remaining);
-  free = roundUsd(free - freeUsed);
-  remaining = roundUsd(remaining - freeUsed);
-  paid = roundUsd(paid - remaining);
-
-  await admin
-    .from("workspaces")
-    .update({
-      billing_free_credit_usd_remaining: free,
-      billing_paid_credit_usd_balance: paid,
-      billing_updated_at: new Date().toISOString(),
-    })
-    .eq("id", args.workspaceId);
-
-  await admin.from("billing_wallet_ledger").insert({
-    workspace_id: args.workspaceId,
-    user_id: args.userId,
-    kind: "usage_debit",
-    amount_usd: -breakdown.totalChargeUsd,
-    model_cost_usd: breakdown.modelCostUsd,
-    groovy_fee_usd: breakdown.groovyFeeUsd,
-    total_charge_usd: breakdown.totalChargeUsd,
-    fee_rate_bps: breakdown.feeRateBps,
-    charge_type: breakdown.chargeType,
-    trace_id: args.traceId,
-    turn_id: args.turnId,
-    source: args.source,
-    span_id: spanId,
-    idempotency_key: `wallet:usage:${args.workspaceId}:${args.traceId}:${args.source}:${spanId}`,
-    meta: {
+  const ledgerMeta = {
       ...(args.meta || {}),
       inputTokens: breakdown.inputTokens,
       outputTokens: breakdown.outputTokens,
@@ -405,8 +310,32 @@ export async function settleGroovyUsageDebitBestEffort(args: {
       ...(typeof normalized?.cacheWriteInputTokens === "number"
         ? { cacheWriteInputTokens: normalized.cacheWriteInputTokens }
         : {}),
-    },
-  });
+    };
+  const admin = createSupabaseAdminClient();
+  const { data: debitResult, error: debitError } = await admin.rpc(
+    "settle_workspace_usage_debit_atomic",
+    {
+      p_workspace_id: args.workspaceId,
+      p_user_id: args.userId,
+      p_trace_id: args.traceId,
+      p_turn_id: args.turnId,
+      p_source: args.source,
+      p_span_id: spanId,
+      p_amount_usd: breakdown.totalChargeUsd,
+      p_model_cost_usd: breakdown.modelCostUsd,
+      p_groovy_fee_usd: breakdown.groovyFeeUsd,
+      p_fee_rate_bps: breakdown.feeRateBps,
+      p_charge_type: breakdown.chargeType,
+      p_meta: ledgerMeta,
+    }
+  );
+  if (debitError) return;
+  const debitRecord =
+    debitResult && typeof debitResult === "object" && !Array.isArray(debitResult)
+      ? (debitResult as Record<string, unknown>)
+      : {};
+  const free = roundUsd(toFiniteNumber(debitRecord.free, 0));
+  const paid = roundUsd(toFiniteNumber(debitRecord.paid, 0));
 
   const availableAfterDebit = roundUsd(free + paid);
   const minimumBalanceBeforeRunUsd = getMinimumBalanceBeforeRunUsd();

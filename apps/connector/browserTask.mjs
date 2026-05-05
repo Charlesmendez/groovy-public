@@ -227,12 +227,23 @@ export async function runBrowserTaskViaPlaywright(opts) {
       : typeof opts?.profileName === "string"
         ? opts.profileName
         : "default";
-  const profileSlug =
+  const rawProfileSlug =
     String(profileNameRaw || "default")
       .trim()
-      .replace(/[^a-zA-Z0-9._-]+/g, "_")
-      .slice(0, 48) || "default";
-  const userDataDir = path.join(os.homedir(), ".groovy", "playwright-mcp-profiles", profileSlug);
+      .replace(/[^a-zA-Z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 48);
+  const profileSlug = rawProfileSlug && !/^\.+$/.test(rawProfileSlug) ? rawProfileSlug : "default";
+  const profilesBaseDir = path.join(os.homedir(), ".groovy", "playwright-mcp-profiles");
+  const userDataDir = path.resolve(profilesBaseDir, profileSlug);
+  const relativeProfileDir = path.relative(path.resolve(profilesBaseDir), userDataDir);
+  if (
+    !relativeProfileDir ||
+    relativeProfileDir.startsWith("..") ||
+    path.isAbsolute(relativeProfileDir)
+  ) {
+    return { ok: false, error: "invalid_profile_name" };
+  }
   const apiKey = typeof opts?.api_key === "string" ? opts.api_key.trim() : "";
   const cliToken = typeof opts?.cli_token === "string" ? opts.cli_token.trim() : "";
   const envTimeoutRaw =
@@ -308,14 +319,10 @@ export async function runBrowserTaskViaPlaywright(opts) {
     try {
       const domain = new URL(startUrl).hostname.toLowerCase();
       const secret = await credentialGetSecret({ domain }).catch(() => null);
-      if (secret?.ok && secret.hasCredential && secret.password) {
+      if (secret?.ok && secret.hasCredential) {
         credentialHint =
-          `\n\nIMPORTANT: If the page requires login, use these credentials:\n` +
-          `<robot_credentials>\n` +
-          `  Username: ${secret.username}\n` +
-          `  Password: ${secret.password}\n` +
-          `</robot_credentials>\n` +
-          `Fill the username/email field, submit, wait for the password field, fill it, then submit.\n`;
+          `\n\nIMPORTANT: Credentials are available locally for this domain, but their values are not visible to you.\n` +
+          `If the page requires login, use the browser normally and rely on the connector's local auto-login helper.\n`;
       }
     } catch {
       // ignore
@@ -862,7 +869,12 @@ async function postBrowserAgent({ appUrl, deviceToken, body }) {
   const headers = { "Content-Type": "application/json" };
   if (deviceToken) headers["X-Device-Token"] = deviceToken;
 
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    redirect: "error",
+  });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     return { ok: false, error: text || `HTTP ${res.status}`, status: res.status };
@@ -1169,4 +1181,3 @@ export async function runBrowserTaskOnConnector(opts) {
     meta: { iterations: iteration, startUrl: targetUrl, profileName },
   };
 }
-

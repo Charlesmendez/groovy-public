@@ -16,17 +16,9 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
-function safeOrigin(req: Request): string {
+function safeOrigin(): string {
   const fromEnv = (process.env.NEXT_PUBLIC_APP_URL || "").trim();
-  const fromReq = (req.headers.get("origin") || "").trim();
-  let fromReqUrl = "";
-  try {
-    fromReqUrl = new URL(req.url).origin;
-  } catch {
-    fromReqUrl = "";
-  }
-  const origin = fromEnv || fromReq || fromReqUrl;
-  return origin.replace(/\/+$/, "");
+  return fromEnv.replace(/\/+$/, "");
 }
 
 function isLikelyEmail(value: string): boolean {
@@ -163,6 +155,13 @@ export async function POST(req: Request) {
   if (!email || !isLikelyEmail(email)) {
     return NextResponse.json({ error: "Valid email is required" }, { status: 400 });
   }
+  const currentUserEmail = normalizeEmail(user.email || "");
+  if (!currentUserEmail || email !== currentUserEmail) {
+    return NextResponse.json(
+      { error: "Upready link email must match your Groovy account email." },
+      { status: 403 }
+    );
+  }
 
   let upreadyUser: { upreadyUserId: string; email: string } | null = null;
   try {
@@ -210,7 +209,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const origin = safeOrigin(req);
+  const origin = safeOrigin();
   if (!origin) {
     return NextResponse.json(
       { error: "Missing app origin configuration for confirmation URL" },

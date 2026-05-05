@@ -17,12 +17,65 @@ import {
 import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
+import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 const PROVIDER = "telegram";
+
+function splitCsv(value: string | undefined): Set<string> {
+  return new Set(
+    String(value || "")
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean)
+  );
+}
+
+function authorizedTelegramSenderIds(ownerUserId: string): Set<string> {
+  const allowed = splitCsv(process.env.TELEGRAM_AUTHORIZED_SENDER_IDS);
+  const scoped = String(process.env.TELEGRAM_AUTHORIZED_SENDERS || "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const entry of scoped) {
+    const [rawUserId, rawIds] = entry.split("=");
+    if (rawUserId?.trim() !== ownerUserId) continue;
+    for (const id of splitCsv(rawIds)) allowed.add(id);
+  }
+  return allowed;
+}
+
+function isAuthorizedTelegramSender(ownerUserId: string, parsed: ReturnType<typeof parseTelegramUpdate>): boolean {
+  if (!parsed?.fromUser?.id) return false;
+  const allowed = authorizedTelegramSenderIds(ownerUserId);
+  return allowed.has(String(parsed.fromUser.id));
+}
+
+async function ignoreUnauthorizedTelegramSender(args: {
+  botToken: string;
+  parsed: NonNullable<ReturnType<typeof parseTelegramUpdate>>;
+  userId: string;
+}) {
+  logWarn("telegram.webhook.unauthorized_sender", {
+    user_id: args.userId,
+    chat_id: args.parsed.chatId,
+    chat_type: args.parsed.chatType,
+    telegram_user_id: args.parsed.fromUser?.id,
+    command: args.parsed.command,
+  });
+  if (args.parsed.chatType === "private") {
+    await sendTelegramText({
+      botToken: args.botToken,
+      chatId: args.parsed.chatId,
+      text: "This Telegram user is not authorized to control this Groovy bot.",
+    }).catch(() => undefined);
+  }
+  return NextResponse.json({ ok: true, ignored: true });
+}
 
 async function getOrCreateSessionId(
   supabase: ReturnType<typeof createSupabaseAdminClient>,
@@ -89,7 +142,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
       return NextResponse.json({ ok: true });
     }
 
-    const botToken = botConfig.bot_token_encrypted;
+    const botToken = decryptTelegramBotToken(botConfig.bot_token_encrypted);
     const botUsername = botConfig.bot_username;
 
     logInfo("telegram.webhook.received", {
@@ -118,6 +171,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
       );
     }
 
+    const senderAuthorized = isAuthorizedTelegramSender(userId, parsed);
+
     if (parsed.command === "/start" && parsed.chatType === "private") {
       await sendTelegramText({
         botToken,
@@ -126,6 +181,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
       });
       logInfo("telegram.webhook.start", { user_id: userId, chat_id: parsed.chatId });
       return NextResponse.json({ ok: true });
+    }
+
+    if (!senderAuthorized) {
+      return ignoreUnauthorizedTelegramSender({ botToken, parsed, userId });
     }
 
     if (parsed.command === "/register" && parsed.chatType !== "private") {
@@ -220,10 +279,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
           ? null
           : anthropicMode === "user"
             ? resolved.userKeys.anthropic || null
-            : process.env.ANTHROPIC_API_KEY || null;
+            : null;
 
         if (!apiKey && !resolved.claudeCliToken) {
-          await sendReply("No API key or CLI token configured. Add your Anthropic key in Settings.");
+          await sendReply("Telegram code runs require your own Anthropic API key or Claude CLI token. Groovy server keys are never sent to connectors.");
           return NextResponse.json({ ok: true });
         }
 
@@ -470,7 +529,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
     const round = await runOrchestratorRound({
       supabase,
       userId,
-      appBaseUrl: new URL(req.url).origin,
+      appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
       history: [...history, { role: "user", content: userText }],
       message: userText,
       orchestratorAgentId: runtimeScope?.agentId || null,

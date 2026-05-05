@@ -6,21 +6,13 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
-function appBaseUrl(req: Request): string {
+function appBaseUrl(): string {
   const fromEnv = (process.env.NEXT_PUBLIC_APP_URL || "").trim();
-  const fromReq = (req.headers.get("origin") || "").trim();
-  let fromReqUrl = "";
-  try {
-    fromReqUrl = new URL(req.url).origin;
-  } catch {
-    fromReqUrl = "";
-  }
-  const base = fromEnv || fromReq || fromReqUrl;
-  return base.replace(/\/+$/, "");
+  return fromEnv.replace(/\/+$/, "") || "http://localhost:3000";
 }
 
-function redirectToDashboard(req: Request, status: "linked" | "invalid" | "expired" | "conflict") {
-  const base = appBaseUrl(req);
+function redirectToDashboard(status: "linked" | "invalid" | "expired" | "conflict") {
+  const base = appBaseUrl();
   const path = `/dashboard?upready_link=${status}`;
   const dest = new URL(path, base).toString();
   return NextResponse.redirect(dest, 302);
@@ -30,7 +22,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const token = (url.searchParams.get("token") || "").trim();
   if (!token) {
-    return redirectToDashboard(req, "invalid");
+    return redirectToDashboard("invalid");
   }
 
   const admin = createSupabaseAdminClient();
@@ -64,13 +56,13 @@ export async function GET(req: Request) {
       : NaN;
 
   if (!id || !flowUserId || !upreadyUserId || !upreadyEmail) {
-    return redirectToDashboard(req, "invalid");
+    return redirectToDashboard("invalid");
   }
   if (consumedAt) {
-    return redirectToDashboard(req, "invalid");
+    return redirectToDashboard("invalid");
   }
   if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) {
-    return redirectToDashboard(req, "expired");
+    return redirectToDashboard("expired");
   }
 
   const nowIso = new Date().toISOString();
@@ -88,7 +80,7 @@ export async function GET(req: Request) {
     );
 
   if (upsertErr) {
-    return redirectToDashboard(req, "conflict");
+    return redirectToDashboard("conflict");
   }
 
   await admin
@@ -96,5 +88,5 @@ export async function GET(req: Request) {
     .update({ consumed_at: nowIso })
     .eq("id", id);
 
-  return redirectToDashboard(req, "linked");
+  return redirectToDashboard("linked");
 }

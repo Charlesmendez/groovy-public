@@ -60,6 +60,7 @@ export async function POST(req: Request) {
       .from("claude_code_agent_configs")
       .select("device_id, workspace_id, code_cli_provider")
       .eq("agent_id", agentId)
+      .eq("user_id", user.id)
       .single();
 
     if (configErr || !agentConfig) {
@@ -83,6 +84,7 @@ export async function POST(req: Request) {
         .from("device_workspaces")
         .select("root_path")
         .eq("id", workspaceId)
+        .eq("user_id", user.id)
         .single();
       rootPath = workspace?.root_path ? String(workspace.root_path) : "";
     }
@@ -217,7 +219,7 @@ export async function POST(req: Request) {
       ? null
       : anthropicMode === "user"
         ? (resolved.userKeys.anthropic || null)
-        : (process.env.ANTHROPIC_API_KEY || null);
+        : null;
 
     console.log("[claude-cli] auth resolved", {
       method: useCliToken ? "cli_token" : "api_key",
@@ -225,27 +227,25 @@ export async function POST(req: Request) {
         ? "user"
         : anthropicMode === "user"
           ? (resolved.userKeys.anthropic ? "user" : "missing")
-          : (process.env.ANTHROPIC_API_KEY ? "groovy" : "missing"),
+          : "server_key_not_exposed",
     });
 
     if (!apiKey && !resolved.claudeCliToken) {
       return NextResponse.json({
         error:
           anthropicMode === "user"
-            ? "Missing Anthropic API key. Add it in Settings, or switch Anthropic to Groovy."
-            : "No API key or CLI token configured. Add your Claude CLI token or configure Groovy Anthropic key on server.",
+            ? "Missing Anthropic API key. Add it in Settings, or connect a Claude CLI token."
+            : "Connector Claude runs require your own Anthropic API key or Claude CLI token. Groovy server keys are never sent to connectors.",
       }, { status: 400 });
     }
 
     const requestId = `claude-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const authOrigin = useCliToken
       ? ("user" as const)
-      : anthropicMode === "groovy"
-        ? ("groovy" as const)
-        : ("user" as const);
+      : ("user" as const);
     const billing = {
       billable: true,
-      chargeType: authOrigin === "groovy" ? ("groovy_key" as const) : ("external_key_fee" as const),
+      chargeType: "external_key_fee" as const,
       provider: "anthropic" as const,
       codeCliProvider: "claude" as const,
       authMethod: useCliToken ? ("cli_token" as const) : ("api_key" as const),

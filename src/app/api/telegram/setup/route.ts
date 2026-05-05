@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getTelegramMe, setTelegramWebhook, deleteTelegramWebhook, setTelegramBotCommands } from "@/lib/telegram/client";
+import { decryptTelegramBotToken, encryptTelegramBotToken } from "@/lib/telegram/botToken";
 import { randomBytes } from "crypto";
 import { logError, logInfo } from "@/lib/observability/log";
 
@@ -73,7 +74,7 @@ export async function POST(req: Request) {
 
     if (existing) {
       try {
-        await deleteTelegramWebhook(existing.bot_token_encrypted);
+        await deleteTelegramWebhook(decryptTelegramBotToken(existing.bot_token_encrypted));
       } catch {
         // best-effort
       }
@@ -126,7 +127,7 @@ export async function POST(req: Request) {
   await admin.from("telegram_bot_configs").upsert(
     {
       user_id: user.id,
-      bot_token_encrypted: botToken,
+      bot_token_encrypted: encryptTelegramBotToken(botToken),
       bot_username: botInfo.username,
       webhook_secret: webhookSecret,
       updated_at: new Date().toISOString(),

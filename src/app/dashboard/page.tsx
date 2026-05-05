@@ -1493,7 +1493,7 @@ function CommandCenterDashboardInner() {
   
   // Minimum required connector version (update this when connector features change)
   // Bump this when connector protocol/lifecycle expectations change.
-  const MIN_CONNECTOR_VERSION = "0.22.77";
+  const MIN_CONNECTOR_VERSION = "0.22.78";
   const connectorGuide = useConnectorInstallGuide();
   
   // Version comparison helper

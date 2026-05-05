@@ -15,6 +15,18 @@ type MessageListProps = {
   emptyMessage?: string;
 };
 
+function safeGeneratedFileUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const trimmed = value.trim();
+  if (trimmed.startsWith("/api/")) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "https:" ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function MessageList({
   messages,
   isStreaming,
@@ -195,7 +207,7 @@ export function MessageList({
                       (f.file_id
                         ? `/api/datagran/files?fileId=${encodeURIComponent(f.file_id)}&agentId=generated`
                         : null) ||
-                      (typeof f.url === "string" && f.url ? f.url : null);
+                      safeGeneratedFileUrl(f.url);
                     return (
                       <a
                         key={`${fileName}-${idx}`}

@@ -165,7 +165,7 @@ export default function CommandCenterDashboard() {
   );
 
   // Soft-warn minimum connector version (don't block tools, just nag)
-  const MIN_CONNECTOR_VERSION = "0.22.77";
+  const MIN_CONNECTOR_VERSION = "0.22.78";
   const isVersionOutdated = useCallback((version: string | null, minVersion: string) => {
     if (!version) return true;
     const v = version.split(".").map(Number);

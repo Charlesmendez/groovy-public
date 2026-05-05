@@ -14,11 +14,18 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { getComputerUseBeta, getComputerUseModel } from "@/lib/ai/modelResolver";
+import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
+import { insertBillingUsageEventBestEffort } from "@/lib/billing/events";
+import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
+import { usageChargeTypeForKeyMode } from "@/lib/billing/pricing";
+import { randomUUID } from "crypto";
 
 // Display dimensions must match what the connector uses
 const DISPLAY_WIDTH = 1280;
 const DISPLAY_HEIGHT = 800;
 const COMPUTER_USE_TOOL_TYPE = "computer_20251124";
+const MAX_BROWSER_AGENT_MESSAGES = 50;
+const MAX_SCREENSHOT_BASE64_CHARS = 7 * 1024 * 1024;
 
 type BrowserAgentRequest = {
   task: string;
@@ -108,10 +115,12 @@ export async function POST(req: Request) {
   const supabaseCookie = await createSupabaseServerClient();
   const { data: { user }, error: userError } = await supabaseCookie.auth.getUser();
 
-  const cookie = req.headers.get("cookie") || "";
   let userId: string | null = user?.id || null;
+  const userEmail = user?.email || null;
+  const usingCookieAuth = !!(userId && !userError);
+  const cookie = usingCookieAuth ? req.headers.get("cookie") || "" : "";
   const supabase =
-    userId && !userError
+    usingCookieAuth
       ? supabaseCookie
       : (() => {
           if (!deviceToken) return null;
@@ -125,6 +134,7 @@ export async function POST(req: Request) {
   if (!supabase || !userId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const authenticatedUserId = userId;
 
   const body = (await req.json().catch(() => null)) as BrowserAgentRequest | null;
   if (!body || typeof body !== "object") {
@@ -136,8 +146,21 @@ export async function POST(req: Request) {
   if (!task && !toolResult) {
     return NextResponse.json({ error: "Task or tool result required" }, { status: 400 });
   }
+  if (Array.isArray(previousMessages) && previousMessages.length > MAX_BROWSER_AGENT_MESSAGES) {
+    return NextResponse.json({ error: "Too many previous messages" }, { status: 400 });
+  }
+  const initialScreenshotSize =
+    typeof initialScreenshot?.screenshot === "string" ? initialScreenshot.screenshot.length : 0;
+  const toolScreenshotSize =
+    typeof toolResult?.result?.screenshot === "string" ? toolResult.result.screenshot.length : 0;
+  if (
+    initialScreenshotSize > MAX_SCREENSHOT_BASE64_CHARS ||
+    toolScreenshotSize > MAX_SCREENSHOT_BASE64_CHARS
+  ) {
+    return NextResponse.json({ error: "Screenshot payload too large" }, { status: 400 });
+  }
 
-  const resolved = await resolveKeys(userId, supabase, cookie);
+  const resolved = await resolveKeys(authenticatedUserId, supabase, cookie);
   const keyMode = resolved.keyModes.anthropic || resolved.globalMode;
   const apiKey = keyMode === "user" ? (resolved.userKeys.anthropic || null) : null;
 
@@ -152,6 +175,44 @@ export async function POST(req: Request) {
       { error: "Groovy Anthropic API key not configured on server" },
       { status: 500 }
     );
+  }
+  const billingWorkspaceId =
+    keyMode === "groovy"
+      ? await getOrCreateWorkspaceIdForUser({
+          userId: authenticatedUserId,
+          email: userEmail,
+        }).catch(() => null)
+      : null;
+  const billingTraceId = randomUUID();
+  const usageChargeType = usageChargeTypeForKeyMode(keyMode);
+  if (keyMode === "groovy") {
+    if (!billingWorkspaceId) {
+      return NextResponse.json(
+        { error: "Billing context unavailable. Please retry." },
+        { status: 503 }
+      );
+    }
+    const preflight = await preflightGroovyUsage({
+      workspaceId: billingWorkspaceId,
+      userId: authenticatedUserId,
+      userEmail,
+      traceId: billingTraceId,
+      source: "browser_agent",
+    });
+    if (!preflight.allowed) {
+      return NextResponse.json(
+        {
+          error: preflight.message,
+          code: preflight.reason,
+          billing: {
+            monthSpendUsd: preflight.monthSpendUsd,
+            monthlyLimitUsd: preflight.monthlyLimitUsd,
+            availableBalanceUsd: preflight.availableBalanceUsd,
+          },
+        },
+        { status: 402 }
+      );
+    }
   }
 
   // Initialize Anthropic client with beta support
@@ -430,6 +491,34 @@ Complete the task step by step. After each action, take a screenshot to see what
           stopReason: response.stop_reason,
           contentBlocks: response.content.length,
         });
+        if (billingWorkspaceId) {
+          insertBillingUsageEventBestEffort({
+            workspaceId: billingWorkspaceId,
+            userId: authenticatedUserId,
+            turnId: billingTraceId,
+            traceId: billingTraceId,
+            source: "browser_agent",
+            spanId: "computer_use",
+            provider: "anthropic",
+            model: getComputerUseModel(),
+            usage: response.usage,
+            billable: true,
+            chargeType: usageChargeType,
+            meta: { computerUse: true },
+          });
+          await settleGroovyUsageDebitBestEffort({
+            workspaceId: billingWorkspaceId,
+            userId: authenticatedUserId,
+            traceId: billingTraceId,
+            turnId: billingTraceId,
+            source: "browser_agent",
+            spanId: "computer_use",
+            model: getComputerUseModel(),
+            usage: response.usage,
+            chargeType: usageChargeType,
+            meta: { computerUse: true },
+          }).catch(() => {});
+        }
 
         // Process response content
         let textResponse = "";

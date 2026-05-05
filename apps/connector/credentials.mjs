@@ -172,14 +172,8 @@ function selectBestRow(db, domain) {
   const d = normalizeDomain(domain);
   if (!d) return null;
 
-  // Deterministic local matching (no vault disclosure to the model):
-  // - exact canonical match
-  // - legacy exact match (www./m. stored historically)
-  // - stored parent domain: d endswith "."+domain (use base domain creds for subdomains)
-  // - stored child domain: domain endswith "."+d (if creds were stored on a subdomain)
-  //
-  // This fixes repeated prompts on sites that redirect between subdomains
-  // (e.g. reddit.com <-> accounts.reddit.com) without hardcoding per-site logic.
+  // Use exact canonical host matching only. Subdomain wildcard matching is too
+  // broad for multi-tenant SaaS and subdomain-takeover cases.
   return db
     .prepare(
       `SELECT id, domain, username, enc_json, created_at, updated_at, last_used_at
@@ -187,22 +181,18 @@ function selectBestRow(db, domain) {
        WHERE domain = ?
           OR domain = ('www.' || ?)
           OR domain = ('m.' || ?)
-          OR ? LIKE ('%.' || domain)
-          OR domain LIKE ('%.' || ?)
        ORDER BY
          CASE
            WHEN domain = ? THEN 0
            WHEN domain = ('www.' || ?) THEN 1
            WHEN domain = ('m.' || ?) THEN 2
-           WHEN ? LIKE ('%.' || domain) THEN 3
-           WHEN domain LIKE ('%.' || ?) THEN 4
            ELSE 9
          END ASC,
          LENGTH(domain) DESC,
          COALESCE(last_used_at, updated_at) DESC
        LIMIT 1`
     )
-    .get(d, d, d, d, d, d, d, d, d, d);
+    .get(d, d, d, d, d, d);
 }
 
 export async function credentialGetMeta({ domain }) {
@@ -304,4 +294,3 @@ export async function credentialRequest({ domain, reason }) {
   inFlightCredentialRequests.set(d, p);
   return await p;
 }
-

@@ -46,8 +46,7 @@ export async function POST(req: Request) {
   const agentId = toStringOrEmpty(body.agentId);
   const provider = toStringOrEmpty(body.provider);
 
-  // Get origin from request headers
-  const origin = req.headers.get("origin") || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+  const origin = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
   let apiKey: string;
   let endUserExternalId: string;
@@ -59,6 +58,7 @@ export async function POST(req: Request) {
       .from("datagran_agent_configs")
       .select("datagran_api_key_enc, provider, end_user_external_id")
       .eq("agent_id", agentId)
+      .eq("user_id", user.id)
       .single();
 
     if (cfgError || !config) {

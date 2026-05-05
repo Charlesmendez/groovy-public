@@ -42,6 +42,10 @@ function verifyKapsoSignature(args: { rawBody: string; signatureHex: string; sec
   }
 }
 
+function isSafeKapsoId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
 function extractKapsoPayload(body: KapsoWebhookBody) {
   const phoneNumberId =
     asString(body.phoneNumberId) ||
@@ -140,7 +144,7 @@ export async function POST(req: Request) {
     if (!body) return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
 
     const { phoneNumberId, from, text } = extractKapsoPayload(body);
-    if (!phoneNumberId || !from || !text) {
+    if (!phoneNumberId || !from || !text || !isSafeKapsoId(phoneNumberId)) {
       logWarn("kapso.inbound.missing_fields", {
         webhook_event: webhookEvent,
         idempotency_key: idempotencyKey,
@@ -163,35 +167,42 @@ export async function POST(req: Request) {
     });
 
     const supabase = createSupabaseAdminClient();
-    const { data: company } = await supabase
+    const { data: kapsoMatches } = await supabase
       .from("workspace_company_whatsapp")
       .select("workspace_id, kapso_phone_number_id, phone_number_id, webhook_secret")
-      .or(`kapso_phone_number_id.eq.${phoneNumberId},phone_number_id.eq.${phoneNumberId}`)
-      .single();
+      .eq("kapso_phone_number_id", phoneNumberId)
+      .limit(2);
+    let company =
+      Array.isArray(kapsoMatches) && kapsoMatches.length === 1 ? kapsoMatches[0] : null;
+    if (!company) {
+      const { data: phoneMatches } = await supabase
+        .from("workspace_company_whatsapp")
+        .select("workspace_id, kapso_phone_number_id, phone_number_id, webhook_secret")
+        .eq("phone_number_id", phoneNumberId)
+        .limit(2);
+      company =
+        Array.isArray(phoneMatches) && phoneMatches.length === 1 ? phoneMatches[0] : null;
+    }
     if (!company) {
       logWarn("kapso.inbound.unknown_company_number", {
         webhook_event: webhookEvent,
         idempotency_key: idempotencyKey,
         phone_number_id: phoneNumberId,
       });
-      return NextResponse.json({ error: "Unknown company number" }, { status: 404 });
+      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
     }
 
     const secret =
-      (typeof company.webhook_secret === "string" && company.webhook_secret.trim()
+      typeof company.webhook_secret === "string" && company.webhook_secret.trim()
         ? company.webhook_secret.trim()
-        : "") ||
-      (process.env.KAPSO_WEBHOOK_SECRET || "").trim();
+        : "";
     if (!secret) {
       logError("kapso.inbound.misconfigured_missing_secret", {
         webhook_event: webhookEvent,
         idempotency_key: idempotencyKey,
         workspace_id: company.workspace_id,
       });
-      return NextResponse.json(
-        { error: "Missing KAPSO_WEBHOOK_SECRET" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
     }
     const valid = verifyKapsoSignature({ rawBody, signatureHex, secret });
     if (!valid) {
@@ -387,8 +398,7 @@ export async function POST(req: Request) {
     const round = await runOrchestratorRound({
       supabase,
       userId: allow.user_id,
-      // Keep delegated internal calls on the live request origin for this webhook hit.
-      appBaseUrl: new URL(req.url).origin,
+      appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
       history: [...history, { role: "user", content: text }],
       message: text,
       orchestratorAgentId: runtimeScope?.agentId || null,

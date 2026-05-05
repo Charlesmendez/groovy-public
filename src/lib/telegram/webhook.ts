@@ -1,8 +1,10 @@
 import type { TelegramUpdate, ParsedTelegramUpdate } from "./types";
+import { timingSafeEqual } from "crypto";
 
 export function verifyTelegramWebhook(req: Request, expectedSecret: string): boolean {
   const header = req.headers.get("x-telegram-bot-api-secret-token") || "";
-  return header === expectedSecret && expectedSecret.length > 0;
+  if (!header || !expectedSecret || header.length !== expectedSecret.length) return false;
+  return timingSafeEqual(Buffer.from(header), Buffer.from(expectedSecret));
 }
 
 export function parseTelegramUpdate(body: unknown): ParsedTelegramUpdate | null {

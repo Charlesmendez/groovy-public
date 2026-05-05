@@ -1,6 +1,16 @@
 import { NextResponse } from "next/server";
+import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export async function POST() {
+  const supabase = await createSupabaseServerClient();
+  const {
+    data: { user },
+    error: authError,
+  } = await supabase.auth.getUser();
+  if (authError || !user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
@@ -33,7 +43,7 @@ export async function POST() {
       const error = await response.text();
       console.error("OpenAI API error:", error);
       return NextResponse.json(
-        { error: "Failed to create session", details: error },
+        { error: "Failed to create session" },
         { status: response.status }
       );
     }
