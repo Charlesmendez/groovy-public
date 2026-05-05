@@ -32,7 +32,14 @@ jobs:
 
       - name: Apply manual version
         if: ${{ inputs.version != '' }}
-        run: npm version "${{ inputs.version }}" --no-git-tag-version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Invalid semver: $VERSION" >&2
+            exit 1
+          fi
+          npm version "$VERSION" --no-git-tag-version
 
       - name: Validate CLI package
         run: |
