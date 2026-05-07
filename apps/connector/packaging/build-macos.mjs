@@ -128,6 +128,22 @@ function notarizeAndStapleDmg(dmgPath, keychainProfile) {
   run("xcrun", ["stapler", "validate", dmgPath]);
 }
 
+function notarizeAndStapleAppBundle(appDir, keychainProfile) {
+  const zipPath = path.join(distDir, "Groovy-Connector-app-notary.zip");
+  fs.rmSync(zipPath, { force: true });
+  run("ditto", ["-c", "-k", "--keepParent", appDir, zipPath], {
+    cwd: path.dirname(appDir),
+  });
+  try {
+    run("xcrun", ["notarytool", "submit", zipPath, "--keychain-profile", keychainProfile, "--wait"]);
+    run("xcrun", ["stapler", "staple", appDir]);
+    run("xcrun", ["stapler", "validate", appDir]);
+    run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appDir]);
+  } finally {
+    fs.rmSync(zipPath, { force: true });
+  }
+}
+
 function isDiskAttached(pathFragment) {
   try {
     const out = runCapture("hdiutil", ["info"]);
@@ -422,6 +438,11 @@ exec "$NODE" "$CONNECTOR" --relay "wss://groovy-relay.fly.dev" --pair "$CODE" "\
     console.log(`Signing app bundle with identity: ${signingIdentity}`);
     writeMacosEntitlements(entitlementsPath);
     signAppBundle(appDir, signingIdentity, entitlementsPath);
+  }
+
+  if (shouldNotarize) {
+    console.log(`Notarizing app bundle with keychain profile: ${notaryKeychainProfile}`);
+    notarizeAndStapleAppBundle(appDir, notaryKeychainProfile);
   }
 
   // Create DMG for distribution with drag-to-Applications visual

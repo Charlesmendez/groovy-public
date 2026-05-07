@@ -40,6 +40,10 @@ function usage() {
     --version 0.22.82 \\
     --macos-dmg apps/connector/dist/Groovy-Connector-macOS.dmg
 
+  node scripts/publish-connector-downloads.mjs \\
+    --version 0.22.82 \\
+    --windows-exe apps/connector/dist/Groovy-Connector-windows.exe
+
 Options:
   --channel <stable|beta|dev|enterprise>      Default: stable
   --bucket <bucket>                           Default: groovy-downloads
@@ -47,6 +51,8 @@ Options:
   --license-types <csv>                       Default: personal,enterprise,enterprise_reseller
   --chunk-size <bytes>                        Default: 41943040
   --platform-macos <value>                    Default: macos
+  --windows-exe <path>
+  --platform-windows <value>                  Default: windows
   --release-notes-url <url>
   --dry-run
 `);
@@ -61,6 +67,7 @@ function parseArgs(argv) {
     dryRun: false,
     licenseTypes: DEFAULT_LICENSE_TYPES,
     macosPlatform: "macos",
+    windowsPlatform: "windows",
     releaseNotesUrl: null,
   };
 
@@ -80,6 +87,8 @@ function parseArgs(argv) {
     else if (key === "--license-types") args.licenseTypes = splitCsv(next());
     else if (key === "--macos-dmg") args.macosDmg = next();
     else if (key === "--platform-macos") args.macosPlatform = next();
+    else if (key === "--windows-exe") args.windowsExe = next();
+    else if (key === "--platform-windows") args.windowsPlatform = next();
     else if (key === "--release-notes-url") args.releaseNotesUrl = next();
     else if (key === "--dry-run") args.dryRun = true;
     else usage();
@@ -88,7 +97,7 @@ function parseArgs(argv) {
   if (!args.version || !String(args.version).trim()) usage();
   args.version = String(args.version).trim().replace(/^v/i, "");
   args.prefix = String(args.prefix || `connector/releases/${args.version}`).replace(/^\/+|\/+$/g, "");
-  if (!args.macosDmg) usage();
+  if (!args.macosDmg && !args.windowsExe) usage();
   if (!["stable", "beta", "dev", "enterprise"].includes(args.channel)) {
     throw new Error(`Invalid channel: ${args.channel}`);
   }
@@ -311,7 +320,9 @@ async function uploadChunkedArtifact(config, artifact, options) {
       });
       offset += bytesRead;
       index += 1;
-      console.log(`[publish-downloads] uploaded chunk ${index} for ${filename}`);
+      console.log(
+        `[publish-downloads] ${options.dryRun ? "prepared" : "uploaded"} chunk ${index} for ${filename}`
+      );
     }
   } finally {
     fs.closeSync(fd);
@@ -352,40 +363,63 @@ async function uploadChunkedArtifact(config, artifact, options) {
 
 async function main() {
   const args = parseArgs(process.argv);
-  const macosPath = path.resolve(args.macosDmg);
-  if (!fs.existsSync(macosPath)) {
-    throw new Error(`Missing macOS DMG: ${macosPath}`);
+  const artifacts = [];
+  if (args.macosDmg) {
+    const macosPath = path.resolve(args.macosDmg);
+    if (!fs.existsSync(macosPath)) {
+      throw new Error(`Missing macOS DMG: ${macosPath}`);
+    }
+
+    console.log(`[publish-downloads] verifying notarized macOS DMG: ${macosPath}`);
+    verifyMacosDmg(macosPath);
+    artifacts.push({
+      path: macosPath,
+      platform: args.macosPlatform,
+      contentType: "application/x-apple-diskimage",
+    });
   }
 
-  console.log(`[publish-downloads] verifying notarized macOS DMG: ${macosPath}`);
-  verifyMacosDmg(macosPath);
+  if (args.windowsExe) {
+    const windowsPath = path.resolve(args.windowsExe);
+    if (!fs.existsSync(windowsPath)) {
+      throw new Error(`Missing Windows installer: ${windowsPath}`);
+    }
+    artifacts.push({
+      path: windowsPath,
+      platform: args.windowsPlatform,
+      contentType: "application/vnd.microsoft.portable-executable",
+    });
+  }
 
   const config = supabaseConfig();
-  const artifact = {
-    path: macosPath,
-    platform: args.macosPlatform,
-    contentType: "application/x-apple-diskimage",
-  };
-  const published = await uploadChunkedArtifact(config, artifact, {
-    version: args.version,
-    channel: args.channel,
-    bucket: args.bucket,
-    prefix: args.prefix,
-    chunkSize: args.chunkSize,
-    licenseTypes: args.licenseTypes,
-    releaseNotesUrl: args.releaseNotesUrl,
-    dryRun: args.dryRun,
-  });
+  const published = [];
+  for (const artifact of artifacts) {
+    published.push(
+      await uploadChunkedArtifact(config, artifact, {
+        version: args.version,
+        channel: args.channel,
+        bucket: args.bucket,
+        prefix: args.prefix,
+        chunkSize: args.chunkSize,
+        licenseTypes: args.licenseTypes,
+        releaseNotesUrl: args.releaseNotesUrl,
+        dryRun: args.dryRun,
+      })
+    );
+  }
 
   if (args.dryRun) {
     console.log("[publish-downloads] dry run complete");
-    console.log(JSON.stringify(published.row, null, 2));
+    console.log(JSON.stringify(published.map((item) => item.row), null, 2));
     return;
   }
 
-  const row = await publishDownloadRow(config, published.row);
-  console.log("[publish-downloads] active download row updated");
-  console.log(JSON.stringify(row, null, 2));
+  const rows = [];
+  for (const item of published) {
+    rows.push(await publishDownloadRow(config, item.row));
+  }
+  console.log("[publish-downloads] active download rows updated");
+  console.log(JSON.stringify(rows, null, 2));
 }
 
 main().catch((err) => {
