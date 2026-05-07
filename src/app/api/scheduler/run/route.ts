@@ -21,12 +21,12 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 800;
 const SCHEDULER_ORCH_MAX_STEPS = (() => {
   const raw = Number(process.env.SCHEDULER_ORCH_MAX_STEPS);
-  if (!Number.isFinite(raw)) return 6;
-  return Math.max(1, Math.min(6, Math.trunc(raw)));
+  if (!Number.isFinite(raw)) return 10;
+  return Math.max(1, Math.min(20, Math.trunc(raw)));
 })();
 const SCHEDULER_ORCH_SOFT_BUDGET_MS = (() => {
   const raw = Number(process.env.SCHEDULER_ORCH_SOFT_BUDGET_MS);
-  if (!Number.isFinite(raw)) return 12 * 60 * 1000;
+  if (!Number.isFinite(raw)) return 10 * 60 * 1000;
   return Math.max(60_000, Math.min(780_000, Math.trunc(raw)));
 })();
 const SCHEDULER_DATA_QUERY_TIMEOUT_MS = (() => {
@@ -784,7 +784,8 @@ export async function POST(req: Request) {
         // Keep each scheduled server round inside the serverless time budget by limiting steps.
         // Continuations still work via traceId + toolResults when connector executes are needed.
         const maxStepsForJob =
-          parseIntInRange(taskOptions?.orchestrator_max_steps, 1, 6) || SCHEDULER_ORCH_MAX_STEPS;
+          parseIntInRange(taskOptions?.orchestrator_max_steps, 1, 20) ||
+          SCHEDULER_ORCH_MAX_STEPS;
         const softBudgetMsForJob =
           parseIntInRange(taskOptions?.orchestrator_round_budget_ms, 60_000, 780_000) ||
           SCHEDULER_ORCH_SOFT_BUDGET_MS;

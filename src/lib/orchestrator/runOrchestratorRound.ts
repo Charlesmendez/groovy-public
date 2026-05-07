@@ -1767,6 +1767,7 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     30
   );
   let loggedDataQueryReauthStop = false;
+  let loggedScheduledDeadlineStop = false;
   const legacyStepBudgetStop = stepCountIs(effectiveMaxSteps) as (args: {
     steps: Array<{ toolCalls?: Array<{ toolName?: string }> }>;
   }) => boolean;
@@ -1794,6 +1795,32 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     const toolCalls = last?.toolCalls || [];
     if (toolCalls.some((tc) => String(tc?.toolName || "") === "runtime_branch_parallel")) {
       return true;
+    }
+    if (
+      args.scheduledMode === true &&
+      typeof args.scheduledHardDeadlineAtMs === "number" &&
+      Number.isFinite(args.scheduledHardDeadlineAtMs)
+    ) {
+      const guardRaw = Number(process.env.SCHEDULED_ROUND_GUARD_MS);
+      const guardMs = Number.isFinite(guardRaw)
+        ? Math.max(5_000, Math.min(Math.trunc(guardRaw), 120_000))
+        : 60_000;
+      if (Date.now() >= args.scheduledHardDeadlineAtMs - guardMs) {
+        if (!loggedScheduledDeadlineStop) {
+          loggedScheduledDeadlineStop = true;
+          console.warn(
+            "[runOrchestratorRound] stop_on_scheduled_deadline",
+            JSON.stringify({
+              traceId,
+              effectiveMaxSteps,
+              remainingMs: Math.max(0, args.scheduledHardDeadlineAtMs - Date.now()),
+              guardMs,
+              steps: steps.length,
+            })
+          );
+        }
+        return true;
+      }
     }
     return legacyStepBudgetStop({ steps });
   };

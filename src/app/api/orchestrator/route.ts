@@ -1742,6 +1742,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
       async start(controller) {
         let streamClosed = false;
         let streamedText = "";
+        let needsClientContinuation = false;
 
         const safeEnqueue = (data: Uint8Array) => {
           if (streamClosed) return;
@@ -1891,6 +1892,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
             "__browser_task__" in (parsedOutput as Record<string, unknown>);
 
           if (isBrowserTask) {
+            needsClientContinuation = true;
             const browserTaskResult = parsedOutput as {
               __browser_task__: true;
               task: string;
@@ -1929,6 +1931,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
             "__ui_open_code__" in (parsedOutput as Record<string, unknown>);
 
           if (isUiOpenCode) {
+            needsClientContinuation = true;
             const uiResult = parsedOutput as {
               __ui_open_code__: true;
               agentId?: string;
@@ -1967,6 +1970,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
             "__connector_execute__" in (parsedOutput as Record<string, unknown>);
 
           if (isConnectorExecute) {
+            needsClientContinuation = true;
             const connectorResult = parsedOutput as {
               __connector_execute__: true;
               type: string;
@@ -2069,6 +2073,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
             );
 
             if (dataResult.needsReauth) {
+              needsClientContinuation = true;
               console.log(
                 "[orchestrator-needs-reauth]",
                 JSON.stringify({
@@ -2316,6 +2321,9 @@ For browser work in this turn, use browser_task instead of the low-level browser
                 sdkResult.metrics?.toolExecutionMsTotal ?? measuredToolMsFromEvents,
             })
           );
+          const hitAgentSdkStepBudget =
+            typeof sdkResult.metrics?.numTurns === "number" &&
+            sdkResult.metrics.numTurns >= effectiveStepBudget;
           if (
             typeof sdkResult.metrics?.numTurns === "number" &&
             sdkResult.metrics.numTurns >= effectiveStepBudget
@@ -2441,7 +2449,13 @@ For browser work in this turn, use browser_task instead of the low-level browser
           // Server-side persist: save the assistant message so it survives client
           // disconnects (e.g. mobile sleep). Best-effort, never blocks the stream.
           // Uses trace_id to avoid duplicates with the client-side persist.
-          if (sdkResult?.text?.trim() && sessionId && traceId) {
+          if (
+            sdkResult?.text?.trim() &&
+            sessionId &&
+            traceId &&
+            !needsClientContinuation &&
+            !hitAgentSdkStepBudget
+          ) {
             const assistantContent = sdkResult.text.trim();
             (async () => {
               try {
@@ -2472,7 +2486,14 @@ For browser work in this turn, use browser_task instead of the low-level browser
           }
 
           safeEnqueue(
-            encoder.encode(`data: ${JSON.stringify({ type: "done", traceId })}\n\n`)
+            encoder.encode(
+              `data: ${JSON.stringify({
+                type: "done",
+                traceId,
+                hitStepBudget: hitAgentSdkStepBudget,
+                needsClientContinuation,
+              })}\n\n`
+            )
           );
         } catch (err) {
           const errorMessage = formatOrchestratorError(err);
@@ -2705,6 +2726,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
   const customStream = new ReadableStream({
     async start(controller) {
       let streamClosed = false;
+      let needsClientContinuation = false;
       
       // Safe enqueue that won't throw if controller is closed
       const safeEnqueue = (data: Uint8Array) => {
@@ -2927,6 +2949,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
               && "__browser_task__" in (parsedOutput as Record<string, unknown>);
             
             if (isBrowserTask) {
+              needsClientContinuation = true;
               const browserTaskResult = parsedOutput as {
                 __browser_task__: true;
                 task: string;
@@ -2963,6 +2986,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
               "__ui_open_code__" in (parsedOutput as Record<string, unknown>);
 
             if (isUiOpenCode) {
+              needsClientContinuation = true;
               const uiResult = parsedOutput as {
                 __ui_open_code__: true;
                 agentId?: string;
@@ -2996,6 +3020,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
               && "__connector_execute__" in (parsedOutput as Record<string, unknown>);
             
             if (isConnectorExecute) {
+              needsClientContinuation = true;
               const connectorResult = parsedOutput as {
                 __connector_execute__: true;
                 type: string;
@@ -3072,6 +3097,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
 
                 // Check if data agent requires re-authorization
                 if (dataResult.needsReauth) {
+                  needsClientContinuation = true;
                   console.log("[orchestrator-needs-reauth]", JSON.stringify({
                     traceId,
                     provider: dataResult.provider,
@@ -3236,7 +3262,13 @@ For browser work in this turn, use browser_task instead of the low-level browser
         // Server-side persist (legacy path): save assistant message so it survives
         // client disconnects (e.g. mobile sleep). Best-effort.
         // Uses trace_id to avoid duplicates with the client-side persist.
-        if (legacyAccumulatedText.trim() && sessionId && traceId) {
+        if (
+          legacyAccumulatedText.trim() &&
+          sessionId &&
+          traceId &&
+          !needsClientContinuation &&
+          !loggedStepBudgetHit
+        ) {
           (async () => {
             try {
               const { data: existing } = await supabase
@@ -3266,7 +3298,14 @@ For browser work in this turn, use browser_task instead of the low-level browser
 
         // Stream completed - send done event
         safeEnqueue(
-          encoder.encode(`data: ${JSON.stringify({ type: "done", traceId })}\n\n`)
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "done",
+              traceId,
+              hitStepBudget: loggedStepBudgetHit,
+              needsClientContinuation,
+            })}\n\n`
+          )
         );
       } catch (err) {
         const errorMessage = formatOrchestratorError(err);

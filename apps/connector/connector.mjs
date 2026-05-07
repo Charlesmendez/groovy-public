@@ -2604,6 +2604,45 @@ function sendToRelay(msg) {
   }
 }
 
+const relayResultBacklog = new Map(); // requestId -> { msg, queuedAtMs }
+const RELAY_RESULT_BACKLOG_TTL_MS = 20 * 60 * 1000;
+const RELAY_RESULT_BACKLOG_MAX = 100;
+
+function pruneRelayResultBacklog(nowMs = Date.now()) {
+  for (const [requestId, entry] of relayResultBacklog.entries()) {
+    if (!entry || nowMs - Number(entry.queuedAtMs || 0) > RELAY_RESULT_BACKLOG_TTL_MS) {
+      relayResultBacklog.delete(requestId);
+    }
+  }
+  while (relayResultBacklog.size > RELAY_RESULT_BACKLOG_MAX) {
+    const oldest = relayResultBacklog.keys().next().value;
+    if (!oldest) break;
+    relayResultBacklog.delete(oldest);
+  }
+}
+
+function queueRelayResult(msg) {
+  const requestId = String(msg?.request_id || "").trim();
+  if (!requestId) return;
+  pruneRelayResultBacklog();
+  relayResultBacklog.set(requestId, { msg, queuedAtMs: Date.now() });
+}
+
+function flushRelayResultBacklog() {
+  pruneRelayResultBacklog();
+  for (const [requestId, entry] of Array.from(relayResultBacklog.entries())) {
+    if (sendToRelay(entry.msg)) {
+      relayResultBacklog.delete(requestId);
+    }
+  }
+}
+
+function sendRelayResult(msg) {
+  if (sendToRelay(msg)) return true;
+  queueRelayResult(msg);
+  return false;
+}
+
 function isDetachedWhatsAppErrorMessage(message) {
   const raw = typeof message === "string" ? message : String(message || "");
   const lower = raw.trim().toLowerCase();
@@ -4278,7 +4317,7 @@ async function runScheduledJob(job) {
             ? requestedTimeoutMs
             : Number.isFinite(envBrowserTimeoutMs) && envBrowserTimeoutMs > 0
               ? envBrowserTimeoutMs
-              : 8 * 60 * 1000;
+              : 12 * 60 * 1000;
 
         const usePlaywright = await isPlaywrightAvailable();
         if (!usePlaywright) {
@@ -4658,7 +4697,16 @@ async function runScheduledJob(job) {
       }
 
       const baseUrl = String(appUrl).replace(/\/+$/, "");
-      const MAX_ROUNDS = 12;
+      const configuredRoundBudget = Number(
+        process.env.SCHEDULER_ORCHESTRATOR_ROUND_BUDGET ||
+          process.env.SCHEDULER_ORCHESTRATOR_MAX_ROUNDS ||
+          process.env.WHATSAPP_ORCHESTRATOR_ROUND_BUDGET ||
+          ""
+      );
+      const MAX_ROUNDS =
+        Number.isFinite(configuredRoundBudget) && configuredRoundBudget > 0
+          ? Math.max(12, Math.min(180, Math.trunc(configuredRoundBudget)))
+          : 48;
       let traceId = null;
       let toolResults = null;
       const upsertToolResult = (nextResult) => {
@@ -4865,6 +4913,20 @@ async function runScheduledJob(job) {
         if (json.kind === "final") {
           stdout = typeof json?.text === "string" ? json.text : JSON.stringify(json);
           stderr = "";
+          if (looksLikeIncompleteScheduledFinal(stdout)) {
+            warn("runScheduledJob: incomplete scheduled final detected", {
+              jobId,
+              traceId,
+              preview: stdout.slice(0, 240),
+            });
+            status = "error";
+            exitCode = 1;
+            errorText = "scheduled_orchestrator_incomplete_final";
+            retryableFailure = true;
+            retryReason = errorText;
+            roundResolved = true;
+            break;
+          }
           // Reliability fallback:
           // heartbeat route should normally return needs_connector for WhatsApp delivery.
           // If server responds final with a non-empty text while WhatsApp delivery is enabled,
@@ -7792,6 +7854,7 @@ async function main() {
           capabilities: { claudeCliInstalled, skillsManager: true },
         })
       );
+      flushRelayResultBacklog();
 
       // App-level ping watchdog: more reliable than WS ping/pong in some environments.
       pingOutstanding = false;
@@ -10820,71 +10883,67 @@ async function main() {
           }
         }
 
-        if (ws.readyState === WebSocket.OPEN) {
-          // result is the full stream-json "result" event object.
-          // The client expects result to be the text string, and session_id / cost at top level.
-          const rawResultField = result && typeof result === "object" ? result.result : undefined;
-          let resultText = "";
-          if (typeof rawResultField === "string") {
-            resultText = rawResultField;
-          } else if (rawResultField !== undefined && rawResultField !== null) {
-            try {
-              resultText = JSON.stringify(rawResultField);
-            } catch {
-              resultText = String(rawResultField);
-            }
+        // result is the full stream-json "result" event object.
+        // The client expects result to be the text string, and session_id / cost at top level.
+        const rawResultField = result && typeof result === "object" ? result.result : undefined;
+        let resultText = "";
+        if (typeof rawResultField === "string") {
+          resultText = rawResultField;
+        } else if (rawResultField !== undefined && rawResultField !== null) {
+          try {
+            resultText = JSON.stringify(rawResultField);
+          } catch {
+            resultText = String(rawResultField);
           }
-          const totalCostUsd = typeof result?.total_cost_usd === "number" ? result.total_cost_usd : undefined;
-          const usageObj = result && typeof result === "object" ? result.usage : undefined;
-          const inputTokens =
-            typeof result?.input_tokens === "number"
-              ? result.input_tokens
-              : usageObj && typeof usageObj === "object" && typeof usageObj.input_tokens === "number"
-                ? usageObj.input_tokens
-                : undefined;
-          const outputTokens =
-            typeof result?.output_tokens === "number"
-              ? result.output_tokens
-              : usageObj && typeof usageObj === "object" && typeof usageObj.output_tokens === "number"
-                ? usageObj.output_tokens
-                : undefined;
-          const totalTokens =
-            typeof result?.total_tokens === "number"
-              ? result.total_tokens
-              : typeof inputTokens === "number" && typeof outputTokens === "number"
-                ? inputTokens + outputTokens
-                : undefined;
-          const resultDiffs = Array.isArray(result?.diffs) ? result.diffs : [];
-          ws.send(
-            JSON.stringify({
-              type: "claude_run_result",
-              request_id: requestId,
-              ok,
-              result: resultText,
-              session_id: result?.session_id || null,
-              model: cliModel,
-              total_cost_usd: totalCostUsd,
-              cost_usd: totalCostUsd,
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              total_tokens: totalTokens,
-              usage: usageObj,
-              ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
-              ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
-              ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
-              ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
-              diffs: resultDiffs,
-              error: errorText,
-              timed_out: timedOut,
-              aborted,
-              partial,
-              exit_code: exitCode,
-              signal: exitSignal,
-              has_result_event: hadResultEvent,
-              duration_ms: Math.max(0, Date.now() - startedAt),
-            })
-          );
         }
+        const totalCostUsd = typeof result?.total_cost_usd === "number" ? result.total_cost_usd : undefined;
+        const usageObj = result && typeof result === "object" ? result.usage : undefined;
+        const inputTokens =
+          typeof result?.input_tokens === "number"
+            ? result.input_tokens
+            : usageObj && typeof usageObj === "object" && typeof usageObj.input_tokens === "number"
+              ? usageObj.input_tokens
+              : undefined;
+        const outputTokens =
+          typeof result?.output_tokens === "number"
+            ? result.output_tokens
+            : usageObj && typeof usageObj === "object" && typeof usageObj.output_tokens === "number"
+              ? usageObj.output_tokens
+              : undefined;
+        const totalTokens =
+          typeof result?.total_tokens === "number"
+            ? result.total_tokens
+            : typeof inputTokens === "number" && typeof outputTokens === "number"
+              ? inputTokens + outputTokens
+              : undefined;
+        const resultDiffs = Array.isArray(result?.diffs) ? result.diffs : [];
+        sendRelayResult({
+          type: "claude_run_result",
+          request_id: requestId,
+          ok,
+          result: resultText,
+          session_id: result?.session_id || null,
+          model: cliModel,
+          total_cost_usd: totalCostUsd,
+          cost_usd: totalCostUsd,
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: totalTokens,
+          usage: usageObj,
+          ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
+          ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
+          ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
+          ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
+          diffs: resultDiffs,
+          error: errorText,
+          timed_out: timedOut,
+          aborted,
+          partial,
+          exit_code: exitCode,
+          signal: exitSignal,
+          has_result_event: hadResultEvent,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
         return;
       }
 
@@ -11806,7 +11865,7 @@ async function main() {
             ? requestedTimeoutMs
             : Number.isFinite(envBrowserTimeoutMs) && envBrowserTimeoutMs > 0
               ? envBrowserTimeoutMs
-              : 8 * 60 * 1000;
+              : 12 * 60 * 1000;
 
         if (!requestId) {
           if (ws.readyState === WebSocket.OPEN) {
@@ -11974,17 +12033,15 @@ async function main() {
           browserTaskClaudeSessionByProfile.delete(browserTaskSessionKey);
         }
 
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: "browser_task_run_result",
-            request_id: requestId,
-            ...result,
-            ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
-            ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
-            ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
-            ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
-          }));
-        }
+        sendRelayResult({
+          type: "browser_task_run_result",
+          request_id: requestId,
+          ...result,
+          ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
+          ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
+          ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
+          ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
+        });
         return;
       }
 
@@ -12194,29 +12251,37 @@ async function main() {
       // Stop scheduler loops until we reconnect + re-auth
       stopSchedulerLoops();
 
-      // Any in-flight browser_task_run / claude_run can no longer return a result while relay is down.
-      // Abort them so Playwright/Claude child processes don't keep running orphaned.
-      if (pendingBrowserTaskRuns.size > 0) {
-        log("aborting in-flight browser tasks after relay disconnect", {
-          count: pendingBrowserTaskRuns.size,
+      // Keep long-running work alive across relay reconnects. Final results are
+      // sent through the current relay socket, or queued briefly if reconnect has
+      // not completed yet. On explicit shutdown we still abort below.
+      if (shouldReconnect && (pendingBrowserTaskRuns.size > 0 || pendingClaudeRuns.size > 0)) {
+        log("keeping in-flight long-running requests across relay reconnect", {
+          browserTaskRuns: pendingBrowserTaskRuns.size,
+          claudeRuns: pendingClaudeRuns.size,
         });
-        for (const [, controller] of pendingBrowserTaskRuns.entries()) {
-          try {
-            controller.abort();
-          } catch {
-            // ignore
+      } else {
+        if (pendingBrowserTaskRuns.size > 0) {
+          log("aborting in-flight browser tasks after relay disconnect", {
+            count: pendingBrowserTaskRuns.size,
+          });
+          for (const [, controller] of pendingBrowserTaskRuns.entries()) {
+            try {
+              controller.abort();
+            } catch {
+              // ignore
+            }
           }
+          pendingBrowserTaskRuns.clear();
         }
-        pendingBrowserTaskRuns.clear();
-      }
-      if (pendingClaudeRuns.size > 0) {
-        log("aborting in-flight claude runs after relay disconnect", {
-          count: pendingClaudeRuns.size,
-        });
-        for (const [, entry] of pendingClaudeRuns.entries()) {
-          try { abortPendingClaudeRun(entry); } catch { /* ignore */ }
+        if (pendingClaudeRuns.size > 0) {
+          log("aborting in-flight claude runs after relay disconnect", {
+            count: pendingClaudeRuns.size,
+          });
+          for (const [, entry] of pendingClaudeRuns.entries()) {
+            try { abortPendingClaudeRun(entry); } catch { /* ignore */ }
+          }
+          pendingClaudeRuns.clear();
         }
-        pendingClaudeRuns.clear();
       }
 
       // Close WebRTC sessions

@@ -387,7 +387,12 @@ type SSEEvent =
       agentId: string;
       linkToken?: string;
     }
-  | { type: "done"; traceId: string }
+  | {
+      type: "done";
+      traceId: string;
+      hitStepBudget?: boolean;
+      needsClientContinuation?: boolean;
+    }
   | { type: "error"; error: string };
 
 // Browser task callback type (for Computer Use)
@@ -2025,6 +2030,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           connectorToolResults: Array<{ toolCallId: string; toolName: string; result: string }>;
           serverSideToolResults: Array<{ toolCallId: string; toolName: string; result: string }>;
           roundText: string;
+          hitStepBudget: boolean;
+          needsClientContinuation: boolean;
         }> => {
           ensureContextPrepActivity();
           const agentId = agentIdBySessionIdRef.current.get(sessionId) || null;
@@ -2093,6 +2100,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           roundText = "";
           let streamError: string | null = null;
           let sawDoneEvent = false;
+          let hitStepBudget = false;
+          let needsClientContinuation = false;
           const finalizeDoneActivities = () => {
             // Mark all remaining "running" activities as "complete".
             // IMPORTANT: Don't auto-complete protected browser/code tasks that can
@@ -2581,6 +2590,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
                 
                 case "done":
                   sawDoneEvent = true;
+                  hitStepBudget = event.hitStepBudget === true;
+                  needsClientContinuation = event.needsClientContinuation === true;
                   finalizeDoneActivities();
                   break;
               }
@@ -2614,6 +2625,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
                 }
               } else if (event.type === "done") {
                 sawDoneEvent = true;
+                hitStepBudget = event.hitStepBudget === true;
+                needsClientContinuation = event.needsClientContinuation === true;
                 finalizeDoneActivities();
               } else if (event.type === "error") {
                 streamError =
@@ -2637,15 +2650,21 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
               "Orchestrator stream ended unexpectedly before completion. Please retry."
             );
           }
-          return { connectorToolResults, serverSideToolResults, roundText };
+          return {
+            connectorToolResults,
+            serverSideToolResults,
+            roundText,
+            hitStepBudget,
+            needsClientContinuation,
+          };
         };
 
         // Loop orchestrator <-> connector until there are no more connector tool results to return (bounded).
         // IMPORTANT: append tool results to llmHistory (tool-runner style) so we don't re-send
         // an ever-growing toolResults blob every round.
-        // Prevent very long connector tool ping-pong loops (e.g. repeated read/check cycles).
-        // 20 rounds still allows complex multi-step workflows while keeping UX bounded.
-        const MAX_ROUNDS = 20;
+        // Prevent unbounded connector/server ping-pong loops while still allowing
+        // genuinely long agentic work such as account reconciliation.
+        const MAX_ROUNDS = 48;
         const extractSuccessfulSiteDevStart = (
           results: Array<{ toolCallId: string; toolName: string; result: string }>
         ): { slug?: string; port: number } | null => {
@@ -2695,7 +2714,12 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           | undefined = undefined;
         for (let i = 0; i < MAX_ROUNDS; i++) {
           throwIfRunCancelled();
-          const { connectorToolResults, serverSideToolResults, roundText: rt } =
+          const {
+            connectorToolResults,
+            serverSideToolResults,
+            roundText: rt,
+            hitStepBudget,
+          } =
             await runOrchestratorRound({
               message: i === 0 ? firstRoundMessage : "",
               history: llmHistory,
@@ -2704,7 +2728,26 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           throwIfRunCancelled();
           pendingToolResultsForServer = undefined;
 
-          // If there are no connector tool calls this round, this is the final answer.
+          // If a server round hit its tool-step budget after server-side tool work,
+          // keep going automatically with those tool results instead of treating
+          // pre-tool/progress text ("now let me check...") as a final answer.
+          if (
+            !connectorToolResults.length &&
+            hitStepBudget &&
+            serverSideToolResults.length > 0
+          ) {
+            const trMsg = toolResultsToHistoryMessage(serverSideToolResults);
+            if (trMsg) {
+              llmHistory = [...llmHistory, trMsg];
+            }
+            pendingToolResultsForServer = serverSideToolResults.map((tr) => ({
+              ...tr,
+              result: compactToolResultForServer(tr.toolName, tr.result),
+            }));
+            continue;
+          }
+
+          // If there are no connector tool calls and no forced continuation, this is the final answer.
           if (!connectorToolResults.length) {
             finalText = rt;
             hitRoundLimit = false;
@@ -2972,11 +3015,9 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
     isStreamingRef.current = isStreaming;
   }, [isStreaming]);
 
-  // Recover from mobile sleep/wake: if we were streaming when the phone went to
-  // sleep, the SSE connection is dead. When the user returns, abort the stale
-  // stream and reload messages from the DB (the server persists the response).
-  // Also reload the session even if not streaming, to pick up any messages that
-  // arrived while the app was backgrounded.
+  // Recover from mobile sleep/wake. For active runs, do not abort: connector
+  // and browser work is client-driven, so aborting the fetch kills the job
+  // halfway through. Reload only when idle.
   useEffect(() => {
     let lastHiddenAt = 0;
 
@@ -2989,26 +3030,12 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       const sid = currentSessionIdRef.current;
 
       if (isStreamingRef.current) {
-        console.log("[useOrchestrator] Woke from sleep while streaming, recovering…", {
+        console.log("[useOrchestrator] Woke while streaming; keeping active run alive", {
           source,
           sleepDurationMs,
           sessionId: sid,
         });
-        // Abort the dead SSE fetch
-        if (abortRef.current && !abortRef.current.signal.aborted) {
-          abortRef.current.abort();
-        }
-        // Clear stale streaming UI
-        activeRunIdRef.current += 1;
-        setIsStreaming(false);
-        isStreamingRef.current = false;
-        setStreamingContent("");
-        setCurrentToolCalls([]);
-        setAgentActivities((prev) =>
-          prev.map((a) =>
-            a.status === "running" ? { ...a, status: "complete" as const } : a
-          )
-        );
+        return;
       }
 
       // Reload session from DB to pick up any completed messages

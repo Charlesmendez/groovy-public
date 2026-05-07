@@ -1523,7 +1523,7 @@ function CommandCenterDashboardInner() {
   
   // Minimum required connector version (update this when connector features change)
   // Bump this when connector protocol/lifecycle expectations change.
-  const MIN_CONNECTOR_VERSION = "0.22.82";
+  const MIN_CONNECTOR_VERSION = "0.22.83";
   const connectorGuide = useConnectorInstallGuide();
   
   // Version comparison helper
@@ -1963,27 +1963,9 @@ function CommandCenterDashboardInner() {
   const relaySubscribe = relay.subscribe;
   const relaySend = relay.send;
 
-  const failPendingConnectorRequestsForDevice = useCallback(
-    (deviceId: string, errorText: string) => {
-      if (!deviceId) return;
-      const pendingMap = pendingConnectorRequests.current;
-      for (const [requestId, pending] of Array.from(pendingMap.entries())) {
-        if (pending.deviceId !== deviceId) continue;
-        clearTimeout(pending.timeout);
-        try {
-          pending.resolve({ ok: false, error: errorText });
-        } catch {
-          // no-op
-        }
-        pendingMap.delete(requestId);
-      }
-    },
-    []
-  );
-
   const CONNECTOR_DEFAULT_TIMEOUT_MS = 30_000;
   const CONNECTOR_CREDENTIAL_TIMEOUT_MS = 120_000;
-  const CONNECTOR_BROWSER_TASK_TIMEOUT_MS = 9 * 60 * 1000;
+  const CONNECTOR_BROWSER_TASK_TIMEOUT_MS = 13 * 60 * 1000;
   const CONNECTOR_TERMINAL_TIMEOUT_MS = 10 * 60 * 1000;
   const CONNECTOR_CLAUDE_RUN_TIMEOUT_MS = 15 * 60 * 1000;
   const CONNECTOR_SITE_DEV_START_TIMEOUT_MS = 210_000;
@@ -2072,10 +2054,9 @@ function CommandCenterDashboardInner() {
         const deviceId = String((msg as { device_id?: string }).device_id || "");
         if (deviceId) {
           onlineDevicesRef.current.delete(deviceId);
-          failPendingConnectorRequestsForDevice(
-            deviceId,
-            "Connector went offline while request was running."
-          );
+          // Do not fail in-flight tool requests on a transient relay/device
+          // offline event. Long browser/code jobs can survive a reconnect and
+          // still return by request_id; their own timeouts remain the hard stop.
         }
 
         const desired = pickDesiredActiveDeviceId(activeDeviceIdRef.current);
@@ -2132,7 +2113,7 @@ function CommandCenterDashboardInner() {
     });
     
     return unsub;
-  }, [relaySubscribe, pickDesiredActiveDeviceId, pickVisibleAiyraVoiceHealth, failPendingConnectorRequestsForDevice]);
+  }, [relaySubscribe, pickDesiredActiveDeviceId, pickVisibleAiyraVoiceHealth]);
 
   // Re-evaluate active connector after preference/device-id changes.
   useEffect(() => {

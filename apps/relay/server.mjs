@@ -3951,17 +3951,47 @@ wss.on("connection", (ws) => {
         }
 
         const requestId = msg?.request_id ? String(msg.request_id) : randomUUID();
+        const rpcTimeoutMs = (() => {
+          if (msgType !== "browser_task_run") return null;
+          const requested = Number(msg?.timeout_ms);
+          const baseMs =
+            Number.isFinite(requested) && requested > 0
+              ? Math.trunc(requested)
+              : 13 * 60 * 1000;
+          return Math.max(60_000, Math.min(baseMs + 15_000, 20 * 60 * 1000));
+        })();
+        const timeoutId =
+          typeof rpcTimeoutMs === "number"
+            ? setTimeout(() => {
+                const pending = pendingRequests.get(requestId);
+                if (!pending || pending.type !== "connector_rpc") return;
+                pendingRequests.delete(requestId);
+                if (pending.browserWs) {
+                  wsSend(pending.browserWs, {
+                    type: `${String(pending.rpcType || msgType)}_result`,
+                    request_id: requestId,
+                    ok: false,
+                    error: "relay_timeout",
+                  });
+                }
+              }, rpcTimeoutMs)
+            : null;
+
         pendingRequests.set(requestId, {
           type: "connector_rpc",
           browserWs: ws,
           userId,
           deviceId,
           rpcType: msgType,
+          timeoutId,
+          connectorDisconnectedAt: null,
         });
 
         const ok = wsSend(connectorWs, { ...msg, request_id: requestId });
         if (!ok) {
+          const pending = pendingRequests.get(requestId);
           pendingRequests.delete(requestId);
+          if (pending?.timeoutId) clearTimeout(pending.timeoutId);
           wsSend(ws, {
             type: `${msgType}_result`,
             request_id: requestId,
@@ -4605,6 +4635,13 @@ wss.on("connection", (ws) => {
       for (const [requestId, pending] of pendingRequests.entries()) {
         if (pending?.deviceId !== info.deviceId) continue;
         if (pending?.type !== "connector_rpc_internal" && pending?.type !== "connector_rpc") continue;
+        if (
+          pending?.type === "connector_rpc" &&
+          String(pending.rpcType || "") === "browser_task_run"
+        ) {
+          pending.connectorDisconnectedAt = Date.now();
+          continue;
+        }
         pendingRequests.delete(requestId);
         if (pending?.timeoutId) {
           try {

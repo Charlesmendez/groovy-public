@@ -37,11 +37,11 @@ loadEnvFile(path.resolve(process.cwd(), ".env.local"));
 function usage() {
   console.error(`Usage:
   node scripts/publish-connector-downloads.mjs \\
-    --version 0.22.82 \\
+    --version 0.22.83 \\
     --macos-dmg apps/connector/dist/Groovy-Connector-macOS.dmg
 
   node scripts/publish-connector-downloads.mjs \\
-    --version 0.22.82 \\
+    --version 0.22.83 \\
     --windows-exe apps/connector/dist/Groovy-Connector-windows.exe
 
 Options:

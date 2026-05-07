@@ -51,6 +51,12 @@ export const browserScreenshotSchema = z.object({
 export const browserTaskSchema = z.object({
   task: z.string().describe("What task to accomplish in the browser. Be specific about URLs to visit and actions to take."),
   startUrl: z.string().optional().describe("Starting URL (if known). If not provided, Claude will figure out where to go."),
+  timeout_ms: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Optional timeout in milliseconds for unusually long authenticated browser work."),
 });
 
 // Credentials for authenticated browsing (stored locally on connector; never sent via chat)
@@ -2541,7 +2547,11 @@ Examples:
 - "Go to news.ycombinator.com and find today's top story"`,
       inputSchema: browserTaskSchema,
       execute: async (args: unknown) => {
-        const { task, startUrl } = args as { task: string; startUrl?: string };
+        const { task, startUrl, timeout_ms } = args as {
+          task: string;
+          startUrl?: string;
+          timeout_ms?: number;
+        };
         // Always run browser tasks on the connector via Playwright MCP (claude -p).
         // This is more reliable than the old Computer Use screenshot-based approach.
         // Pass API key / CLI token so the connector can spawn claude -p.
@@ -2557,6 +2567,7 @@ Examples:
           params: {
             task,
             start_url: startUrl,
+            timeout_ms,
             app_url: context.appBaseUrl || "",
             profile_name: "default",
             ...(useCliToken

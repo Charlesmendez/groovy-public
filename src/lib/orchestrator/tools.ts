@@ -29,6 +29,12 @@ export const browserTools = {
     inputSchema: z.object({
       task: z.string().describe("Natural language description of the browsing task to complete"),
       start_url: z.string().optional().describe("Optional URL to start at (e.g., 'google.com')"),
+      timeout_ms: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Optional timeout in milliseconds for unusually long authenticated browser work."),
     }),
   }),
 
@@ -544,6 +550,7 @@ export function toolToConnectorMessage(
         start_url: params.start_url,
         app_url: params.app_url,
         profile_name: params.profile_name || "default",
+        timeout_ms: params.timeout_ms,
       },
     };
   }
