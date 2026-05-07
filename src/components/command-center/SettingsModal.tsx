@@ -476,6 +476,21 @@ function isRestartableWhatsAppIssue(
   );
 }
 
+function isWhatsAppBrowserRuntimeIssue(
+  health: ConnectorWhatsAppHealth | null | undefined
+): boolean {
+  if (!health) return false;
+  const combined = `${String(health.reason || "")}; ${String(
+    health.detail || ""
+  )}`.toLowerCase();
+  return (
+    combined.includes("could not find chrome") ||
+    combined.includes(".cache/puppeteer") ||
+    combined.includes("puppeteer browser") ||
+    combined.includes("puppeteer browsers install")
+  );
+}
+
 export function SettingsModal({
   isOpen,
   onClose,
@@ -1877,6 +1892,9 @@ export function SettingsModal({
   const connectorIssueRestartable =
     connectorHasWhatsAppIssue &&
     isRestartableWhatsAppIssue(connectorWhatsAppHealth);
+  const connectorWhatsAppBrowserIssue =
+    connectorHasWhatsAppIssue &&
+    isWhatsAppBrowserRuntimeIssue(connectorWhatsAppHealth);
   const connectorStatusLabel = connectorHasWhatsAppIssue
     ? connectorWhatsAppStatus === "recovering"
       ? "Online · WhatsApp recovering"
@@ -2062,6 +2080,8 @@ export function SettingsModal({
                 <div className="text-[11px] text-zinc-400 mt-1">
                   {connectorWhatsAppHealth?.auto_restart_pending
                     ? "Automatic restart was requested. You can still click Restart if it doesn't recover quickly."
+                    : connectorWhatsAppBrowserIssue
+                      ? "The connector could not find a Chromium browser. Update to the latest connector or install Chrome, then restart."
                     : connectorIssueRestartable
                       ? "Click Restart to force a clean reconnect now."
                       : "This looks like a config/auth issue; restart may not fix it."}

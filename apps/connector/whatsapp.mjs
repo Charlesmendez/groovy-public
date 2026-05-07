@@ -383,20 +383,58 @@ async function executeLocalUnsubscribe({ unsubscribeUrl, unsubscribeMailto }) {
 }
 
 /**
- * On Windows, Puppeteer's bundled Chrome isn't included in the connector bundle.
- * Detect a usable Chromium-based browser (Edge ships with every Windows 10+ install).
- * On macOS/Linux, return null to let Puppeteer use its own bundled Chrome.
+ * The packaged connector does not ship Puppeteer's external browser cache.
+ * Prefer an installed Chromium-family browser so WhatsApp Web does not depend on
+ * ~/.cache/puppeteer having the exact Chrome revision required by whatsapp-web.js.
  */
 function detectBrowserExecutable() {
-  if (process.platform !== "win32") return null;
+  const envCandidates = [
+    process.env.GROOVY_WHATSAPP_CHROME_PATH,
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
+  ];
+
+  const macApp = (appName, executableName = appName) => [
+    path.join("/Applications", `${appName}.app`, "Contents", "MacOS", executableName),
+    path.join(homeDir(), "Applications", `${appName}.app`, "Contents", "MacOS", executableName),
+  ];
+
+  let platformCandidates = [];
+  if (process.platform === "darwin") {
+    platformCandidates = [
+      ...macApp("Google Chrome"),
+      ...macApp("Google Chrome Beta"),
+      ...macApp("Chromium"),
+      ...macApp("Microsoft Edge"),
+      ...macApp("Brave Browser"),
+      ...macApp("Arc"),
+    ];
+  } else if (process.platform === "win32") {
+    platformCandidates = [
+      // Edge (always present on Windows 10+)
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
+      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
+      // Chrome
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+    ];
+  } else {
+    platformCandidates = [
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+      "/usr/bin/microsoft-edge",
+      "/usr/bin/microsoft-edge-stable",
+      "/usr/bin/brave-browser",
+    ];
+  }
+
   const candidates = [
-    // Edge (always present on Windows 10+)
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
-    process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
-    // Chrome
-    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
-    process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+    ...envCandidates,
+    ...platformCandidates,
   ].filter(Boolean);
   for (const p of candidates) {
     try { if (fs.existsSync(p)) return p; } catch { /* skip */ }
@@ -2347,6 +2385,15 @@ export async function startWhatsAppBridge(opts = {}) {
     });
   }
 
+  const browserExecutable = detectBrowserExecutable();
+  if (browserExecutable) {
+    log("using installed browser for WhatsApp Web", { executablePath: browserExecutable });
+  } else {
+    warn(
+      "no installed Chromium browser detected for WhatsApp Web; falling back to Puppeteer browser cache"
+    );
+  }
+
   const clientOptions = {
     authStrategy: new LocalAuth({ dataPath }),
     // Let Puppeteer advertise the real browser UA. whatsapp-web.js defaults to
@@ -2355,7 +2402,7 @@ export async function startWhatsAppBridge(opts = {}) {
     userAgent: false,
     puppeteer: {
     headless: false,
-    ...(detectBrowserExecutable() ? { executablePath: detectBrowserExecutable() } : {}),
+    ...(browserExecutable ? { executablePath: browserExecutable } : {}),
     // 4 min: cold boots after app updates can be significantly slower on some Macs.
     // A higher timeout avoids false-negative startup failures that require manual restarts.
     protocolTimeout: 240_000,
