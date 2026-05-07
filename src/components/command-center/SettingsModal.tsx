@@ -48,7 +48,14 @@ import type { Provider, LlmKeyMode, KeyModes } from "@/lib/keys/resolveKeyMode";
 // Kept for backwards-compat with existing imports; not used by this modal anymore.
 export type FilesAgentInfo = { id: string; name: string; createdAt?: string };
 export type ObsidianVault = { name: string; path: string };
-export type SettingsFocusSection = "api-keys" | "files-agent" | "obsidian" | "aiyra-voice";
+export type SettingsFocusSection =
+  | "account"
+  | "connector"
+  | "billing"
+  | "api-keys"
+  | "files-agent"
+  | "obsidian"
+  | "aiyra-voice";
 
 type ConnectorWhatsAppHealth = {
   status?: "healthy" | "degraded" | "recovering" | "disabled" | "unknown";
@@ -422,6 +429,9 @@ function resolveInitialSettingsSection({
   currentKeyModes?: KeyModes;
   currentKeys: Partial<Record<Provider, { configured: boolean; lastUpdated?: string }>>;
 }): SettingsSection {
+  if (focusSection === "account") return "account";
+  if (focusSection === "connector") return "connector";
+  if (focusSection === "billing") return "billing";
   if (focusSection === "api-keys") return "api-keys";
   if (focusSection === "aiyra-voice") return "aiyra-voice";
   const hasPerProvider = Object.keys(currentKeyModes || {}).length > 0;

@@ -30,6 +30,8 @@ Commit and push the local workflow/code changes to private `groovy`; GitHub Acti
 
 Upload the current connector installers/source artifacts into private storage and register them in `/admin` so licensed users download through `/account/downloads`. Do not rely on public GitHub Release asset URLs for customer downloads.
 
+macOS customer DMGs must come from the signed/notarized release workflow, not from a local developer build. The release workflow runs `scripts/publish-connector-downloads.mjs`, which refuses to publish a macOS DMG unless `codesign`, `spctl`, and `stapler validate` all pass. A local unsigned `apps/connector/dist/Groovy-Connector-macOS.dmg` will produce Gatekeeper errors such as Apple being unable to verify the app or forcing the user to move it to Trash.
+
 If hosted Groovy Macs are used, upload the headless connector tarball to private
 storage and set:
 

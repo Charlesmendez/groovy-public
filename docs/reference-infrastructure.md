@@ -128,6 +128,14 @@ The account download API verifies the user license and converts those references
 
 Admin artifact creation can send either `fileUrl`/`archiveUrl` or `storageBucket` + `storagePath`.
 
+Large connector installers can use chunked private storage references:
+
+```text
+supabase-chunked://<bucket>/<manifest-path>.manifest.json
+```
+
+Use `scripts/publish-connector-downloads.mjs` from the macOS release workflow to create these manifests. For macOS DMGs, the script verifies Developer ID signing, Gatekeeper assessment, and notarization staple validation before it uploads chunks or activates the download row.
+
 ## Enterprise and Reseller Exports
 
 Enterprise admins can export true-up usage:

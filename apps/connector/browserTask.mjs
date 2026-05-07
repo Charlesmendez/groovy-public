@@ -1,9 +1,7 @@
-import { credentialGetSecret, credentialRequest } from "./credentials.mjs";
+import { credentialGetSecret } from "./credentials.mjs";
 import {
   initBrowser,
   browserNavigate,
-  browserEvaluate,
-  browserPressKey,
   computerUseAction,
   closeBrowser,
 } from "./browser.mjs";
@@ -183,9 +181,8 @@ function summarizeComputerUseToolCall(toolCall) {
 }
 
 // ---------------------------------------------------------------------------
-// Playwright MCP browser task runner (preferred path)
+// Playwright MCP browser task runner
 // Uses `claude -p` + Playwright MCP for reliable, headless browser automation.
-// Falls back to the legacy Computer Use loop if claude CLI is unavailable.
 // ---------------------------------------------------------------------------
 
 const PLAYWRIGHT_ALLOWED_TOOLS = [
@@ -212,6 +209,253 @@ const PLAYWRIGHT_ALLOWED_TOOLS = [
   "mcp__playwright__browser_evaluate",
   "mcp__playwright__browser_install",
 ].join(",");
+
+const PLAYWRIGHT_LOGIN_USERNAME_SECRET = "GROOVY_LOGIN_USERNAME";
+const PLAYWRIGHT_LOGIN_PASSWORD_SECRET = "GROOVY_LOGIN_PASSWORD";
+
+function dotenvQuote(value) {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function cleanupPlaywrightCredentialSecrets(record) {
+  const dir = record?.dir ? String(record.dir) : "";
+  if (!dir) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // ignore temp cleanup failures
+  }
+}
+
+function cleanupPlaywrightTempDir(record) {
+  const dir = record?.dir ? String(record.dir) : "";
+  if (!dir) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // ignore temp cleanup failures
+  }
+}
+
+function preparePlaywrightAutoLoginInitPage() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "groovy-playwright-init-"));
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // best effort
+  }
+
+  const file = path.join(dir, "groovy-autofill.cjs");
+  const credentialsModuleUrl = new URL("./credentials.mjs", import.meta.url).href;
+  const source = `
+module.exports = {
+  default: async function groovyAutoFillInitPage({ page }) {
+    const userInitPage = String(process.env.GROOVY_PLAYWRIGHT_USER_INIT_PAGE || "").trim();
+    if (userInitPage) {
+      try {
+        const path = require("path");
+        const mod = require(path.resolve(process.cwd(), userInitPage));
+        const fn = typeof mod?.default === "function" ? mod.default : typeof mod === "function" ? mod : null;
+        if (fn) await fn({ page });
+      } catch {
+        // Ignore user init-page failures here; Playwright MCP would otherwise fail the whole browser task.
+      }
+    }
+
+    const credentialsModuleUrl = ${JSON.stringify(credentialsModuleUrl)};
+    let credentialGetSecret = null;
+    const cache = new Map();
+    const cacheTtlMs = 30_000;
+
+    async function loadCredential(domain) {
+      const now = Date.now();
+      const cached = cache.get(domain);
+      if (cached && now - cached.ts < cacheTtlMs) return cached.value;
+      if (!credentialGetSecret) {
+        const mod = await import(credentialsModuleUrl);
+        credentialGetSecret = mod.credentialGetSecret;
+      }
+      const value = await credentialGetSecret({ domain }).catch(() => null);
+      cache.set(domain, { ts: now, value });
+      return value;
+    }
+
+    async function fillOnce() {
+      let domain = "";
+      try {
+        domain = new URL(page.url()).hostname.toLowerCase();
+      } catch {
+        return;
+      }
+      if (!domain) return;
+
+      const loginLike = await page.evaluate(() => {
+        function isVisible(el) {
+          try {
+            return !!(el && el.offsetParent !== null);
+          } catch {
+            return false;
+          }
+        }
+        const hasPw = Array.from(document.querySelectorAll('input[type="password"]')).some(isVisible);
+        const hasUserish = [
+          'input[type="email"]',
+          'input[name*="email" i]',
+          'input[id*="email" i]',
+          'input[name*="user" i]',
+          'input[id*="user" i]',
+          'input[name*="login" i]',
+          'input[id*="login" i]',
+        ].some((sel) => Array.from(document.querySelectorAll(sel)).some(isVisible));
+        const url = String(window.location?.href || "");
+        const title = String(document?.title || "");
+        const hasLoginHint = /login|signin|sign-in|auth/i.test(url) || /login|sign in|signin/i.test(title);
+        return hasPw || (hasUserish && hasLoginHint);
+      }).catch(() => false);
+      if (!loginLike) return;
+
+      const secret = await loadCredential(domain);
+      if (!secret?.ok || !secret.hasCredential || !secret.password) return;
+
+      await page.evaluate(({ username, password, usernameToken, passwordToken }) => {
+        function isVisible(el) {
+          try {
+            return !!(el && el.offsetParent !== null);
+          } catch {
+            return false;
+          }
+        }
+
+        function setNativeValue(el, val) {
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+          if (setter) setter.call(el, val);
+          else el.value = val;
+        }
+
+        function setValue(el, val) {
+          if (!el || !val) return false;
+          const current = String(el.value || "");
+          if (current && current !== usernameToken && current !== passwordToken) return false;
+          try {
+            el.focus();
+            setNativeValue(el, "");
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            setNativeValue(el, val);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          } catch {
+            return false;
+          }
+        }
+
+        const pwEl = Array.from(document.querySelectorAll('input[type="password"]')).find(isVisible) || null;
+        const userSelectors = [
+          '#email-signup-input',
+          'input[type="email"]',
+          'input[name*="email" i]',
+          'input[id*="email" i]',
+          'input[autocomplete*="email" i]',
+          'input[name*="user" i]',
+          'input[id*="user" i]',
+          'input[name*="login" i]',
+          'input[id*="login" i]',
+          'input[placeholder*="email" i]',
+          'input[placeholder*="user" i]',
+          'input[aria-label*="email" i]',
+          'input[aria-label*="user" i]',
+          'input[type="text"]',
+        ];
+
+        let userEl = null;
+        for (const sel of userSelectors) {
+          const cand = Array.from(document.querySelectorAll(sel)).find(isVisible);
+          if (cand && cand !== pwEl) {
+            userEl = cand;
+            break;
+          }
+        }
+
+        setValue(userEl, username);
+        setValue(pwEl, password);
+      }, {
+        username: String(secret.username || ""),
+        password: String(secret.password || ""),
+        usernameToken: ${JSON.stringify(PLAYWRIGHT_LOGIN_USERNAME_SECRET)},
+        passwordToken: ${JSON.stringify(PLAYWRIGHT_LOGIN_PASSWORD_SECRET)},
+      }).catch(() => {});
+    }
+
+    function scheduleFill() {
+      for (const delay of [0, 250, 750, 1500, 3000, 6000]) {
+        setTimeout(() => fillOnce().catch(() => {}), delay).unref?.();
+      }
+    }
+
+    page.on("domcontentloaded", scheduleFill);
+    page.on("load", scheduleFill);
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) scheduleFill();
+    });
+    const timer = setInterval(() => fillOnce().catch(() => {}), 1500);
+    timer.unref?.();
+    page.once("close", () => clearInterval(timer));
+    scheduleFill();
+  },
+};
+`;
+
+  fs.writeFileSync(file, source, { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort
+  }
+  return { dir, file };
+}
+
+async function preparePlaywrightCredentialSecrets(startUrl) {
+  if (!startUrl) return null;
+
+  let domain = "";
+  try {
+    domain = new URL(startUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  if (!domain) return null;
+
+  const secret = await credentialGetSecret({ domain }).catch(() => null);
+  if (!secret?.ok || !secret.hasCredential || !secret.password) return null;
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "groovy-playwright-secrets-"));
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // best effort
+  }
+
+  const file = path.join(dir, "secrets.env");
+  const contents = [
+    `${PLAYWRIGHT_LOGIN_USERNAME_SECRET}=${dotenvQuote(secret.username || "")}`,
+    `${PLAYWRIGHT_LOGIN_PASSWORD_SECRET}=${dotenvQuote(secret.password || "")}`,
+    "",
+  ].join("\n");
+  fs.writeFileSync(file, contents, { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort
+  }
+
+  return {
+    dir,
+    file,
+    domain: secret.domain || domain,
+    hasUsername: !!secret.username,
+    hasPassword: !!secret.password,
+  };
+}
 
 export async function runBrowserTaskViaPlaywright(opts) {
   const task = String(opts?.task || "").trim();
@@ -313,20 +557,16 @@ export async function runBrowserTaskViaPlaywright(opts) {
     await sleep(500);
   }
 
-  // Build the prompt: include credentials if we have them for the start URL domain
+  // Build the prompt: expose only Playwright MCP secret names, never values.
   let credentialHint = "";
-  if (startUrl) {
-    try {
-      const domain = new URL(startUrl).hostname.toLowerCase();
-      const secret = await credentialGetSecret({ domain }).catch(() => null);
-      if (secret?.ok && secret.hasCredential) {
-        credentialHint =
-          `\n\nIMPORTANT: Credentials are available locally for this domain, but their values are not visible to you.\n` +
-          `If the page requires login, use the browser normally and rely on the connector's local auto-login helper.\n`;
-      }
-    } catch {
-      // ignore
-    }
+  const credentialSecrets = await preparePlaywrightCredentialSecrets(startUrl);
+  if (credentialSecrets?.file) {
+    credentialHint =
+      `\n\nIMPORTANT: Saved credentials are available locally for ${credentialSecrets.domain}, but their values are not visible to you.\n` +
+      `When a login form appears, use Playwright MCP's browser_type or browser_fill_form with these exact secret names as the text/value:\n` +
+      `- Username/email: ${PLAYWRIGHT_LOGIN_USERNAME_SECRET}\n` +
+      `- Password: ${PLAYWRIGHT_LOGIN_PASSWORD_SECRET}\n` +
+      `Playwright MCP will replace those names locally with the real saved credentials. Do not ask for, print, inspect, or reveal the actual password.\n`;
   }
 
   const startUrlInstruction = shouldContinueSession
@@ -347,7 +587,7 @@ export async function runBrowserTaskViaPlaywright(opts) {
     `- If the page seems "stuck" after a click (snapshot doesn't change), check browser_tabs — you may be on the wrong tab.\n` +
     `- NEVER repeat the same action more than 2 times when URL/title/snapshot are unchanged.\n` +
     `- If the page stays blank/about:blank or no progress is possible, STOP and return a blocked summary instead of looping.\n` +
-    `- If you encounter a login page, fill credentials step by step.\n` +
+    `- If you encounter a login page, fill credentials step by step using the local secret names above when they are provided.\n` +
     `- When done, provide a clear text summary of what you found/accomplished.\n` +
     `- Always include a final status line in plain text: status=completed|partial|blocked plus what remains.`;
 
@@ -377,18 +617,38 @@ export async function runBrowserTaskViaPlaywright(opts) {
     taskLen: task.length,
     startUrl,
     model: cliModel,
-    hasCredentials: !!credentialHint,
+    hasCredentials: !!credentialSecrets?.file,
     timeoutMs,
     profile: profileSlug,
     headless,
     continueSession: shouldContinueSession ? `${continueSessionId.slice(0, 8)}...` : null,
   });
 
-  if (abortSignal?.aborted) return { ok: false, error: "aborted" };
+  if (abortSignal?.aborted) {
+    cleanupPlaywrightCredentialSecrets(credentialSecrets);
+    return { ok: false, error: "aborted" };
+  }
 
+  let autoLoginInitPage = null;
+  try {
+    autoLoginInitPage = preparePlaywrightAutoLoginInitPage();
+  } catch (err) {
+    cleanupPlaywrightCredentialSecrets(credentialSecrets);
+    const message = err instanceof Error ? err.message : String(err || "browser_task_init_failed");
+    return { ok: false, error: message };
+  }
+  const userInitPage = String(process.env.PLAYWRIGHT_MCP_INIT_PAGE || "").trim();
   const spawnEnv = {
     ...(headless ? { PLAYWRIGHT_MCP_HEADLESS: "true" } : {}),
     PLAYWRIGHT_MCP_USER_DATA_DIR: userDataDir,
+    PLAYWRIGHT_MCP_INIT_PAGE: autoLoginInitPage.file,
+    ...(userInitPage ? { GROOVY_PLAYWRIGHT_USER_INIT_PAGE: userInitPage } : {}),
+    ...(credentialSecrets?.file
+      ? {
+          PLAYWRIGHT_MCP_SECRETS_FILE: credentialSecrets.file,
+          PLAYWRIGHT_MCP_SECRETS: credentialSecrets.file,
+        }
+      : {}),
   };
 
   try {
@@ -526,6 +786,9 @@ export async function runBrowserTaskViaPlaywright(opts) {
       };
     }
     return { ok: false, error: message };
+  } finally {
+    cleanupPlaywrightCredentialSecrets(credentialSecrets);
+    cleanupPlaywrightTempDir(autoLoginInitPage);
   }
 }
 
@@ -644,15 +907,6 @@ function normalizeAppUrl(appUrl) {
   return u.replace(/\/+$/, "");
 }
 
-function safeDomainFromUrl(u) {
-  try {
-    const url = new URL(String(u));
-    return String(url.hostname || "").toLowerCase();
-  } catch {
-    return "";
-  }
-}
-
 // Prevent request bodies from exploding (413) by stripping old screenshot images
 // from the conversation history. We keep ALL messages (never drop assistant/user turns)
 // to preserve tool_use → tool_result pairing that Anthropic requires.
@@ -698,170 +952,6 @@ function trimBrowserAgentMessages(messages, { keepRecentImages = 2 } = {}) {
   });
 
   return result;
-}
-
-async function detectLikelyLogin({ pageId = "default" }) {
-  const r = await browserEvaluate({
-    pageId,
-    script: `
-      const url = String(window.location && window.location.href || "");
-      const title = String(document && document.title || "");
-      const pw = document.querySelector('input[type="password"]');
-      const hasPw = !!(pw && (pw.offsetParent !== null));
-      const hasSubmit = !!document.querySelector('button[type="submit"], input[type="submit"]');
-      const hasUserish = !!document.querySelector('input[type="email"], input[name*="user" i], input[name*="login" i], input[id*="user" i], input[id*="login" i]');
-      const urlHint = /login|signin|sign-in|auth/i.test(url) || /login|sign in|signin/i.test(title);
-      return { url, title, hasPw, hasSubmit, hasUserish, urlHint };
-    `,
-  });
-  if (!r?.ok) return { ok: false, error: r?.error || "detect_failed" };
-  return { ok: true, ...r.result };
-}
-
-async function heuristicLoginFill({ pageId = "default", username, password }) {
-  const u = String(username || "");
-  const p = String(password || "");
-  if (!p) return { ok: false, error: "missing_password" };
-  const r = await browserEvaluate({
-    pageId,
-    script: `
-      (function() {
-        const username = ${JSON.stringify(u)};
-        const password = ${JSON.stringify(p)};
-
-        function isVisible(el) {
-          try { return !!(el && (el.offsetParent !== null)); } catch { return false; }
-        }
-
-        const pw = Array.from(document.querySelectorAll('input[type="password"]')).find(isVisible);
-        if (!pw) return { ok: false, reason: "no_password_field" };
-
-        const userCandidates = [
-          'input[type="email"]',
-          'input[name*="user" i]',
-          'input[name*="login" i]',
-          'input[name*="email" i]',
-          'input[id*="user" i]',
-          'input[id*="login" i]',
-          'input[id*="email" i]',
-          'input[autocomplete*="user" i]',
-          'input[autocomplete*="email" i]',
-          'input[placeholder*="user" i]',
-          'input[placeholder*="email" i]',
-          'input[placeholder*="login" i]',
-          'input[aria-label*="user" i]',
-          'input[aria-label*="email" i]',
-          'input[type="text"]',
-          'input[type="tel"]',
-          'input:not([type="hidden"]):not([type="password"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'
-        ];
-        let user = null;
-        for (const sel of userCandidates) {
-          const cand = Array.from(document.querySelectorAll(sel)).find(isVisible);
-          if (cand && cand !== pw) { user = cand; break; }
-        }
-
-        function setValue(el, val) {
-          try {
-            // Use the native setter to bypass React/Vue controlled inputs
-            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype, 'value'
-            )?.set;
-            el.focus();
-            if (nativeInputValueSetter) {
-              nativeInputValueSetter.call(el, '');
-            } else {
-              el.value = '';
-            }
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            if (nativeInputValueSetter) {
-              nativeInputValueSetter.call(el, val);
-            } else {
-              el.value = val;
-            }
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            // Also dispatch InputEvent for modern frameworks
-            try {
-              el.dispatchEvent(new InputEvent("input", { bubbles: true, data: val, inputType: "insertText" }));
-            } catch {}
-          } catch {}
-        }
-
-        if (user && username) setValue(user, username);
-        setValue(pw, password);
-        try { pw.focus(); } catch {}
-
-        // Try to click submit button — look in the form first, then the whole page.
-        const form = pw.form || (user && user.form) || null;
-        let clicked = false;
-        const submitSelectors = [
-          'button[type="submit"]',
-          'input[type="submit"]',
-          'button:not([type="button"]):not([type="reset"])',
-          '[role="button"]',
-          'a[href*="login" i]',
-          'button',
-        ];
-        const searchRoots = form ? [form, document] : [document];
-        for (const root of searchRoots) {
-          if (clicked) break;
-          for (const sel of submitSelectors) {
-            const btn = root.querySelector(sel);
-            if (btn && isVisible(btn) && btn !== user && btn !== pw) {
-              try { btn.click(); clicked = true; break; } catch {}
-            }
-          }
-        }
-
-        return {
-          ok: true,
-          filled_user: !!(user && username),
-          filled_pw: true,
-          clicked_submit: clicked,
-        };
-      })()
-    `,
-  });
-  if (!r?.ok) return { ok: false, error: r?.error || "login_fill_failed" };
-  return { ok: true, ...(r.result || {}) };
-}
-
-async function maybeAutoLogin({ domain, pageId = "default" }) {
-  const det = await detectLikelyLogin({ pageId });
-  if (!det.ok) return { ok: true, skipped: true };
-
-  // Be more forgiving: if there's a password field, that's enough to try auto-login.
-  // Some sites (like ClassLink) don't have URL hints or standard username selectors.
-  const likely = det.hasPw;
-  if (!likely) return { ok: true, skipped: true };
-
-  const secret = await credentialGetSecret({ domain });
-  if (!secret.ok) return { ok: false, error: secret.error || "credential_get_failed" };
-  if (!secret.hasCredential) {
-    const req = await credentialRequest({ domain, reason: "Browser task requires login." });
-    if (!req.ok) return { ok: false, error: req.error || "credential_request_failed" };
-  }
-
-  const secret2 = await credentialGetSecret({ domain });
-  if (!secret2.ok) return { ok: false, error: secret2.error || "credential_get_failed" };
-  if (!secret2.hasCredential) return { ok: false, error: "missing_credentials" };
-
-  const filled = await heuristicLoginFill({
-    pageId,
-    username: secret2.username,
-    password: secret2.password,
-  });
-  if (!filled.ok) return { ok: false, error: filled.error || "login_fill_failed" };
-
-  // If we didn't click submit, try Enter.
-  if (!filled.clicked_submit) {
-    await browserPressKey({ pageId, key: "Enter" }).catch(() => {});
-  }
-
-  // Wait for navigation/redirect after login
-  await sleep(2500);
-  return { ok: true, attempted: true, domain, url: det.url };
 }
 
 async function postBrowserAgent({ appUrl, deviceToken, body }) {

@@ -1138,9 +1138,26 @@ export default function CommandCenterDashboard() {
   );
 }
 
+function settingsFocusFromQuery(value: string | null): SettingsFocusSection | undefined {
+  if (
+    value === "account" ||
+    value === "connector" ||
+    value === "billing" ||
+    value === "api-keys" ||
+    value === "files-agent" ||
+    value === "obsidian" ||
+    value === "aiyra-voice"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
 function CommandCenterDashboardInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const searchParamString = searchParams.toString();
+  const settingsQuery = searchParams.get("settings");
   const supabase = getSupabaseBrowserClient();
 
   // Auth state
@@ -1217,6 +1234,19 @@ function CommandCenterDashboardInner() {
     setSettingsFocusSection(section);
     setShowSettings(true);
   };
+  useEffect(() => {
+    const section = settingsFocusFromQuery(settingsQuery);
+    if (!section) return;
+
+    setSettingsFocusSection(section);
+    setShowSettings(true);
+
+    const nextParams = new URLSearchParams(searchParamString);
+    nextParams.delete("settings");
+    nextParams.delete("checkout");
+    const nextQuery = nextParams.toString();
+    router.replace(nextQuery ? `/dashboard?${nextQuery}` : "/dashboard", { scroll: false });
+  }, [router, searchParamString, settingsQuery]);
   const openObsidianSetup = () => setShowObsidianSetup(true);
   const openFilesSetup = useCallback(() => setShowFilesSetup(true), []);
   const openChatAgentCreate = () => setShowChatAgentCreate(true);
@@ -1493,7 +1523,7 @@ function CommandCenterDashboardInner() {
   
   // Minimum required connector version (update this when connector features change)
   // Bump this when connector protocol/lifecycle expectations change.
-  const MIN_CONNECTOR_VERSION = "0.22.78";
+  const MIN_CONNECTOR_VERSION = "0.22.82";
   const connectorGuide = useConnectorInstallGuide();
   
   // Version comparison helper

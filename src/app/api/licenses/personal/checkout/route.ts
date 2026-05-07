@@ -72,7 +72,7 @@ export async function POST(req: Request) {
       customer: customerId,
       line_items: [{ price: await personalPriceId(stripe), quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${origin}/account/license?checkout=success`,
+      success_url: `${origin}/dashboard?settings=billing&checkout=success`,
       cancel_url: `${origin}/pricing?checkout=cancelled`,
       client_reference_id: user.id,
       metadata: {

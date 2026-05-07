@@ -17,11 +17,29 @@ export function toStorageReference(value: unknown): { bucket: string; path: stri
   };
 }
 
+export function toChunkedStorageReference(value: unknown): { bucket: string; path: string } | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const match = trimmed.match(/^supabase-chunked:\/\/([^/]+)\/(.+)$/);
+  if (!match) return null;
+  return {
+    bucket: match[1],
+    path: match[2],
+  };
+}
+
 export function buildStorageReference(bucket?: string | null, path?: string | null): string | null {
   const cleanBucket = typeof bucket === "string" ? bucket.trim() : "";
   const cleanPath = typeof path === "string" ? path.trim().replace(/^\/+/, "") : "";
   if (!cleanBucket || !cleanPath) return null;
   return `supabase://${cleanBucket}/${cleanPath}`;
+}
+
+export function buildChunkedStorageReference(bucket?: string | null, path?: string | null): string | null {
+  const cleanBucket = typeof bucket === "string" ? bucket.trim() : "";
+  const cleanPath = typeof path === "string" ? path.trim().replace(/^\/+/, "") : "";
+  if (!cleanBucket || !cleanPath) return null;
+  return `supabase-chunked://${cleanBucket}/${cleanPath}`;
 }
 
 export async function signedArtifactUrl(
@@ -30,6 +48,8 @@ export async function signedArtifactUrl(
   expiresInSeconds = 15 * 60
 ): Promise<string | null> {
   if (typeof value !== "string" || !value.trim()) return null;
+  const chunkedRef = toChunkedStorageReference(value);
+  if (chunkedRef) return `/api/downloads/artifact?ref=${encodeURIComponent(value.trim())}`;
   const ref = toStorageReference(value);
   if (!ref) return value.trim();
   const { data, error } = await admin.storage

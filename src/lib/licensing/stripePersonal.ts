@@ -45,6 +45,34 @@ function subscriptionStatusToLicenseStatus(status: string | null | undefined) {
   return "past_due";
 }
 
+function unixSeconds(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+function subscriptionPeriod(subscription: Stripe.Subscription): {
+  startSeconds: number;
+  endSeconds: number;
+} {
+  const raw = subscription as unknown as Record<string, unknown>;
+  const firstItem = subscription.items.data[0] as unknown as Record<string, unknown> | undefined;
+  const startSeconds =
+    unixSeconds(raw.current_period_start) ||
+    unixSeconds(firstItem?.current_period_start) ||
+    unixSeconds(raw.start_date) ||
+    Math.trunc(Date.now() / 1000);
+  const endSeconds =
+    unixSeconds(raw.current_period_end) ||
+    unixSeconds(firstItem?.current_period_end) ||
+    unixSeconds(raw.trial_end) ||
+    startSeconds + 365 * 24 * 60 * 60;
+
+  return {
+    startSeconds,
+    endSeconds: endSeconds > startSeconds ? endSeconds : startSeconds + 365 * 24 * 60 * 60,
+  };
+}
+
 async function getOrCreateOrganization(args: {
   workspaceId: string;
   userId: string;
@@ -207,9 +235,7 @@ export async function handlePersonalSubscriptionChanged(
   const workspaceId = (metadata.workspace_id || "").trim();
   const userId = (metadata.user_id || "").trim();
   if (!workspaceId || !userId) return;
-  const sub = subscription as unknown as Record<string, unknown>;
-  const currentPeriodStart = Number(sub.current_period_start || 0);
-  const currentPeriodEnd = Number(sub.current_period_end || 0);
+  const { startSeconds, endSeconds } = subscriptionPeriod(subscription);
   const priceId = subscription.items.data[0]?.price?.id || null;
 
   await upsertPersonalLicenseForSubscription({
@@ -219,8 +245,8 @@ export async function handlePersonalSubscriptionChanged(
     userId,
     customerEmail: options.customerEmail || null,
     status: subscription.status,
-    currentPeriodStartIso: new Date((currentPeriodStart || Date.now() / 1000) * 1000).toISOString(),
-    currentPeriodEndIso: new Date((currentPeriodEnd || Date.now() / 1000) * 1000).toISOString(),
+    currentPeriodStartIso: new Date(startSeconds * 1000).toISOString(),
+    currentPeriodEndIso: new Date(endSeconds * 1000).toISOString(),
     cancelAtPeriodEnd: subscription.cancel_at_period_end || false,
     stripePriceId: priceId,
   });

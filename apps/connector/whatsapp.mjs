@@ -32,7 +32,7 @@ import {
   getDisplayDimensions,
   closeBrowser,
 } from "./browser.mjs";
-import { runBrowserTaskOnConnector, runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
+import { runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
 import { credentialGetMeta, credentialRequest } from "./credentials.mjs";
 import {
   fileRead,
@@ -735,6 +735,20 @@ const WHATSAPP_API_TIMEOUT_MS = Number.parseInt(
   process.env.WHATSAPP_API_FETCH_TIMEOUT_MS || "",
   10
 );
+const WHATSAPP_ORCHESTRATOR_ROUND_BUDGET = Number.parseInt(
+  process.env.WHATSAPP_ORCHESTRATOR_ROUND_BUDGET ||
+    process.env.WHATSAPP_ORCHESTRATOR_MAX_ROUNDS ||
+    "",
+  10
+);
+const WHATSAPP_CONTINUATION_TTL_MS = Number.parseInt(
+  process.env.WHATSAPP_CONTINUATION_TTL_MS || "",
+  10
+);
+const WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES = Number.parseInt(
+  process.env.WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES || "",
+  10
+);
 
 function resolveWhatsAppApiAttempts() {
   if (Number.isFinite(WHATSAPP_API_MAX_ATTEMPTS) && WHATSAPP_API_MAX_ATTEMPTS >= 1) {
@@ -745,9 +759,36 @@ function resolveWhatsAppApiAttempts() {
 
 function resolveWhatsAppApiTimeoutMs() {
   if (Number.isFinite(WHATSAPP_API_TIMEOUT_MS) && WHATSAPP_API_TIMEOUT_MS >= 5000) {
-    return Math.min(120_000, WHATSAPP_API_TIMEOUT_MS);
+    return Math.min(15 * 60_000, WHATSAPP_API_TIMEOUT_MS);
   }
-  return 120_000;
+  return 6 * 60_000;
+}
+
+function resolveWhatsAppOrchestratorRoundBudget() {
+  if (
+    Number.isFinite(WHATSAPP_ORCHESTRATOR_ROUND_BUDGET) &&
+    WHATSAPP_ORCHESTRATOR_ROUND_BUDGET >= 1
+  ) {
+    return Math.max(12, Math.min(180, WHATSAPP_ORCHESTRATOR_ROUND_BUDGET));
+  }
+  return 48;
+}
+
+function resolveWhatsAppContinuationTtlMs() {
+  if (Number.isFinite(WHATSAPP_CONTINUATION_TTL_MS) && WHATSAPP_CONTINUATION_TTL_MS >= 60_000) {
+    return Math.min(24 * 60 * 60_000, WHATSAPP_CONTINUATION_TTL_MS);
+  }
+  return 30 * 60_000;
+}
+
+function resolveWhatsAppApiTimeoutAutoRecoveries() {
+  if (
+    Number.isFinite(WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES) &&
+    WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES >= 0
+  ) {
+    return Math.min(12, Math.trunc(WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES));
+  }
+  return 3;
 }
 
 function buildWhatsAppIngressTraceId(messageLike) {
@@ -826,7 +867,7 @@ async function callWhatsAppApi({ baseUrl, deviceToken, body, allowRetries = fals
         await sleep(waitMs);
         continue;
       }
-      return { ok: false, status: 0, error: lastNetworkErr };
+      return { ok: false, status: 0, error: lastNetworkErr, timedOut, timeoutMs };
     } finally {
       clearTimeout(timer);
     }
@@ -1628,15 +1669,13 @@ async function executeConnectorRpc({
         });
       }
 
-      console.log("[whatsapp] browser_task_run using legacy Computer Use");
-      return await runBrowserTaskOnConnector({
-        task: p.task,
-        start_url: p.start_url,
-        app_url: p.app_url,
-        profile_name: p.profile_name || "default",
-        device_token: deviceToken || undefined,
-        onProgress: emitProgress,
-      });
+      console.log("[whatsapp] browser_task_run blocked because Playwright MCP is unavailable");
+      return {
+        ok: false,
+        error: "playwright_mcp_unavailable",
+        message:
+          "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
+      };
     }
     if (t === "browser_init") return await initBrowser(p);
     if (t === "browser_close") return await closeBrowser();
@@ -1732,6 +1771,92 @@ function getWelcomeHash() {
 // Track messages we sent to avoid loops
 const recentBotSends = new Map();
 const twilioFollowupWatchersByThread = new Map(); // threadKey -> watcherToken
+const groovyContinuationsByThread = new Map();
+const codeContinuationsByThread = new Map();
+
+function cloneToolResults(toolResults) {
+  if (!Array.isArray(toolResults)) return [];
+  return toolResults
+    .filter((entry) => entry && typeof entry === "object")
+    .map((entry) => ({ ...entry }));
+}
+
+function isContinuationRequest(text) {
+  const normalized = normalizeText(text).toLowerCase().replace(/[!?.,:;]+$/g, "").trim();
+  return [
+    "continue",
+    "resume",
+    "keep going",
+    "keep working",
+    "go on",
+    "carry on",
+  ].includes(normalized);
+}
+
+function pruneContinuations(map) {
+  const now = Date.now();
+  for (const [threadKey, row] of map.entries()) {
+    const expiresAt = Number(row?.expiresAt || 0);
+    if (!expiresAt || expiresAt <= now) map.delete(threadKey);
+  }
+}
+
+function saveContinuation(map, threadKey, state) {
+  const key = String(threadKey || "").trim();
+  if (!key || !state || typeof state !== "object") return;
+  pruneContinuations(map);
+  map.set(key, {
+    ...state,
+    savedAt: Date.now(),
+    expiresAt: Date.now() + resolveWhatsAppContinuationTtlMs(),
+  });
+}
+
+function takeContinuation(map, threadKey) {
+  const key = String(threadKey || "").trim();
+  if (!key) return null;
+  pruneContinuations(map);
+  const row = map.get(key) || null;
+  if (row) map.delete(key);
+  return row;
+}
+
+function clearContinuation(map, threadKey) {
+  const key = String(threadKey || "").trim();
+  if (key) map.delete(key);
+}
+
+function buildContinuationPauseReply({ commandPrefix, roundBudget, traceId }) {
+  const ttlMinutes = Math.max(1, Math.round(resolveWhatsAppContinuationTtlMs() / 60_000));
+  const traceLine = traceId ? `\nTrace: ${traceId}` : "";
+  return (
+    `I’m still working, but I paused this WhatsApp turn after ${roundBudget} connector rounds so it does not go silent. ` +
+    `This is not a failure. Send ${commandPrefix} continue within ${ttlMinutes} minutes to continue the same run.${traceLine}`
+  );
+}
+
+function isWhatsAppApiTimeoutError(error) {
+  return /^request_timeout_\d+ms$/i.test(String(error || "").trim());
+}
+
+function buildContinuationTimeoutReply({ commandPrefix, timeoutMs, traceId }) {
+  const ttlMinutes = Math.max(1, Math.round(resolveWhatsAppContinuationTtlMs() / 60_000));
+  const timeoutMinutes = Math.max(1, Math.round(Number(timeoutMs || 0) / 60_000));
+  const traceLine = traceId ? `\nTrace: ${traceId}` : "";
+  return (
+    `This kept running past the ${timeoutMinutes}-minute WhatsApp request window after multiple automatic recovery attempts, so I paused the turn instead of dropping it. ` +
+    `Send ${commandPrefix} continue within ${ttlMinutes} minutes to continue the same run.${traceLine}`
+  );
+}
+
+function buildAutomaticTimeoutRecoveryStatus({ timeoutMs, attempt, maxAttempts }) {
+  const timeoutMinutes = Math.max(1, Math.round(Number(timeoutMs || 0) / 60_000));
+  return (
+    `Still working. The server step exceeded ${timeoutMinutes} minutes, so I’m continuing automatically ` +
+    `(${attempt}/${maxAttempts}).`
+  );
+}
+
 function rememberBotSend(text) {
   const key = sha256Hex(normalizeText(text));
   recentBotSends.set(key, Date.now());
@@ -1896,6 +2021,7 @@ async function handleCodeMessage({
   }
 
   if (isNew) {
+    clearContinuation(codeContinuationsByThread, chatId);
     await sendReply?.("✅ Started a new Code session for this WhatsApp thread (visible in the dashboard).");
     return;
   }
@@ -1904,9 +2030,41 @@ async function handleCodeMessage({
   // The orchestrator will decide what to send into Claude Code, and parse the resulting output.
   const userPrompt = String(text || "").trim();
   if (!userPrompt) return;
+  const wantsContinuation = isContinuationRequest(userPrompt);
+  const pausedContinuation = wantsContinuation
+    ? takeContinuation(codeContinuationsByThread, chatId)
+    : null;
+  if (wantsContinuation && !pausedContinuation) {
+    await sendReply?.("I don’t have a paused Code run for this WhatsApp thread anymore.");
+    return;
+  }
+  if (!wantsContinuation) {
+    clearContinuation(codeContinuationsByThread, chatId);
+  }
+  if (
+    pausedContinuation?.terminalId &&
+    pausedContinuation.terminalId !== terminalId
+  ) {
+    log("code/relay_resume_terminal_changed", {
+      previousTerminalId: pausedContinuation.terminalId,
+      terminalId,
+    });
+  }
 
-  let traceId = initialTraceId || null;
-  let toolResults = [];
+  let traceId = pausedContinuation?.traceId || initialTraceId || null;
+  let toolResults = cloneToolResults(pausedContinuation?.toolResults);
+  const promptForRound = pausedContinuation ? "" : userPrompt;
+  let timeoutRecoveryCount = 0;
+  const saveCodeContinuation = (extra = {}) => {
+    saveContinuation(codeContinuationsByThread, chatId, {
+      kind: "code",
+      traceId,
+      terminalId,
+      workspaceRootPath,
+      toolResults: cloneToolResults(toolResults),
+      ...extra,
+    });
+  };
   const upsertToolResult = (nextResult) => {
     if (!nextResult || typeof nextResult !== "object") return;
     const toolCallId =
@@ -1951,7 +2109,8 @@ async function handleCodeMessage({
     minIntervalMs: 2500,
     maxChars: 240,
   });
-  for (let round = 0; round < 12; round++) {
+  const roundBudget = resolveWhatsAppOrchestratorRoundBudget();
+  for (let round = 0; round < roundBudget; round++) {
     const body = {
       provider: "whatsapp_web",
       connectorPlatform:
@@ -1967,13 +2126,52 @@ async function handleCodeMessage({
         terminalId,
         workspaceRootPath,
       },
-      message: round === 0 ? userPrompt : "",
+      message: round === 0 ? promptForRound : "",
       toolResults: toolResults.length ? toolResults : undefined,
       traceId: traceId || undefined,
     };
 
     const res2 = await callWhatsAppApi({ baseUrl, deviceToken, body });
     if (!res2.ok) {
+      if (res2.timedOut === true || isWhatsAppApiTimeoutError(res2.error)) {
+        const timeoutMs = res2.timeoutMs || resolveWhatsAppApiTimeoutMs();
+        const maxTimeoutRecoveries = resolveWhatsAppApiTimeoutAutoRecoveries();
+        if (timeoutRecoveryCount < maxTimeoutRecoveries) {
+          timeoutRecoveryCount += 1;
+          saveCodeContinuation({ timeoutRecoveryCount });
+          log("code/relay_auto_recover_after_timeout", {
+            chatId,
+            traceId,
+            timeoutMs,
+            timeoutRecoveryCount,
+            maxTimeoutRecoveries,
+            toolResultCount: toolResults.length,
+          });
+          await sendProgress(
+            buildAutomaticTimeoutRecoveryStatus({
+              timeoutMs,
+              attempt: timeoutRecoveryCount,
+              maxAttempts: maxTimeoutRecoveries,
+            })
+          );
+          await sleep(1000);
+          continue;
+        }
+        saveCodeContinuation({ timeoutRecoveryCount });
+        log("code/relay_paused_after_timeout", {
+          chatId,
+          traceId,
+          timeoutMs,
+          timeoutRecoveryCount,
+          toolResultCount: toolResults.length,
+        });
+        reply = buildContinuationTimeoutReply({
+          commandPrefix: "@code",
+          timeoutMs,
+          traceId,
+        });
+        break;
+      }
       reply = `Error: ${res2.error}`;
       break;
     }
@@ -1983,6 +2181,7 @@ async function handleCodeMessage({
     log("code/relay_round", { round, traceId, kind: data2.kind });
 
     if (data2.kind === "final") {
+      clearContinuation(codeContinuationsByThread, chatId);
       reply =
         String(data2.reply || "").trim() ||
         "I ran into an internal processing error. Please retry your @code message.";
@@ -2041,6 +2240,21 @@ async function handleCodeMessage({
 
     reply = `Unhandled response: ${data2.kind || "unknown"}`;
     break;
+  }
+
+  if (!reply) {
+    saveCodeContinuation({ timeoutRecoveryCount });
+    log("code/relay_paused_without_final", {
+      chatId,
+      traceId,
+      roundBudget,
+      toolResultCount: toolResults.length,
+    });
+    reply = buildContinuationPauseReply({
+      commandPrefix: "@code",
+      roundBudget,
+      traceId,
+    });
   }
 
   try {
@@ -3587,10 +3801,21 @@ export async function startWhatsAppBridge(opts = {}) {
         const threadKey = chat.id._serialized;
         const threadName = chat.name;
         const ingressTraceId = buildWhatsAppIngressTraceId(message);
+        const wantsGroovyContinuation = isContinuationRequest(userText);
+        const pausedGroovyContinuation = wantsGroovyContinuation
+          ? takeContinuation(groovyContinuationsByThread, threadKey)
+          : null;
+        if (wantsGroovyContinuation && !pausedGroovyContinuation) {
+          await sendReply("I don’t have a paused Groovy run for this WhatsApp thread anymore.");
+          return;
+        }
+        if (!wantsGroovyContinuation) {
+          clearContinuation(groovyContinuationsByThread, threadKey);
+        }
 
         // Download any attached media (images, documents, etc.)
         let attachedFiles = [];
-        if (message.hasMedia) {
+        if (!pausedGroovyContinuation && message.hasMedia) {
           try {
             const media = await message.downloadMedia();
             if (media && media.mimetype && media.data) {
@@ -3612,6 +3837,7 @@ export async function startWhatsAppBridge(opts = {}) {
 
         // Handle "new" command
         if (userText.trim().toLowerCase() === "new") {
+          clearContinuation(groovyContinuationsByThread, threadKey);
           await startTyping();
           const res = await callWhatsAppApi({
             baseUrl: appUrl,
@@ -3630,13 +3856,31 @@ export async function startWhatsAppBridge(opts = {}) {
         }
 
         // Regular orchestrator message - handle tool execution loop
-        let traceId = ingressTraceId || null;
-        let toolResults = [];
-        let deferredFollowupText = "";
-        let deferredReplyPrefix = "";
-        let deferredPendingMessageId = "";
-        let deferredPendingToolResults = [];
-        let pendingTwilioFollowup = null;
+        let traceId = pausedGroovyContinuation?.traceId || ingressTraceId || null;
+        let toolResults = cloneToolResults(pausedGroovyContinuation?.toolResults);
+        let deferredFollowupText = String(pausedGroovyContinuation?.deferredFollowupText || "");
+        let deferredReplyPrefix = String(pausedGroovyContinuation?.deferredReplyPrefix || "");
+        let deferredPendingMessageId = String(pausedGroovyContinuation?.deferredPendingMessageId || "");
+        let deferredPendingToolResults = cloneToolResults(
+          pausedGroovyContinuation?.deferredPendingToolResults
+        );
+        let pendingTwilioFollowup = pausedGroovyContinuation?.pendingTwilioFollowup || null;
+        const userTextForRound = pausedGroovyContinuation ? "" : userText;
+        let completedWithoutTextReply = false;
+        let timeoutRecoveryCount = 0;
+        const saveGroovyContinuation = (extra = {}) => {
+          saveContinuation(groovyContinuationsByThread, threadKey, {
+            kind: "groovy",
+            traceId,
+            toolResults: cloneToolResults(toolResults),
+            deferredFollowupText,
+            deferredReplyPrefix,
+            deferredPendingMessageId,
+            deferredPendingToolResults: cloneToolResults(deferredPendingToolResults),
+            pendingTwilioFollowup,
+            ...extra,
+          });
+        };
         const upsertToolResult = (nextResult) => {
           if (!nextResult || typeof nextResult !== "object") return;
           const toolCallId =
@@ -3688,8 +3932,9 @@ export async function startWhatsAppBridge(opts = {}) {
           minIntervalMs: 2500,
           maxChars: 240,
         });
-        for (let round = 0; round < 12; round++) {
-          const messageForRound = deferredFollowupText || (round === 0 ? userText : "");
+        const roundBudget = resolveWhatsAppOrchestratorRoundBudget();
+        for (let round = 0; round < roundBudget; round++) {
+          const messageForRound = deferredFollowupText || (round === 0 ? userTextForRound : "");
           const body = {
             provider: "whatsapp_web",
             connectorPlatform:
@@ -3702,7 +3947,10 @@ export async function startWhatsAppBridge(opts = {}) {
             threadName,
             message: messageForRound,
             // Only send files on first round (with the user message)
-            files: round === 0 && attachedFiles.length > 0 ? attachedFiles : undefined,
+            files:
+              !pausedGroovyContinuation && round === 0 && attachedFiles.length > 0
+                ? attachedFiles
+                : undefined,
             toolResults: toolResults.length ? toolResults : undefined,
             traceId: traceId || undefined,
           };
@@ -3711,6 +3959,45 @@ export async function startWhatsAppBridge(opts = {}) {
           let res;
           res = await callWhatsAppApi({ baseUrl: appUrl, deviceToken, body });
           if (!res.ok) {
+            if (res.timedOut === true || isWhatsAppApiTimeoutError(res.error)) {
+              const timeoutMs = res.timeoutMs || resolveWhatsAppApiTimeoutMs();
+              const maxTimeoutRecoveries = resolveWhatsAppApiTimeoutAutoRecoveries();
+              if (timeoutRecoveryCount < maxTimeoutRecoveries) {
+                timeoutRecoveryCount += 1;
+                saveGroovyContinuation({ timeoutRecoveryCount });
+                log("groovy/auto_recover_after_timeout", {
+                  threadKey,
+                  traceId,
+                  timeoutMs,
+                  timeoutRecoveryCount,
+                  maxTimeoutRecoveries,
+                  toolResultCount: toolResults.length,
+                });
+                await sendProgress(
+                  buildAutomaticTimeoutRecoveryStatus({
+                    timeoutMs,
+                    attempt: timeoutRecoveryCount,
+                    maxAttempts: maxTimeoutRecoveries,
+                  })
+                );
+                await sleep(1000);
+                continue;
+              }
+              saveGroovyContinuation({ timeoutRecoveryCount });
+              log("groovy/paused_after_timeout", {
+                threadKey,
+                traceId,
+                timeoutMs,
+                timeoutRecoveryCount,
+                toolResultCount: toolResults.length,
+              });
+              reply = buildContinuationTimeoutReply({
+                commandPrefix: "@groovy",
+                timeoutMs,
+                traceId,
+              });
+              break;
+            }
             reply = `Error: ${res.error}`;
             break;
           }
@@ -3719,6 +4006,7 @@ export async function startWhatsAppBridge(opts = {}) {
           traceId = data.traceId || traceId;
 
           if (data.kind === "final") {
+            clearContinuation(groovyContinuationsByThread, threadKey);
             const files = Array.isArray(data.files) ? data.files : [];
             const textReply = String(data.reply || "").trim();
             pendingTwilioFollowup =
@@ -3762,6 +4050,7 @@ export async function startWhatsAppBridge(opts = {}) {
             if (files.length > 0) {
               // Send image(s) directly to WhatsApp.
               await sendReply(finalReplyText || "Here you go:", files);
+              completedWithoutTextReply = true;
               reply = "";
               break;
             }
@@ -3931,6 +4220,7 @@ export async function startWhatsAppBridge(opts = {}) {
               deferredReplyPrefix = "";
               deferredPendingMessageId = "";
               deferredPendingToolResults = [];
+              clearContinuation(groovyContinuationsByThread, threadKey);
               break;
             }
             continue;
@@ -3954,6 +4244,20 @@ export async function startWhatsAppBridge(opts = {}) {
           break;
         }
 
+        if (!reply && !completedWithoutTextReply) {
+          saveGroovyContinuation({ timeoutRecoveryCount });
+          log("groovy/paused_without_final", {
+            threadKey,
+            traceId,
+            roundBudget,
+            toolResultCount: toolResults.length,
+          });
+          reply = buildContinuationPauseReply({
+            commandPrefix: "@groovy",
+            roundBudget,
+            traceId,
+          });
+        }
         if (!reply && deferredReplyPrefix) {
           reply =
             "I completed the inbox action command, but the follow-up answer did not finish. Please resend the follow-up question.";

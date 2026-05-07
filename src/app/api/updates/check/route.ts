@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { findLicenseByKey } from "@/lib/licensing/server";
-import { signedArtifactUrl } from "@/lib/downloads/artifacts";
+import { signedArtifactUrl, toChunkedStorageReference } from "@/lib/downloads/artifacts";
+import { createArtifactDownloadToken } from "@/lib/downloads/artifactToken";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,6 +16,17 @@ type Body = {
 
 function channel(value: unknown): "stable" | "beta" | "dev" | "enterprise" {
   return value === "beta" || value === "dev" || value === "enterprise" ? value : "stable";
+}
+
+function platformAliases(value: string): string[] {
+  const normalized = value.trim().toLowerCase();
+  if (["macos", "mac", "darwin", "osx", "macos-arm64"].includes(normalized)) {
+    return ["macos", "macos-arm64", "darwin"];
+  }
+  if (["windows", "win", "win32", "windows-x64"].includes(normalized)) {
+    return ["windows", "windows-x64", "win32"];
+  }
+  return [value.trim()];
 }
 
 function versionParts(value: unknown): number[] {
@@ -43,6 +55,28 @@ function licenseAllowsUpdates(row: Record<string, unknown>): boolean {
   return (status === "active" || status === "past_due") && validUntil >= Date.now();
 }
 
+async function downloadableArtifactUrl(args: {
+  admin: ReturnType<typeof createSupabaseAdminClient>;
+  req: Request;
+  value: unknown;
+  licenseTypes: string[];
+}): Promise<string | null> {
+  if (typeof args.value !== "string" || !args.value.trim()) return null;
+  if (toChunkedStorageReference(args.value)) {
+    const url = new URL("/api/downloads/artifact", args.req.url);
+    url.searchParams.set("ref", args.value.trim());
+    url.searchParams.set(
+      "token",
+      createArtifactDownloadToken({
+        ref: args.value.trim(),
+        licenseTypes: args.licenseTypes,
+      })
+    );
+    return url.toString();
+  }
+  return signedArtifactUrl(args.admin, args.value);
+}
+
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as Body | null;
   const licenseKey = typeof body?.licenseKey === "string" ? body.licenseKey.trim() : "";
@@ -66,7 +100,7 @@ export async function POST(req: Request) {
     .from("downloads")
     .select("id, version, channel, platform, file_url, checksum, release_notes_url, created_at")
     .eq("is_active", true)
-    .eq("platform", platform)
+    .in("platform", platformAliases(platform))
     .eq("channel", channel(body?.channel))
     .contains("license_type_allowed", [licenseType])
     .order("created_at", { ascending: false })
@@ -83,7 +117,14 @@ export async function POST(req: Request) {
     updateAvailable,
     latest: {
       ...latest,
-      file_url: updateAvailable ? await signedArtifactUrl(admin, latest.file_url) : null,
+      file_url: updateAvailable
+        ? await downloadableArtifactUrl({
+            admin,
+            req,
+            value: latest.file_url,
+            licenseTypes: [licenseType],
+          })
+        : null,
     },
   });
 }

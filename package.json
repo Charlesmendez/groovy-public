@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "groovy": "node scripts/groovy-cli.mjs",
+    "publish:connector-downloads": "node scripts/publish-connector-downloads.mjs",
     "pseo:generate": "node scripts/pseo/generate-pseo-data.mjs",
     "relay": "node apps/relay/server.mjs",
     "connector": "cd apps/connector && node connector.mjs"

@@ -17,7 +17,7 @@ export function ArtifactsAdminPanel() {
     kind: "download" as ArtifactKind,
     version: "",
     channel: "stable" as ArtifactChannel,
-    platform: "macos-arm64",
+    platform: "macos",
     fileUrl: "",
     archiveUrl: "",
     storageBucket: "",

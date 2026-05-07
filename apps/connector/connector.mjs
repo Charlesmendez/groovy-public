@@ -62,7 +62,7 @@ const DEFAULT_OPENWAKEWORD_THRESHOLD = 0.27;
 const DEFAULT_OPENWAKEWORD_ALLOW_APPROXIMATE = false;
 const AIYRA_RUNTIME_RECOVERY_BASE_DELAY_MS = 2000;
 const AIYRA_RUNTIME_RECOVERY_MAX_DELAY_MS = 30000;
-import { runBrowserTaskOnConnector, runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
+import { runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
 import { credentialGetMeta, credentialRequest } from "./credentials.mjs";
 import {
   linkdbInit,
@@ -4255,7 +4255,7 @@ async function runScheduledJob(job) {
         return { ok: false, error: "parallel_branch_batch_round_limit" };
       }
 
-      // ===== Browser Tasks (Playwright MCP preferred) =====
+      // ===== Browser Tasks (Playwright MCP only) =====
       // NOTE: scheduled jobs execute connector tools directly (not via relay WS),
       // so we must support browser tooling here too.
       if (t === "browser_task_run") {
@@ -4266,7 +4266,6 @@ async function runScheduledJob(job) {
             : typeof p.startUrl === "string"
               ? p.startUrl
               : undefined;
-        const appUrl = String(p.app_url || p.appUrl || "").trim();
         const profileName = typeof p.profile_name === "string" ? p.profile_name : "default";
         const apiKey = typeof p.api_key === "string" ? p.api_key.trim() : "";
         const cliToken = typeof p.cli_token === "string" ? p.cli_token.trim() : "";
@@ -4282,24 +4281,22 @@ async function runScheduledJob(job) {
               : 8 * 60 * 1000;
 
         const usePlaywright = await isPlaywrightAvailable();
-        const hasCliAuth = !!(cliToken || apiKey);
-        if (usePlaywright && hasCliAuth) {
-          return await runBrowserTaskViaPlaywright({
-            task,
-            start_url: startUrl,
-            api_key: apiKey,
-            cli_token: cliToken,
-            timeout_ms: timeoutMs,
-            profile_name: profileName,
-          });
+        if (!usePlaywright) {
+          return {
+            ok: false,
+            error: "playwright_mcp_unavailable",
+            message:
+              "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
+          };
         }
 
-        return await runBrowserTaskOnConnector({
+        return await runBrowserTaskViaPlaywright({
           task,
           start_url: startUrl,
-          app_url: appUrl,
+          api_key: apiKey,
+          cli_token: cliToken,
+          timeout_ms: timeoutMs,
           profile_name: profileName,
-          device_token: activeDeviceToken || undefined,
         });
       }
 
@@ -4749,10 +4746,31 @@ async function runScheduledJob(job) {
           expectedWhatsAppChatId = schedulerWhatsAppThreadKey;
         }
       };
+      const looksLikeIncompleteScheduledFinal = (finalText) => {
+        const text = String(finalText || "").trim();
+        if (!text) return false;
+        if (
+          /\b(daily trade summary|weekly summary|monthly summary|year-to-date|net today|sent scheduled whatsapp message)\b/i.test(
+            text
+          )
+        ) {
+          return false;
+        }
+        return [
+          /\b(now let me|let me now|let me check|i'?ll check|i will check|i'?ll retry|let me retry)\b/i,
+          /\b(proceed with|proceed to|try a fresh approach|fresh query|simple query to reset)\b/i,
+          /\b(session|connection).{0,80}\b(stuck|stale|error|keeps occurring|dead)\b/i,
+          /\b(postgres|database).{0,120}\b(stuck|stale|error|retry|fresh approach)\b/i,
+          /\bvalidation passed\b[\s\S]{0,800}\b(postgres|duplicates|insert|query)\b/i,
+        ].some((pattern) => pattern.test(text));
+      };
       const tryScheduledWhatsAppFinalFallback = async (finalText) => {
         const textToSend = String(finalText || "").trim();
         if (!textToSend) {
           return { ok: false, error: "scheduled_whatsapp_send_missing_after_final" };
+        }
+        if (looksLikeIncompleteScheduledFinal(textToSend)) {
+          return { ok: false, error: "scheduled_orchestrator_incomplete_final" };
         }
         if (expectedWhatsAppChatId || expectedWhatsAppRecipientQuery) {
           return await runConnectorOpWithPriority(
@@ -11706,7 +11724,7 @@ async function main() {
 
       // ===== Browser Task Runner =====
       // Prefer Playwright MCP (claude -p + playwright) for reliable DOM-based automation.
-      // Falls back to legacy Computer Use (Puppeteer + screenshot loop) if claude CLI unavailable.
+      // Browser task runs use Playwright MCP only.
       if (msg.type === "browser_task_cancel") {
         const requestId = String(msg.request_id || "");
         const targetRequestId = String(msg.target_request_id || "").trim();
@@ -11768,7 +11786,6 @@ async function main() {
         const requestId = String(msg.request_id || "");
         const task = String(msg.task || "").trim();
         const startUrl = typeof msg.start_url === "string" ? msg.start_url : undefined;
-        const appUrl = String(msg.app_url || "").trim();
         const profileName = typeof msg.profile_name === "string" ? msg.profile_name : "default";
         const apiKey = typeof msg.api_key === "string" ? msg.api_key.trim() : "";
         const cliToken = typeof msg.cli_token === "string" ? msg.cli_token.trim() : "";
@@ -11906,14 +11923,17 @@ async function main() {
                 });
               }
             } else {
-              log("browser_task_run using legacy Computer Use", { usePlaywright, hasApiKey: !!apiKey, hasCliToken: !!cliToken });
-              result = await runBrowserTaskOnConnector({
-                task,
-                start_url: startUrl,
-                app_url: appUrl,
-                profile_name: profileName,
-                device_token: activeDeviceToken || undefined,
+              log("browser_task_run blocked because Playwright MCP is unavailable", {
+                usePlaywright,
+                hasApiKey: !!apiKey,
+                hasCliToken: !!cliToken,
               });
+              result = {
+                ok: false,
+                error: "playwright_mcp_unavailable",
+                message:
+                  "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
+              };
             }
             return result;
           } finally {

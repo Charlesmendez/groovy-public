@@ -2232,7 +2232,41 @@ async function executeDataToolViaDelegation(
         (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
         (process.env.PORT ? `http://localhost:${process.env.PORT}` : "") ||
         "http://localhost:3000";
-      const sessionId = `orch-${context.traceId || Date.now()}`;
+      const { data: delegatedSession, error: delegatedSessionErr } = await supabase
+        .from("chat_sessions")
+        .insert({
+          user_id: context.userId,
+          agent_id: selectedAgent.agentId,
+          title: `Orchestrator data query: ${selectedAgent.agentName}`,
+        })
+        .select("id")
+        .single();
+
+      if (delegatedSessionErr || !delegatedSession?.id) {
+        const msg =
+          delegatedSessionErr?.message ||
+          "Failed to create delegated data-agent chat session";
+        logEvent(context, "data_query_session_create_error", {
+          agentId: selectedAgent.agentId,
+          agentName: selectedAgent.agentName,
+          provider: selectedAgent.provider,
+          error: msg,
+        });
+        return {
+          success: false,
+          error: msg,
+          agent: "data",
+          toolName,
+          executionTime: Date.now() - startTime,
+          delegatedTo: {
+            agentId: selectedAgent.agentId,
+            agentName: selectedAgent.agentName,
+            provider: selectedAgent.provider,
+          },
+        };
+      }
+
+      const sessionId = String(delegatedSession.id);
       
       logEvent(context, "data_query_calling_agent", {
         agentId: selectedAgent.agentId,
