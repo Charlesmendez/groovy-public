@@ -2,8 +2,8 @@
 
 This repository is the release-synchronized source-available public mirror.
 
-Published from private source ref: source-v0.2.8
-Private source commit: 28f6dadc6611efa875ace894ed0688fe06046f44
+Published from private source ref: source-v0.2.9
+Private source commit: d25bb7515b30aa5db14e722b381f2f74342fb147
 Publication policy: source-v* releases are mirrored when their private tag is pushed.
 
 This mirror is for transparency, evaluation, security review, documentation, and contributions.
