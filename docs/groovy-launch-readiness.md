@@ -146,29 +146,27 @@ Private storage buckets exist:
 - `groovy-downloads`
 - `groovy-source-snapshots`
 
-### Still required
+### Already done
 
-Database migrations must be pushed.
+The harness-platform migrations through
+`20260723005000_team_chat_run_controls.sql` are present in production.
+PostgREST schema checks confirm the profile, team-chat, public-API,
+cloud-scheduler, shared-settings/invite-scope, and run-control tables are live.
 
-Blocked because the local Supabase CLI is not authenticated and no DB password is available.
+### Future migration operations
 
-### Where to go
-
-Supabase Dashboard > Project `tjcdifsssxgxitaccadb`.
-
-Either provide:
-
-- Supabase access token through `SUPABASE_ACCESS_TOKEN`, and DB password if CLI asks, or
-- direct database password for `npx supabase db push`.
-
-After credentials are available, run:
+The local Supabase CLI session is not authenticated. Before the next migration,
+authenticate it with a scoped Supabase access token and the production database
+password, then run:
 
 ```bash
 npx supabase link --project-ref tjcdifsssxgxitaccadb
 npx supabase db push --include-all --yes
 ```
 
-The licensing tables, provider key license model, RLS changes, downloads, source snapshots, reseller billing tables, and security advisories depend on these migrations.
+Use Supabase Dashboard > Project `tjcdifsssxgxitaccadb` to obtain the project
+connection details. Do not store the production database password in the
+repository.
 
 ## 4. Stripe
 
