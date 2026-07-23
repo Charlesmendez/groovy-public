@@ -54,6 +54,13 @@ export async function GET() {
       .eq("user_id", user.id)
       .limit(1)
   );
+  await runCheck(checks, "branch_worker_columns", async () =>
+    supabase
+      .from("orchestrator_branches")
+      .select("branch_kind,goal,result_summary,result_payload,completed_at")
+      .eq("user_id", user.id)
+      .limit(1)
+  );
   await runCheck(checks, "session_runtime_agent_scope", async () =>
     supabase
       .from("orchestrator_session_runtime")
@@ -71,7 +78,9 @@ export async function GET() {
   await runCheck(checks, "skills_versions", async () =>
     supabase
       .from("orchestrator_skill_versions")
-      .select("id,skill_id,version,lifecycle,runner")
+      .select(
+        "id,skill_id,version,lifecycle,runner,default_state,metadata,validation_status,validation_task,validation_token,validation_output_preview,validation_requested_at,validated_at"
+      )
       .eq("user_id", user.id)
       .limit(1)
   );

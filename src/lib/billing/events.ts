@@ -33,6 +33,10 @@ export type BillingUsageEventInput = {
   feeRateBps?: number | null;
   billable?: boolean;
   chargeType?: UsageChargeType | string | null;
+  /** Agent this usage is attributed to (worker, orchestrator runtime, or system agent). */
+  agentId?: string | null;
+  /** Harness that produced the usage: "claude" | "codex" | null for direct API calls. */
+  harness?: string | null;
   meta?: Record<string, unknown>;
 };
 
@@ -108,6 +112,8 @@ export async function insertBillingUsageEventBestEffort(input: BillingUsageEvent
       span_id: input.spanId || "main",
       provider: input.provider || null,
       model: input.model || null,
+      agent_id: input.agentId || null,
+      harness: input.harness || null,
       input_tokens: typeof inputTokens === "number" ? inputTokens : null,
       output_tokens: typeof outputTokens === "number" ? outputTokens : null,
       total_tokens: typeof totalTokens === "number" ? totalTokens : null,
@@ -183,6 +189,8 @@ export type BillingToolEventInput = {
   toolCallId: string;
   toolName: string;
   agent?: string | null;
+  /** Agent row this tool invocation is attributed to (uuid; supplements the legacy text label). */
+  agentId?: string | null;
   meta?: Record<string, unknown>;
 };
 
@@ -198,6 +206,7 @@ export async function insertBillingToolEventBestEffort(input: BillingToolEventIn
       tool_call_id: input.toolCallId,
       tool_name: input.toolName,
       agent: input.agent || null,
+      agent_id: input.agentId || null,
       meta: input.meta || {},
     };
 
@@ -242,6 +251,7 @@ export async function insertBillingToolEventsBestEffort(inputs: BillingToolEvent
         tool_call_id: i.toolCallId,
         tool_name: i.toolName,
         agent: i.agent || null,
+        agent_id: i.agentId || null,
         meta: i.meta || {},
       }));
 

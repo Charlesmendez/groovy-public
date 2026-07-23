@@ -219,7 +219,7 @@ type ClaudeRunResultMsg = {
   has_result_event?: boolean;
 };
 
-const CONNECTOR_CLAUDE_RUN_TIMEOUT_MS = 600_000;
+const CONNECTOR_CLAUDE_RUN_TIMEOUT_MS = 20 * 60 * 1000;
 const CLAUDE_RUN_TIMEOUT_MS = CONNECTOR_CLAUDE_RUN_TIMEOUT_MS + 120_000;
 const CLAUDE_RUN_PROGRESS_TIMEOUT_MS = CLAUDE_RUN_TIMEOUT_MS;
 const MAX_RESTORED_INFLIGHT_AGE_MS = CLAUDE_RUN_TIMEOUT_MS + 60_000;
@@ -333,6 +333,7 @@ export function ClaudeCliChatPanel({
   queuedPrompt,
   onQueuedPromptHandled,
   handshake,
+  sharedRelay,
 }: {
   agentId: string;
   agentName?: string;
@@ -343,9 +344,15 @@ export function ClaudeCliChatPanel({
   queuedPrompt?: { id: string; content: string } | null;
   onQueuedPromptHandled?: (id: string) => void;
   handshake?: CodeHandshakeContext | null;
+  /**
+   * Optional shared relay connection. The harness grid embeds many panels at
+   * once — without this each panel opens its own websocket to the relay.
+   */
+  sharedRelay?: ReturnType<typeof useRelay>;
 }) {
   const supabase = getSupabaseBrowserClient();
-  const relay = useRelay({ enabled: true });
+  const ownRelay = useRelay({ enabled: !sharedRelay });
+  const relay = sharedRelay ?? ownRelay;
   const relaySubscribe = relay.subscribe;
   const relaySend = relay.send;
   const relayReconnect = relay.reconnect;
@@ -420,6 +427,7 @@ export function ClaudeCliChatPanel({
   // Refs
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const toolActivityScrollRef = useRef<HTMLDivElement>(null);
   const thinkingScrollRef = useRef<HTMLDivElement>(null);
   const currentRequestIdRef = useRef<string | null>(restoredInflight?.requestId ?? null);
   const streamingContentRef = useRef("");
@@ -477,7 +485,7 @@ export function ClaudeCliChatPanel({
       agent_id: agentId,
       ...(config?.deviceId ? { device_id: config.deviceId } : {}),
       ...(cliSessionId ? { session_id: cliSessionId } : {}),
-      cancel_all_for_agent: true,
+      cancel_all_for_agent: false,
     });
   }, [agentId, cliSessionId, config?.deviceId, relaySend]);
 
@@ -1161,25 +1169,53 @@ export function ClaudeCliChatPanel({
     };
   }, []); // stable — reads from refs
 
-  // Scroll to bottom on new messages
+  // Keep outer message scrolling stable while live output streams inside the
+  // working card. The inner tool/thinking panes handle token-level scrolling.
   useEffect(() => {
     const el = messagesScrollRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages, streamingContent]);
+    const frame = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages.length]);
+
+  useEffect(() => {
+    if (!sending) return;
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    const frame = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [sending]);
+
+  // Auto-scroll tool activity to the newest tool event.
+  useEffect(() => {
+    const el = toolActivityScrollRef.current;
+    if (!el) return;
+    const frame = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeTools]);
 
   // Auto-scroll thinking section to bottom as content streams in
   useEffect(() => {
     const el = thinkingScrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const frame = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [streamingContent]);
 
   // Auto-resize textarea height (handles both typing and programmatic clears like send)
   useEffect(() => {
-    if (inputRef.current) {
-      inputRef.current.style.height = "40px";
-      inputRef.current.style.height = Math.min(inputRef.current.scrollHeight, 120) + "px";
-    }
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.max(44, Math.min(textarea.scrollHeight + 2, 120))}px`;
   }, [input]);
 
   // Load config
@@ -1375,28 +1411,58 @@ export function ClaudeCliChatPanel({
   }, [agentId, cliSessionId, supabase]);
 
   // Persist message to DB
-  const persistMessage = useCallback(async (msg: Message) => {
+  const persistMessage = useCallback(async (msg: Message): Promise<string | null> => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return null;
+
+      // Don't set id - let the database generate the UUID
+      const { data, error } = await supabase
+        .from("claude_code_cli_messages")
+        .insert({
+          user_id: user.id,
+          claude_code_agent_id: agentId,
+          role: msg.role,
+          content: msg.content,
+          diffs: msg.diffs || null,
+          model: msg.model || null,
+          cost_usd: msg.costUsd || null,
+          duration_ms: msg.durationMs || null,
+        })
+        .select("id")
+        .single();
+      
+      if (error) {
+        console.error("[ClaudeCliChatPanel] Error persisting message:", error);
+        return null;
+      }
+      return typeof data?.id === "string" ? data.id : null;
+    } catch (e) {
+      console.error("[ClaudeCliChatPanel] Error persisting message:", e);
+      return null;
+    }
+  }, [agentId, supabase]);
+
+  const deletePersistedMessage = useCallback(async (messageId: string | null) => {
+    const id = typeof messageId === "string" ? messageId.trim() : "";
+    if (!id) return;
+
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      // Don't set id - let the database generate the UUID
-      const { error } = await supabase.from("claude_code_cli_messages").insert({
-        user_id: user.id,
-        claude_code_agent_id: agentId,
-        role: msg.role,
-        content: msg.content,
-        diffs: msg.diffs || null,
-        model: msg.model || null,
-        cost_usd: msg.costUsd || null,
-        duration_ms: msg.durationMs || null,
-      });
-      
+      const { error } = await supabase
+        .from("claude_code_cli_messages")
+        .delete()
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .eq("claude_code_agent_id", agentId);
+
       if (error) {
-        console.error("[ClaudeCliChatPanel] Error persisting message:", error);
+        console.error("[ClaudeCliChatPanel] Error deleting failed message:", error);
       }
     } catch (e) {
-      console.error("[ClaudeCliChatPanel] Error persisting message:", e);
+      console.error("[ClaudeCliChatPanel] Error deleting failed message:", e);
     }
   }, [agentId, supabase]);
 
@@ -2052,12 +2118,6 @@ export function ClaudeCliChatPanel({
 
       timeoutRetryAttemptedRef.current = false;
       setTimeoutRetrySessionId(null);
-      if (opts?.clearInput) setInput("");
-      setSending(true);
-      setError(null);
-      setStreamingContent("");
-      streamingContentRef.current = "";
-      setActiveTools([]);
 
       const userMsg: Message = {
         id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
@@ -2065,7 +2125,22 @@ export function ClaudeCliChatPanel({
         content: prompt,
         createdAt: new Date(),
       };
-      setMessages((prev) => [...prev, userMsg]);
+
+      let persistedUserMessageId: string | null = null;
+      persistedUserMessageId = await persistMessage(userMsg);
+      const displayUserMsg = persistedUserMessageId
+        ? { ...userMsg, id: persistedUserMessageId }
+        : userMsg;
+
+      if (opts?.clearInput) setInput("");
+      setSending(true);
+      setError(null);
+      setStreamingContent("");
+      streamingContentRef.current = "";
+      setActiveTools([]);
+      setMessages((prev) =>
+        prev.some((msg) => msg.id === displayUserMsg.id) ? prev : [...prev, displayUserMsg]
+      );
 
       try {
         const latestThreadSession = await loadLatestThreadSessionId();
@@ -2085,20 +2160,21 @@ export function ClaudeCliChatPanel({
           baselineMessageCount: messages.length,
         });
         if (!runStarted) {
-          setMessages((prev) => prev.filter((msg) => msg.id !== userMsg.id));
+          await deletePersistedMessage(persistedUserMessageId);
+          setMessages((prev) => prev.filter((msg) => msg.id !== displayUserMsg.id));
           if (opts?.clearInput) {
             setInput((current) => current || prompt);
           }
           return false;
         }
-        persistMessage(userMsg);
         return true;
       } catch (e) {
         console.log("[ClaudeCliChat] runPrompt error:", e);
         clearInflight();
         setSending(false);
         setTimeoutRetrySessionId(null);
-        setMessages((prev) => prev.filter((msg) => msg.id !== userMsg.id));
+        await deletePersistedMessage(persistedUserMessageId);
+        setMessages((prev) => prev.filter((msg) => msg.id !== displayUserMsg.id));
         if (opts?.clearInput) {
           setInput((current) => current || prompt);
         }
@@ -2115,6 +2191,7 @@ export function ClaudeCliChatPanel({
       availableSlashCommands,
       codeCliProvider,
       persistMessage,
+      deletePersistedMessage,
       loadLatestThreadSessionId,
       startClaudeRunRequest,
       cliSessionId,
@@ -2263,7 +2340,7 @@ export function ClaudeCliChatPanel({
         : "Configured device is offline";
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex h-full min-h-0 min-w-0 w-full flex-col">
       {/* Header */}
       {!embedded && (
         <div className="flex items-center gap-2 px-3 py-2 border-b border-white/10 bg-zinc-900/50">
@@ -2370,18 +2447,18 @@ export function ClaudeCliChatPanel({
             {/* Rich working container — tool activity + thinking */}
             {(streamingContent || sending) && (
               <div className="flex justify-start">
-                <div className="w-full max-w-[92%] min-w-0 rounded-xl border border-cyan-500/20 bg-zinc-950/80 overflow-hidden">
+                <div className="flex max-h-80 w-full max-w-[92%] min-w-0 flex-col overflow-hidden rounded-xl border border-cyan-500/20 bg-zinc-950/80 [overflow-anchor:none]">
                   {/* Header */}
-                  <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5 bg-cyan-500/5">
+                  <div className="flex shrink-0 items-center gap-2 border-b border-white/5 bg-cyan-500/5 px-3 py-2">
                     <Loader2 className="w-3.5 h-3.5 text-cyan-400 animate-spin shrink-0" />
                     <span className="text-xs font-medium text-cyan-400">Working...</span>
                   </div>
 
                   {/* Tool Activity */}
                   {activeTools.length > 0 && (
-                    <div className="px-3 py-2 border-b border-white/5">
+                    <div className="min-h-0 shrink-0 border-b border-white/5 px-3 py-2">
                       <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1.5">Tool Activity</div>
-                      <div className="space-y-2 max-h-[180px] overflow-y-auto">
+                      <div ref={toolActivityScrollRef} className="max-h-28 space-y-2 overflow-y-auto pr-1">
                         {activeTools.map((tool) => {
                           const Icon = tool.toolName === "Bash" ? Terminal
                             : tool.toolName === "Read" ? FileText
@@ -2424,9 +2501,9 @@ export function ClaudeCliChatPanel({
 
                   {/* Thinking text */}
                   {streamingContent && (
-                    <div className="px-3 py-2">
-                      <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1.5">Thinking</div>
-                      <div ref={thinkingScrollRef} className="max-h-[160px] overflow-y-auto">
+                    <div className="flex min-h-0 flex-1 flex-col px-3 py-2">
+                      <div className="shrink-0 text-[10px] text-zinc-500 uppercase tracking-wider mb-1.5">Thinking</div>
+                      <div ref={thinkingScrollRef} className="min-h-0 flex-1 overflow-y-auto pr-1">
                         <FormattedMessageContent
                           content={streamingContent}
                           className="text-xs text-zinc-400 space-y-2"
@@ -2481,8 +2558,8 @@ export function ClaudeCliChatPanel({
       )}
 
       {/* Input */}
-      <div className="p-3 border-t border-white/10 bg-zinc-900/50">
-        <div className="flex items-end gap-2">
+      <div className="min-w-0 border-t border-white/10 bg-zinc-900/50 p-3">
+        <div className="flex min-w-0 items-end gap-2">
           {/* Plan mode toggle */}
           <button
             onClick={() => setPlanMode(!planMode)}
@@ -2501,7 +2578,7 @@ export function ClaudeCliChatPanel({
           >
             <ListChecks className="w-5 h-5" />
           </button>
-          <div className="relative flex-1">
+          <div className="relative min-w-0 flex-1">
             {isSlashMenuOpen && (
               <div className="absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border border-white/10 bg-zinc-950/95 shadow-2xl backdrop-blur">
                 {/* Compact header */}
@@ -2592,12 +2669,13 @@ export function ClaudeCliChatPanel({
             <textarea
               ref={inputRef}
               value={input}
+              wrap="soft"
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={promptPlaceholder}
               disabled={!canUseInput}
               rows={1}
-              className="w-full bg-black/30 rounded-xl px-4 py-2.5 text-sm text-white placeholder-zinc-500 outline-none border border-white/10 focus:border-cyan-500/50 resize-none min-h-[40px] max-h-[120px] disabled:opacity-50"
+              className="block min-h-11 max-h-[120px] w-full max-w-full resize-none overflow-x-hidden whitespace-pre-wrap break-words rounded-xl border border-white/10 bg-black/30 px-4 py-2.5 text-sm leading-5 text-white outline-none [overflow-wrap:anywhere] placeholder-zinc-500 focus:border-cyan-500/50 disabled:opacity-50"
             />
           </div>
           {sending ? (

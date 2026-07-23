@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import {
   connectSkillsRepository,
   createSkillsArtifact,
+  exportRuntimeSkillToRepository,
   listSkillsManagerState,
   preflightAgentSkills,
+  pushSkillsRepositoryChanges,
   reassignSkillAssignment,
   setSkillAssignment,
   syncSkillsRepository,
@@ -20,6 +22,7 @@ type ActionBody = {
   repositoryId?: string;
   deviceId?: string;
   artifactId?: string;
+  runtimeSkillId?: string;
   assignmentId?: string;
   agentId?: string | null;
   toAgentId?: string | null;
@@ -31,6 +34,8 @@ type ActionBody = {
   name?: string;
   description?: string;
   targets?: string[];
+  overwrite?: boolean;
+  commitMessage?: string;
 };
 
 function statusForError(message: string) {
@@ -88,6 +93,18 @@ export async function POST(req: Request) {
         result,
       });
     }
+    if (action === "push_repo") {
+      const result = await pushSkillsRepositoryChanges({
+        repositoryId: body.repositoryId || "",
+        deviceId: body.deviceId || "",
+      });
+      const resultRecord = result as Record<string, unknown>;
+      return NextResponse.json({
+        ok: resultRecord.ok === true,
+        ...(resultRecord.ok === true ? {} : { error: resultRecord.error || "Skills repo push failed" }),
+        result,
+      });
+    }
     if (action === "create_artifact") {
       const result = await createSkillsArtifact({
         repositoryId: body.repositoryId || "",
@@ -98,10 +115,25 @@ export async function POST(req: Request) {
         name: body.name,
         description: body.description,
         targets: body.targets,
+        overwrite: body.overwrite === true,
+        commitMessage: body.commitMessage,
       });
       return NextResponse.json({
         ok: result.ok === true,
         ...(result.ok === true ? {} : { error: result.error || "Artifact creation failed" }),
+        result,
+      });
+    }
+    if (action === "export_runtime_skill") {
+      const result = await exportRuntimeSkillToRepository({
+        runtimeSkillId: body.runtimeSkillId || "",
+        repositoryId: body.repositoryId || "",
+        deviceId: body.deviceId || "",
+      });
+      const resultRecord = result as Record<string, unknown>;
+      return NextResponse.json({
+        ok: resultRecord.ok === true,
+        ...(resultRecord.ok === true ? {} : { error: resultRecord.error || "Runtime skill export failed" }),
         result,
       });
     }

@@ -11,6 +11,7 @@
 import { z } from "zod";
 import type { ConnectorClientPlatform } from "@/lib/connector/platform";
 import { executeTool, type ToolExecutionContext } from "./toolExecutor";
+import { filterToolsByPolicy } from "./toolPolicy";
 import type { AgentType } from "./router";
 import {
   applySkillStatePatch,
@@ -20,6 +21,7 @@ import {
 import { zodSchemaFromJsonSchema } from "@/lib/extensions/jsonSchema";
 import { indexExtensionRuntimeTools } from "@/lib/extensions/registry";
 import type { ExtensionRuntimeTool } from "@/lib/extensions/types";
+import { getAppUrl, getRelayUrl } from "@/lib/config/appConfig";
 
 // ============================================================================
 // BROWSER TOOLS - Executed via local connector
@@ -583,6 +585,12 @@ export const dataQuerySchema = z.object({
   query: z
     .string()
     .describe("Natural language query to send to the specialized agent"),
+  agentName: z
+    .string()
+    .optional()
+    .describe(
+      "Optional: when multiple connected agents/accounts exist for the same provider, choose one by its displayed agent/account name from data_check_connection."
+    ),
   pixelName: z
     .string()
     .optional()
@@ -620,10 +628,49 @@ export const rememberSchema = z.object({
     .string()
     .optional()
     .describe("Optional category/label for the memory"),
+  wiki_category: z
+    .enum(["entities", "concepts", "projects"])
+    .optional()
+    .describe("Best private Wiki section for this learning"),
+  wiki_page: z
+    .string()
+    .optional()
+    .describe("Stable kebab-case Wiki page name, or an existing Wiki-relative markdown path"),
+  wiki_title: z
+    .string()
+    .optional()
+    .describe("Human-readable title if the Wiki page must be created"),
 });
 
 export const recallSchema = z.object({
   query: z.string().describe("What to search for in memory"),
+});
+
+export const wikiSearchSchema = z.object({
+  query: z.string().describe("Named project, entity, decision, preference, or topic to find"),
+  limit: z.number().int().min(1).max(8).optional().describe("Maximum matching Wiki pages"),
+});
+
+export const wikiReadSchema = z.object({
+  path: z
+    .string()
+    .describe("Wiki-relative path such as index.md, projects/groovy.md, or concepts/user-preferences.md"),
+});
+
+export const wikiFileLearningSchema = z.object({
+  content: z
+    .string()
+    .describe("Concise durable learning to add; do not include passwords, tokens, keys, or full account numbers"),
+  label: z.string().optional().describe("Optional learning category or tag"),
+  category: z
+    .enum(["entities", "concepts", "projects"])
+    .optional()
+    .describe("Best Wiki section for this learning"),
+  page: z
+    .string()
+    .optional()
+    .describe("Stable kebab-case page name, or an existing Wiki-relative markdown path"),
+  title: z.string().optional().describe("Human-readable title when creating a new page"),
 });
 
 // Files Agent request schema (for document creation/analysis without upload)
@@ -775,6 +822,26 @@ export const scheduleCreateSchema = z
       .describe(
         "For kind=orchestrator: natural language task for Groovy to execute at runtime (e.g. 'use Firecrawl to crawl target.com and summarize')"
       ),
+    agent: z
+      .string()
+      .optional()
+      .describe(
+        "For kind=orchestrator: optional worker agent (name or id) that should run the task deterministically. Omit to let the Orchestrator handle it (default). Scheduled worker runs are capped at ~10 minutes."
+      ),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "For kind=orchestrator: optional model id for this scheduled task (for example gpt-5.6-luna or claude-sonnet-4-6). Omit to use the selected Orchestrator or worker default."
+      ),
+    provider: z
+      .enum(["anthropic", "openai"])
+      .optional()
+      .describe("Optional model provider; inferred from model when omitted."),
+    reasoning_effort: z
+      .enum(["none", "low", "medium", "high", "xhigh", "max"])
+      .optional()
+      .describe("Optional reasoning effort when supported by the selected model."),
     schedule: scheduleSpecSchema.describe("When to run"),
   })
   .superRefine((val, ctx) => {
@@ -811,6 +878,143 @@ export const scheduleIdSchema = z.object({
   job_id: z.string().describe("Scheduled job id (UUID)"),
 });
 
+// ---------------------------------------------------------------------------
+// Worker-agent delegation tools (harness)
+// ---------------------------------------------------------------------------
+
+export const listAgentsSchema = z.object({});
+
+export const listSkillsAndDocsSchema = z.object({
+  query: z
+    .string()
+    .optional()
+    .describe("Optional name, description, slug, or path search"),
+});
+
+const skillAssignmentDestinationSchema = z.enum([
+  "orchestrator",
+  "all_claude",
+  "all_codex",
+  "worker",
+]);
+
+export const assignSkillOrDocSchema = z.object({
+  artifact: z
+    .string()
+    .min(1)
+    .describe("Exact skill/doc name, slug, relative path, or artifact id"),
+  destination: skillAssignmentDestinationSchema.describe(
+    "Assign to the orchestrator, all Claude agents, all Codex agents, or one worker"
+  ),
+  agent: z
+    .string()
+    .optional()
+    .describe("Required only when destination=worker: exact worker name or id"),
+});
+
+export const removeSkillOrDocAssignmentSchema = assignSkillOrDocSchema;
+
+export const assignTaskSchema = z.object({
+  agent: z
+    .string()
+    .describe("Worker agent to run the task: exact name (preferred) or agent id"),
+  task: z
+    .string()
+    .describe(
+      "The full task for the worker agent. Be specific and self-contained — the worker does not see this conversation."
+    ),
+  context: z
+    .string()
+    .optional()
+    .describe("Optional extra context to prepend to the task (facts, constraints, prior findings)"),
+  title: z.string().optional().describe("Optional short title for the task (defaults to a prompt summary)"),
+  require_approval: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true for destructive or production-affecting work: the task waits for the user's approval before running"
+    ),
+  plan_mode: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true when the user wants a plan first: the worker runs in read-only plan mode and returns a plan instead of making changes. The user then approves the plan (it is saved to the workspace's .claude/plans/) and chooses which agent executes it."
+    ),
+  wait: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true only for very short tasks (<2 min) when the user needs the result in this reply. Default false: the task runs in the background and you are notified on completion."
+    ),
+});
+
+export const consultAgentSchema = z.object({
+  agent: z
+    .string()
+    .describe("Exact worker agent name (preferred) or agent id whose workspace should be explored"),
+  objective: z
+    .string()
+    .min(1)
+    .describe("The project or feature the orchestrator is planning"),
+  questions: z
+    .array(z.string().min(1))
+    .max(12)
+    .optional()
+    .describe("Targeted repository questions the worker should answer with file evidence"),
+  depth: z
+    .enum(["quick", "standard", "thorough"])
+    .optional()
+    .describe("Exploration depth; standard is the default"),
+  planning_session_id: z
+    .string()
+    .optional()
+    .describe("Reuse the id returned by an earlier consultation for a follow-up investigation"),
+});
+
+export const finalizePlanSchema = z.object({
+  planning_session_id: z
+    .string()
+    .describe("Planning session id returned by consult_agent"),
+  title: z.string().min(1).max(160).describe("Short plan title"),
+  plan: z
+    .string()
+    .min(1)
+    .max(100_000)
+    .describe(
+      "The orchestrator's final evidence-backed markdown plan, including scope, verified architecture, files, ordered steps, tests, risks, and open decisions"
+    ),
+});
+
+export const checkAgentStatusSchema = z.object({
+  agent: z.string().optional().describe("Worker agent name or id (omit for all agents)"),
+  task_id: z.string().optional().describe("Specific task id to check"),
+});
+
+export const collectResultSchema = z.object({
+  task_id: z.string().describe("Task id to collect the result for"),
+});
+
+export const usageReportSchema = z.object({
+  days: z
+    .number()
+    .int()
+    .min(1)
+    .max(365)
+    .optional()
+    .describe("Lookback window in days (default 30)"),
+});
+
+export const transferContextSchema = z.object({
+  from_agent: z
+    .string()
+    .describe('Source: a worker agent name/id, or "orchestrator" for this conversation'),
+  to_agent: z.string().describe("Target worker agent name or id"),
+  instructions: z
+    .string()
+    .optional()
+    .describe("Optional handoff instructions appended to the transferred briefing"),
+});
+
 /**
  * Tool definitions (schemas only) for the AI SDK
  * Execution is handled separately via executeToolCall
@@ -831,6 +1035,11 @@ The specialized agent will:
 Failure handling:
 - If data_query returns JSON with blockedForRun=true or retryable=false, do not call data_query again in this run.
 - In that case, summarize what was obtained, explain the failure briefly, and suggest the next best provider/query strategy.
+
+Multiple connected accounts:
+- If data_check_connection reports multiple active agents for a provider, pass agentName to query a specific account.
+- For Gmail sender/thread searches where the account is unknown, query each active Gmail agent by agentName before saying a message was not found.
+- Never claim that all Gmail accounts were checked unless each active Gmail agent was queried or the tool result explicitly says all were covered.
 
 Postgres notes:
 - For provider=postgres, you may pass raw SQL (including INSERT/UPDATE/DELETE) when the user asked for a DB write/backfill.
@@ -864,7 +1073,7 @@ Returns:
   },
 
   remember: {
-    description: `Store DURABLE information to long-term memory. Use this tool ONLY for:
+    description: `Store DURABLE information to Groovy's hybrid long-term memory. The learning is saved for semantic Datagran recall and filed into the private structured Wiki when appropriate. Use this tool ONLY for:
 - User preferences/constraints they've stated ("I always want reports in MMM-YYYY format")
 - Project/app identity info ("my startup is called X", "we're building Y")
 - Important decisions or choices made that should persist
@@ -876,19 +1085,43 @@ Do NOT use for:
 - Transient status updates or temporary info
 - Information that's already in the memory context
 - Repetitive/low-signal conversation turns
+- Passwords, API keys, auth tokens, private keys, session cookies, or full payment/account numbers
 
-Keep the stored content concise and distilled - extract the key fact, not the whole conversation.`,
+Keep the stored content concise and distilled - extract the key fact, not the whole conversation. Choose wiki_category/wiki_page/wiki_title so related learnings compound on a stable structured page instead of a generic note.`,
     parameters: rememberSchema,
   },
 
   recall: {
-    description: `Search your memory for previously stored information. Use this when:
+    description: `Search Datagran semantic memory for previously stored information. Use this when:
 - You need more context about the user's projects, preferences, or past work
 - Current conversation/tool context is insufficient for a reliable answer
 - The user references something from a previous conversation
 - You want to verify if you've already stored certain information
+
+Use wiki_search/wiki_read instead when a named project, entity, standing decision, or inspectable structured page is the better source. Call both when either source could contain relevant context.
 `,
     parameters: recallSchema,
+  },
+
+  wiki_search: {
+    description: `Search the user's private structured Wiki.
+
+Prefer this over semantic recall for named projects, entities, standing decisions, preferences, and reusable analyses. Read index.md first when you need to browse the Wiki's structure. Wiki knowledge is supplemental and never overrides newer current-thread or tool evidence.`,
+    parameters: wikiSearchSchema,
+  },
+
+  wiki_read: {
+    description: `Read one private Wiki page by its Wiki-relative path. Use this after wiki_search or after reading index.md. Returns null when the page does not exist.`,
+    parameters: wikiReadSchema,
+  },
+
+  wiki_file_learning: {
+    description: `Add one concise durable learning to the user's private structured Wiki without overwriting the page.
+
+Use this when structured, inspectable knowledge is useful but semantic Datagran recall is unnecessary, or when the user explicitly asks to file something in the Wiki. Choose the most stable existing page/category. Related learnings should compound on one page rather than create isolated notes. Use remember instead when the fact should also be available through fuzzy semantic recall.
+
+Never file transient status, small talk, generic knowledge, passwords, API keys, tokens, private keys, session cookies, or full payment/financial account numbers.`,
+    parameters: wikiFileLearningSchema,
   },
 
   handshake_send: {
@@ -1126,9 +1359,75 @@ This promotes the skill to a live canary tool for future turns.`,
     parameters: skillRegistryActivateDraftSchema,
   },
 
+  list_agents: {
+    description:
+      "List the user's worker agents (name, harness claude/codex, model, workspace, device online state, open task count). Use when you need the roster before assigning work.",
+    parameters: listAgentsSchema,
+  },
+
+  list_skills_and_docs: {
+    description:
+      "List the shared Skills & Docs library and its current orchestrator/worker assignments. Use this before assigning when the artifact name is not exact.",
+    parameters: listSkillsAndDocsSchema,
+  },
+
+  assign_skill_or_doc: {
+    description:
+      "Persistently assign one shared skill or Markdown instruction doc to the orchestrator, all Claude agents, all Codex agents, or one named worker. The assignment applies on the next run and is also visible in Skills & Docs.",
+    parameters: assignSkillOrDocSchema,
+  },
+
+  remove_skill_or_doc_assignment: {
+    description:
+      "Remove a persisted Skills & Docs assignment from the orchestrator, a harness group, or one named worker. Resolve the exact artifact and destination before calling.",
+    parameters: removeSkillOrDocAssignmentSchema,
+  },
+
+  assign_task: {
+    description: `Assign a task to one of the user's worker agents (a Claude Code or Codex CLI harness running on their machine). Workers have full file access, terminals, and repo context in their configured workspace.
+
+Use this whenever work should happen in a workspace: coding, refactors, file edits, running commands, repo analysis. The task runs in the background; you get the task id immediately and the completion result arrives as a follow-up event. Mention the worker by the user's @mention when they named one; otherwise pick the best-suited worker from the roster.`,
+    parameters: assignTaskSchema,
+  },
+
+  consult_agent: {
+    description: `Consult a specific worker agent in read-only mode so the orchestrator can inspect that agent's real workspace before writing a plan. The worker explores files, symbols, architecture, tests, and repository state and returns a structured evidence brief inline. Use planning_session_id for targeted follow-up consultations. After enough evidence is collected, the orchestrator must write the final plan and call finalize_plan.`,
+    parameters: consultAgentSchema,
+  },
+
+  finalize_plan: {
+    description:
+      "Persist the orchestrator's synthesized plan as the approvable plan for a consult_agent planning session. Call this after repository consultation and before presenting the final plan to the user.",
+    parameters: finalizePlanSchema,
+  },
+
+  check_agent_status: {
+    description:
+      "Check worker agents' current state: running/queued tasks, last results, device online state. Use before assigning to a busy agent or when the user asks what agents are doing.",
+    parameters: checkAgentStatusSchema,
+  },
+
+  collect_result: {
+    description:
+      "Fetch the full result of a completed task by id (use after assign_task when you need the details).",
+    parameters: collectResultSchema,
+  },
+
+  transfer_context: {
+    description:
+      'Move a summarized briefing of one agent\'s work into another agent. Source can be a worker agent or "orchestrator" (this conversation). The receiving agent gets the briefing prepended to its next task.',
+    parameters: transferContextSchema,
+  },
+
+  usage_report: {
+    description:
+      "Read-only usage & cost report grouped by agent (tokens, spend per model, task outcomes). Use when the user asks about spend, wants to compare agents/models, or asks to optimize costs. Base recommendations on cost vs. task success — e.g. suggest a cheaper model for an agent whose tasks succeed regardless.",
+    parameters: usageReportSchema,
+  },
+
   schedule_create: {
     description:
-      "Create a scheduled job that will run locally on the user's machine via the Groovy Connector. Use for requests like 'every day at 7:30 run ...', 'tomorrow at 9 run ...', 'every 15 minutes run ...'.",
+      "Create a scheduled job that will run through the user's Groovy Connector. For kind=orchestrator, pass agent when the user names a worker (for example Scout); omit agent only when the Orchestrator should run it. When the user names a model or reasoning effort, pass model/provider/reasoning_effort explicitly instead of only mentioning it in task text. Use for requests like 'every day at 7:30 have Scout triage new issues using gpt-5.6-luna', 'tomorrow at 9 run ...', or 'every 15 minutes run ...'.",
     parameters: scheduleCreateSchema,
   },
 
@@ -1497,7 +1796,21 @@ export async function executeToolCall(
 
   if (toolName === "remember") {
     const params = args as z.infer<typeof rememberSchema>;
-    return `Remembered: "${params.content}"${params.label ? ` (${params.label})` : ""}`;
+    const stored =
+      result.result && typeof result.result === "object"
+        ? (result.result as Record<string, unknown>)
+        : {};
+    const wikiPath =
+      typeof stored.wikiPath === "string" && stored.wikiPath
+        ? ` Wiki: ${stored.wikiPath}.`
+        : stored.wikiReason
+          ? ` Wiki filing: ${String(stored.wikiReason)}.`
+          : "";
+    const datagranStatus =
+      stored.datagranStored === false
+        ? " Datagran semantic storage did not complete."
+        : "";
+    return `Remembered: "${params.content}"${params.label ? ` (${params.label})` : ""}.${wikiPath}${datagranStatus}`;
   }
 
   if (toolName === "recall") {
@@ -1540,6 +1853,13 @@ function getOpsPlaybook(
   const isWindows = connectorPlatform === "windows";
   const isMac = connectorPlatform === "macos";
   const platformLabel = isWindows ? "windows" : isMac ? "macos" : "unknown";
+  let configuredAppUrl = "<GROOVY_APP_URL>";
+  try {
+    configuredAppUrl = getAppUrl();
+  } catch {
+    // Deployment configuration is intentionally shown as a required placeholder.
+  }
+  const configuredRelayUrl = getRelayUrl() || "<GROOVY_RELAY_URL>";
 
   const connector = isWindows
     ? `## CONNECTOR (Windows)
@@ -1589,7 +1909,7 @@ Fixes:
   - pkill -f "connector.mjs" || true
   - pkill -f "whatsapp-web-session" || true
   - sleep 2
-  - cd apps/connector && WHATSAPP_GROUP_NAME="<group_name_from_config>" GROOVY_APP_URL="https://www.gogroovy.ai" node connector.mjs --relay wss://groovy-relay.fly.dev --whatsapp --kill-others --no-autostart
+  - cd apps/connector && WHATSAPP_GROUP_NAME="<group_name_from_config>" GROOVY_APP_URL="${configuredAppUrl}" node connector.mjs --relay "${configuredRelayUrl}" --whatsapp --kill-others --no-autostart
 - To go back to LaunchAgent-managed mode:
   - pkill -f "connector.mjs"
   - open /Applications/Groovy\\ Connector.app
@@ -1843,6 +2163,91 @@ export function createExecutableTools(
     };
   }
 
+  // Worker-agent delegation tools (harness) — the orchestrator's core toolset.
+  if (!directAgent) {
+    tools.list_agents = {
+      description: toolDefinitions.list_agents.description,
+      inputSchema: listAgentsSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("list_agents", args as Record<string, unknown>, context);
+      },
+    };
+    tools.list_skills_and_docs = {
+      description: toolDefinitions.list_skills_and_docs.description,
+      inputSchema: listSkillsAndDocsSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("list_skills_and_docs", args as Record<string, unknown>, context);
+      },
+    };
+    tools.assign_skill_or_doc = {
+      description: toolDefinitions.assign_skill_or_doc.description,
+      inputSchema: assignSkillOrDocSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("assign_skill_or_doc", args as Record<string, unknown>, context);
+      },
+    };
+    tools.remove_skill_or_doc_assignment = {
+      description: toolDefinitions.remove_skill_or_doc_assignment.description,
+      inputSchema: removeSkillOrDocAssignmentSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall(
+          "remove_skill_or_doc_assignment",
+          args as Record<string, unknown>,
+          context
+        );
+      },
+    };
+    tools.assign_task = {
+      description: toolDefinitions.assign_task.description,
+      inputSchema: assignTaskSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("assign_task", args as Record<string, unknown>, context);
+      },
+    };
+    tools.consult_agent = {
+      description: toolDefinitions.consult_agent.description,
+      inputSchema: consultAgentSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("consult_agent", args as Record<string, unknown>, context);
+      },
+    };
+    tools.finalize_plan = {
+      description: toolDefinitions.finalize_plan.description,
+      inputSchema: finalizePlanSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("finalize_plan", args as Record<string, unknown>, context);
+      },
+    };
+    tools.check_agent_status = {
+      description: toolDefinitions.check_agent_status.description,
+      inputSchema: checkAgentStatusSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("check_agent_status", args as Record<string, unknown>, context);
+      },
+    };
+    tools.collect_result = {
+      description: toolDefinitions.collect_result.description,
+      inputSchema: collectResultSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("collect_result", args as Record<string, unknown>, context);
+      },
+    };
+    tools.transfer_context = {
+      description: toolDefinitions.transfer_context.description,
+      inputSchema: transferContextSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("transfer_context", args as Record<string, unknown>, context);
+      },
+    };
+    tools.usage_report = {
+      description: toolDefinitions.usage_report.description,
+      inputSchema: usageReportSchema,
+      execute: async (args: unknown) => {
+        return executeToolCall("usage_report", args as Record<string, unknown>, context);
+      },
+    };
+  }
+
   // Schedule tools - server-side, require connector for execution but CRUD can still be done.
   // Only shown when no directAgent, or directAgent is "schedule".
   if (!directAgent || forceScheduleOnly) {
@@ -1975,6 +2380,27 @@ export function createExecutableTools(
     inputSchema: recallSchema,
     execute: async (args: unknown) => {
       return executeToolCall("recall", args as Record<string, unknown>, context);
+    },
+  };
+  tools.wiki_search = {
+    description: toolDefinitions.wiki_search.description,
+    inputSchema: wikiSearchSchema,
+    execute: async (args: unknown) => {
+      return executeToolCall("wiki_search", args as Record<string, unknown>, context);
+    },
+  };
+  tools.wiki_read = {
+    description: toolDefinitions.wiki_read.description,
+    inputSchema: wikiReadSchema,
+    execute: async (args: unknown) => {
+      return executeToolCall("wiki_read", args as Record<string, unknown>, context);
+    },
+  };
+  tools.wiki_file_learning = {
+    description: toolDefinitions.wiki_file_learning.description,
+    inputSchema: wikiFileLearningSchema,
+    execute: async (args: unknown) => {
+      return executeToolCall("wiki_file_learning", args as Record<string, unknown>, context);
     },
   };
 
@@ -2485,7 +2911,7 @@ export function createExecutableTools(
 
   // If user explicitly addressed @obsidian, we're done - don't add browser tools
   if (forceObsidianOnly) {
-    return tools;
+    return stripRetiredHarnessTools(tools);
   }
 
   // Credentials tools (browser-auth). Only show when browser is relevant.
@@ -2787,6 +3213,29 @@ Examples:
     }
   }
 
+  return filterToolsByPolicy(stripRetiredHarnessTools(tools), context.toolPolicy);
+}
+
+/**
+ * Cutover safety boundary. The old single-view capabilities intentionally no
+ * longer exist in the harness product, so never expose their tools even while
+ * the remaining implementation is removed mechanically from this large file.
+ */
+function stripRetiredHarnessTools<T extends Record<string, unknown>>(tools: T): T {
+  for (const name of Object.keys(tools)) {
+    if (
+      (name.startsWith("browser_") && name !== "browser_task") ||
+      name.startsWith("files_") ||
+      name.startsWith("obsidian_") ||
+      name.startsWith("credential_") ||
+      name === "computer_use_action" ||
+      name === "handshake_send" ||
+      name === "code_open_session" ||
+      name === "ai_agent_delegate"
+    ) {
+      delete tools[name];
+    }
+  }
   return tools;
 }
 

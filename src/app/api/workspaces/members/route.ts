@@ -56,6 +56,21 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: "Cannot remove another admin" }, { status: 409 });
       }
 
+      const { data: workspaceChannels } = await admin
+        .from("chat_channels")
+        .select("id")
+        .eq("workspace_id", workspaceId);
+      const channelIds = (workspaceChannels || []).map((channel) =>
+        String(channel.id),
+      );
+      if (channelIds.length) {
+        await admin
+          .from("chat_channel_members")
+          .delete()
+          .eq("member_type", "user")
+          .eq("user_id", targetUserId)
+          .in("channel_id", channelIds);
+      }
       await admin
         .from("workspace_members")
         .delete()
@@ -87,7 +102,26 @@ export async function POST(req: Request) {
       }
     }
 
-    await admin.from("workspace_members").delete().eq("workspace_id", workspaceId).eq("user_id", user.id);
+    const { data: workspaceChannels } = await admin
+      .from("chat_channels")
+      .select("id")
+      .eq("workspace_id", workspaceId);
+    const channelIds = (workspaceChannels || []).map((channel) =>
+      String(channel.id),
+    );
+    if (channelIds.length) {
+      await admin
+        .from("chat_channel_members")
+        .delete()
+        .eq("member_type", "user")
+        .eq("user_id", user.id)
+        .in("channel_id", channelIds);
+    }
+    await admin
+      .from("workspace_members")
+      .delete()
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", user.id);
     await syncWorkspaceAddonSubscriptionBestEffort({
       workspaceId,
       userId: user.id,
@@ -102,4 +136,3 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: message }, { status });
   }
 }
-

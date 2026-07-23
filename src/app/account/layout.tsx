@@ -1,7 +1,8 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { isSelfHosted } from "@/lib/config/edition";
 
-const navItems = [
+const cloudNavItems = [
   ["License", "/account/license"],
   ["Downloads", "/account/downloads"],
   ["Source", "/account/source"],
@@ -10,6 +11,9 @@ const navItems = [
 ];
 
 export default function AccountLayout({ children }: { children: ReactNode }) {
+  const navItems = isSelfHosted()
+    ? cloudNavItems.filter(([label]) => label !== "License" && label !== "Billing")
+    : cloudNavItems;
   return (
     <div className="fixed inset-0 z-10 overflow-y-auto bg-zinc-950 text-white">
       <header className="sticky top-0 z-20 border-b border-white/10 bg-zinc-950/95 backdrop-blur">

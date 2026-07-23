@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   allowedDevOrigins: ["*.trycloudflare.com"],
   // Exclude packages with native bindings or subprocess spawning from bundling.
   // These are resolved via Node.js require() at runtime instead.

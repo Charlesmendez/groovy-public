@@ -4,6 +4,8 @@ import { isWindows } from "../detect.mjs";
 import { killProcessTree } from "../process/index.mjs";
 import { prepareSpawnEnv } from "../shell/index.mjs";
 
+const DEFAULT_CODE_AGENT_TIMEOUT_MS = 20 * 60 * 1000;
+
 function quoteWindowsArg(arg) {
   const s = String(arg ?? "");
   if (!s) return '""';
@@ -66,6 +68,13 @@ function buildClaudeArgs(options) {
     args.push("--verbose");
   }
   if (options.model) args.push("--model", String(options.model));
+  if (options.reasoningEffort) {
+    const effort = String(options.reasoningEffort).trim();
+    if (!["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+      throw new Error("invalid_reasoning_effort");
+    }
+    args.push("--effort", effort);
+  }
   if (options.allowedTools) args.push("--allowedTools", String(options.allowedTools));
   if (options.planMode) {
     args.push("--permission-mode", "plan");
@@ -262,7 +271,7 @@ function spawnOnce({
       timedOut = true;
       timeoutError = `claude_run timed out after ${timeoutMs}ms`;
       void stopChildAndRejectIfNeeded(timeoutError);
-    }, Math.max(1000, Number(timeoutMs) || 5 * 60 * 1000));
+    }, Math.max(1000, Number(timeoutMs) || DEFAULT_CODE_AGENT_TIMEOUT_MS));
   });
 }
 
@@ -275,10 +284,13 @@ export async function runHeadlessClaude(options = {}) {
   const claudeBin = String(options.claudeBin || "claude").trim() || "claude";
   const cwd = normalizeCwd(options.cwd);
   const args = buildClaudeArgs(options);
-  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 5 * 60 * 1000);
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_CODE_AGENT_TIMEOUT_MS);
   const env = prepareSpawnEnv({ ...process.env, ...(options.env || {}) });
 
-  if (options.cliToken) {
+  if (options.localAuth === true) {
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete env.ANTHROPIC_API_KEY;
+  } else if (options.cliToken) {
     env.CLAUDE_CODE_OAUTH_TOKEN = String(options.cliToken);
     delete env.ANTHROPIC_API_KEY;
   } else if (options.apiKey) {

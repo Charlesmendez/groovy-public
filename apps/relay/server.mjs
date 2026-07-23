@@ -10,6 +10,17 @@ const SUPABASE_ANON_KEY =
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY || process.env.NEXT_SUPABASE_SERVICE_ROLE_KEY;
 const RELAY_JWT_SECRET = process.env.RELAY_JWT_SECRET;
+const GROOVY_APP_URL = process.env.GROOVY_APP_URL?.trim() || "";
+const SCHEDULER_CRON_SECRET =
+  process.env.SCHEDULER_CRON_SECRET?.trim() || process.env.CRON_SECRET?.trim() || "";
+const RELAY_SELF_HOSTED =
+  String(process.env.GROOVY_EDITION || "").trim().toLowerCase() === "self-hosted";
+const CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN =
+  process.env.AGENT_TASK_COMPLETION_ORIGIN?.trim() || GROOVY_APP_URL;
+if (!CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN) {
+  throw new Error("Missing GROOVY_APP_URL");
+}
+const AGENT_TASK_COMPLETION_ORIGIN = new URL(CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN).origin;
 
 if (!SUPABASE_URL) throw new Error("Missing SUPABASE_URL");
 if (!SUPABASE_ANON_KEY) throw new Error("Missing SUPABASE_ANON_KEY");
@@ -23,6 +34,7 @@ const INTERNAL_USER_ID_HEADER = "x-groovy-internal-user-id";
 const INTERNAL_AUTH_HEADER = "x-groovy-internal-auth";
 const RELAY_CONNECTOR_RPC_SCOPE = "relay_connector_rpc";
 const RELAY_AIYRA_RUNTIME_SCOPE = "relay_aiyra_runtime";
+const AGENT_TASK_COMPLETE_SCOPE = "agent_task_complete";
 
 function trimmed(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -50,6 +62,36 @@ function verifyInternalRouteAuthHeaders(headers, scope) {
   if (a.length !== b.length) return null;
   if (!timingSafeEqual(a, b)) return null;
   return { userId };
+}
+
+function buildInternalRouteAuthHeaders(userId, scope) {
+  const normalizedUserId = trimmed(userId);
+  const normalizedScope = trimmed(scope);
+  if (!normalizedUserId || !normalizedScope) return {};
+  const ts = String(Date.now());
+  return {
+    [INTERNAL_USER_ID_HEADER]: normalizedUserId,
+    [INTERNAL_AUTH_HEADER]: `${ts}.${signInternalScope(
+      normalizedScope,
+      normalizedUserId,
+      ts
+    )}`,
+  };
+}
+
+function normalizeAgentTaskCompletionUrl(value) {
+  const raw = trimmed(value);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.origin !== AGENT_TASK_COMPLETION_ORIGIN) return "";
+    if (url.pathname !== "/api/agents/tasks/complete") return "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
 }
 
 function readJsonBody(req) {
@@ -1390,6 +1432,192 @@ const terminalBuffers = new Map(); // terminalId -> string
 const aiyraRuntimeByConversation = new Map(); // `${userId}:${conversationId}` -> managed ws/chat runtime
 const AIYRA_RUNTIME_IDLE_CLOSE_MS = 30 * 60 * 1000;
 const AIYRA_RUNTIME_CONNECT_TIMEOUT_MS = 15_000;
+const AGENT_TASK_LIVE_TEXT_MAX_CHARS = 60_000;
+const AGENT_TASK_LIVE_TOOLS_MAX = 24;
+const AGENT_TASK_PROGRESS_FLUSH_MS = 500;
+
+function buildAgentTaskLiveMeta(pending, status = "running") {
+  return {
+    ...(pending.taskMeta || {}),
+    relay_request_id: pending.requestId,
+    live_status: status,
+    live_text: pending.liveText || "",
+    live_text_truncated: pending.liveTextTruncated === true || undefined,
+    live_tools: Array.isArray(pending.liveTools) ? pending.liveTools : [],
+    progress_updated_at: new Date().toISOString(),
+  };
+}
+
+async function flushAgentTaskProgress(pending, status = "running") {
+  if (!pending?.taskId || !pending?.userId) return;
+  if (pending.progressFlushTimer) {
+    clearTimeout(pending.progressFlushTimer);
+    pending.progressFlushTimer = null;
+  }
+
+  const write = async () => {
+    const nextMeta = buildAgentTaskLiveMeta(pending, status);
+    pending.taskMeta = nextMeta;
+    pending.progressDirty = false;
+    const res = await supabaseService(
+      `/rest/v1/agent_tasks?id=eq.${encodeURIComponent(
+        pending.taskId
+      )}&user_id=eq.${encodeURIComponent(
+        pending.userId
+      )}&status=eq.running`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          result_meta: nextMeta,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn("[relay] agent task progress persist failed", {
+        taskId: pending.taskId,
+        requestId: pending.requestId,
+        status: res.status,
+        error: body.slice(0, 300),
+      });
+    }
+  };
+
+  pending.progressWritePromise = (pending.progressWritePromise || Promise.resolve())
+    .catch(() => {})
+    .then(write);
+  await pending.progressWritePromise;
+}
+
+function queueAgentTaskProgress(pending, msg) {
+  if (!pending) return;
+  const eventType = trimmed(msg?.event_type) || "assistant";
+  const content = typeof msg?.content === "string" ? msg.content : "";
+  if (eventType === "assistant" && content) {
+    const combined = `${pending.liveText || ""}${content}`;
+    if (combined.length > AGENT_TASK_LIVE_TEXT_MAX_CHARS) {
+      pending.liveText = combined.slice(-AGENT_TASK_LIVE_TEXT_MAX_CHARS);
+      pending.liveTextTruncated = true;
+    } else {
+      pending.liveText = combined;
+    }
+  }
+  if (eventType === "tool_use") {
+    const toolName = trimmed(msg?.tool_name) || "Tool";
+    const toolInput =
+      typeof msg?.tool_input === "string" ? msg.tool_input.trim().slice(0, 500) : "";
+    const tools = Array.isArray(pending.liveTools) ? pending.liveTools : [];
+    const last = tools[tools.length - 1];
+    if (!last || last.name !== toolName || last.input !== toolInput) {
+      pending.liveTools = [
+        ...tools.slice(-(AGENT_TASK_LIVE_TOOLS_MAX - 1)),
+        {
+          name: toolName,
+          input: toolInput,
+          at: new Date().toISOString(),
+        },
+      ];
+    }
+  }
+  pending.progressDirty = true;
+  if (!pending.progressFlushTimer) {
+    pending.progressFlushTimer = setTimeout(() => {
+      pending.progressFlushTimer = null;
+      void flushAgentTaskProgress(pending).catch((error) => {
+        console.warn(
+          "[relay] agent task progress flush failed:",
+          error instanceof Error ? error.message : String(error)
+        );
+      });
+    }, AGENT_TASK_PROGRESS_FLUSH_MS);
+  }
+}
+
+async function deliverAgentTaskCompletion(pending, result) {
+  if (!pending?.completionUrl || !pending?.taskId || !pending?.requestId) return;
+  pending.completionResult = result;
+  if (pending.timeoutId) {
+    clearTimeout(pending.timeoutId);
+    pending.timeoutId = null;
+  }
+  await flushAgentTaskProgress(pending, "finalizing").catch(() => {});
+
+  const attempt = async () => {
+    if (pendingRequests.get(pending.requestId) !== pending) return;
+    pending.completionAttempts = (pending.completionAttempts || 0) + 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    let response;
+    let errorText = "";
+    try {
+      response = await fetch(pending.completionUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...buildInternalRouteAuthHeaders(
+            pending.userId,
+            AGENT_TASK_COMPLETE_SCOPE
+          ),
+        },
+        body: JSON.stringify({
+          taskId: pending.taskId,
+          requestId: pending.requestId,
+          result: pending.completionResult,
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        errorText = await response.text().catch(() => "");
+      }
+    } catch (error) {
+      errorText = error instanceof Error ? error.message : String(error);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response?.ok) {
+      pendingRequests.delete(pending.requestId);
+      console.log("[relay] agent task completion delivered", {
+        taskId: pending.taskId,
+        requestId: pending.requestId,
+        attempts: pending.completionAttempts,
+      });
+      return;
+    }
+
+    console.warn("[relay] agent task completion delivery failed", {
+      taskId: pending.taskId,
+      requestId: pending.requestId,
+      attempt: pending.completionAttempts,
+      status: response?.status || null,
+      error: errorText.slice(0, 300),
+    });
+    pending.taskMeta = {
+      ...buildAgentTaskLiveMeta(pending, "finalizing"),
+      completion_delivery_error:
+        errorText.slice(0, 500) || `HTTP ${response?.status || 0}`,
+    };
+    pending.progressDirty = true;
+    await flushAgentTaskProgress(pending, "finalizing").catch(() => {});
+
+    const delay =
+      pending.completionAttempts <= 1
+        ? 1_000
+        : pending.completionAttempts <= 3
+          ? 5_000
+          : pending.completionAttempts <= 6
+            ? 15_000
+            : 60_000;
+    pending.completionRetryTimer = setTimeout(() => {
+      pending.completionRetryTimer = null;
+      void attempt();
+    }, delay);
+  };
+
+  await attempt();
+}
 
 async function handleInternalConnectorRpcHttp(req, res) {
   if (req.method !== "POST") {
@@ -1420,9 +1648,20 @@ async function handleInternalConnectorRpcHttp(req, res) {
       ? body.payload
       : {};
   const timeoutRaw = Number(body?.timeoutMs);
+  const maxTimeoutMs = rpcType === "claude_run" ? 22 * 60 * 1000 : 5 * 60 * 1000;
+  const defaultTimeoutMs = rpcType === "claude_run" ? 20 * 60 * 1000 + 30_000 : 30_000;
   const timeoutMs = Number.isFinite(timeoutRaw)
-    ? Math.max(1000, Math.min(Math.trunc(timeoutRaw), 5 * 60 * 1000))
-    : 30_000;
+    ? Math.max(1000, Math.min(Math.trunc(timeoutRaw), maxTimeoutMs))
+    : defaultTimeoutMs;
+  const callbackDelivery =
+    body?.delivery === "callback" && rpcType === "claude_run";
+  const taskId = trimmed(body?.taskId);
+  const completionUrl = normalizeAgentTaskCompletionUrl(body?.completionUrl);
+  const requestedRequestId = trimmed(body?.requestId);
+  const taskMeta =
+    body?.taskMeta && typeof body.taskMeta === "object" && !Array.isArray(body.taskMeta)
+      ? body.taskMeta
+      : {};
 
   if (!deviceId) {
     writeJson(res, 400, { error: "missing_device_id" });
@@ -1430,6 +1669,12 @@ async function handleInternalConnectorRpcHttp(req, res) {
   }
   if (!rpcType) {
     writeJson(res, 400, { error: "missing_rpc_type" });
+    return;
+  }
+  if (callbackDelivery && (!taskId || !completionUrl || !requestedRequestId)) {
+    writeJson(res, 400, {
+      error: "missing_callback_delivery_fields",
+    });
     return;
   }
 
@@ -1440,7 +1685,79 @@ async function handleInternalConnectorRpcHttp(req, res) {
     return;
   }
 
-  const requestId = randomUUID();
+  const requestId = requestedRequestId || randomUUID();
+  if (pendingRequests.has(requestId)) {
+    writeJson(res, 409, { error: "request_id_in_use" });
+    return;
+  }
+
+  if (callbackDelivery) {
+    const pending = {
+      type: "agent_task_run_internal",
+      requestId,
+      userId: auth.userId,
+      deviceId,
+      rpcType,
+      taskId,
+      completionUrl,
+      taskMeta,
+      liveText: "",
+      liveTextTruncated: false,
+      liveTools: [],
+      progressDirty: false,
+      progressFlushTimer: null,
+      progressWritePromise: Promise.resolve(),
+      completionAttempts: 0,
+      completionRetryTimer: null,
+      timeoutId: null,
+    };
+    pending.timeoutId = setTimeout(() => {
+      if (pendingRequests.get(requestId) !== pending) return;
+      const currentConnector = connectorByDevice.get(deviceId);
+      if (currentConnector) {
+        wsSend(currentConnector, {
+          type: "claude_run_cancel",
+          request_id: `relay-task-timeout-cancel-${requestId}`,
+          target_request_id: requestId,
+          agent_id: trimmed(payload?.agent_id),
+          cancel_all_for_agent: false,
+        });
+      }
+      void deliverAgentTaskCompletion(pending, {
+        type: "claude_run_result",
+        request_id: requestId,
+        ok: false,
+        error: "relay_timeout",
+        timed_out: true,
+      });
+    }, timeoutMs);
+    pendingRequests.set(requestId, pending);
+
+    const sent = wsSend(
+      connectorWs,
+      {
+        ...payload,
+        type: rpcType,
+        request_id: requestId,
+      },
+      () => {}
+    );
+    if (!sent) {
+      pendingRequests.delete(requestId);
+      clearTimeout(pending.timeoutId);
+      writeJson(res, 502, { error: "connector_send_failed" });
+      return;
+    }
+
+    writeJson(res, 202, {
+      ok: true,
+      accepted: true,
+      requestId,
+      taskId,
+    });
+    return;
+  }
+
   const responsePromise = new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
       pendingRequests.delete(requestId);
@@ -2640,7 +2957,79 @@ async function fetchWorkspaceByPath({ userId, deviceId, rootPath }) {
   return null;
 }
 
-async function fetchScheduledJobs({ deviceId }) {
+function relayLicenseRowIsActive(row) {
+  const status = String(row?.status || "");
+  const validUntil = Date.parse(String(row?.valid_until || ""));
+  return (status === "active" || status === "past_due") && Number.isFinite(validUntil) && validUntil >= Date.now();
+}
+
+async function productAccessForUser(userId) {
+  if (RELAY_SELF_HOSTED) {
+    return { hasAccess: true, status: "self_hosted" };
+  }
+  const membershipsQ = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    select: "workspace_id",
+  });
+  const membershipsRes = await supabaseService(`/rest/v1/workspace_members?${membershipsQ.toString()}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!membershipsRes.ok) return { hasAccess: false, status: "unavailable" };
+  const memberships = await membershipsRes.json();
+  const workspaceIds = Array.isArray(memberships)
+    ? memberships.map((row) => String(row?.workspace_id || "")).filter(Boolean)
+    : [];
+
+  const personalQ = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    select: "status,valid_until",
+  });
+  const personalRes = await supabaseService(`/rest/v1/licenses?${personalQ.toString()}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!personalRes.ok) return { hasAccess: false, status: "unavailable" };
+  const personal = await personalRes.json();
+
+  let workspaceLicenses = [];
+  if (workspaceIds.length > 0) {
+    const workspaceQ = new URLSearchParams({
+      workspace_id: `in.(${workspaceIds.join(",")})`,
+      select: "status,valid_until",
+    });
+    const workspaceRes = await supabaseService(`/rest/v1/licenses?${workspaceQ.toString()}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+    if (!workspaceRes.ok) return { hasAccess: false, status: "unavailable" };
+    const rows = await workspaceRes.json();
+    workspaceLicenses = Array.isArray(rows) ? rows : [];
+  }
+
+  const licenses = [...(Array.isArray(personal) ? personal : []), ...workspaceLicenses];
+  if (licenses.some(relayLicenseRowIsActive)) return { hasAccess: true, status: "licensed" };
+
+  const trialQ = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    select: "ends_at",
+    limit: "1",
+  });
+  const trialRes = await supabaseService(`/rest/v1/license_free_trials?${trialQ.toString()}`, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  if (!trialRes.ok) return { hasAccess: false, status: "unavailable" };
+  const trials = await trialRes.json();
+  const endsAt = Array.isArray(trials) && trials[0]?.ends_at ? Date.parse(String(trials[0].ends_at)) : 0;
+  return Number.isFinite(endsAt) && endsAt > Date.now()
+    ? { hasAccess: true, status: "trial" }
+    : { hasAccess: false, status: endsAt ? "expired" : "trial_available" };
+}
+
+async function fetchScheduledJobs({ deviceId, userId }) {
+  const access = await productAccessForUser(userId);
+  if (!access.hasAccess) return { jobs: [], accessStatus: access.status };
   const q = new URLSearchParams({
     device_id: `eq.${deviceId}`,
     select:
@@ -2657,7 +3046,9 @@ async function fetchScheduledJobs({ deviceId }) {
   return { jobs: Array.isArray(rows) ? rows : [] };
 }
 
-async function fetchScheduledJobForDevice({ jobId, deviceId }) {
+async function fetchScheduledJobForDevice({ jobId, deviceId, userId }) {
+  const access = await productAccessForUser(userId);
+  if (!access.hasAccess) return { error: "license_required", job: null };
   const q = new URLSearchParams({
     id: `eq.${jobId}`,
     device_id: `eq.${deviceId}`,
@@ -3425,8 +3816,53 @@ wss.on("connection", (ws) => {
           typeof msg?.provider === "string" && msg.provider.trim()
             ? msg.provider.trim()
             : "claude";
-        const forwardModel =
+        let forwardModel =
           typeof msg?.model === "string" && msg.model.trim() ? msg.model.trim() : "";
+        let forwardReasoningEffort =
+          typeof msg?.reasoning_effort === "string" && msg.reasoning_effort.trim()
+            ? msg.reasoning_effort.trim()
+            : "";
+        if (agentId && (!forwardModel || !forwardReasoningEffort)) {
+          try {
+            const configResponse = await supabaseService(
+              `/rest/v1/claude_code_agent_configs?agent_id=eq.${encodeURIComponent(agentId)}` +
+                `&user_id=eq.${encodeURIComponent(userId)}` +
+                "&select=model,reasoning_effort&limit=1",
+              { method: "GET", headers: { Accept: "application/json" } }
+            );
+            if (configResponse.ok) {
+              const rows = await configResponse.json();
+              const config = Array.isArray(rows) ? rows[0] : null;
+              if (!forwardModel && typeof config?.model === "string") {
+                forwardModel = config.model.trim();
+              }
+              if (
+                !forwardReasoningEffort &&
+                typeof config?.reasoning_effort === "string"
+              ) {
+                forwardReasoningEffort = config.reasoning_effort.trim();
+              }
+            }
+          } catch (error) {
+            console.warn("[relay] claude_run model settings fallback failed", {
+              requestId,
+              agentId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        const requestedRunTimeoutMs = Number(msg?.timeout_ms);
+        const runTimeoutMs =
+          Number.isFinite(requestedRunTimeoutMs) && requestedRunTimeoutMs > 0
+            ? Math.min(Math.trunc(requestedRunTimeoutMs), 20 * 60 * 1000)
+            : 20 * 60 * 1000;
+        console.log("[relay] claude_run forwarding model settings", {
+          requestId,
+          agentId: agentId || null,
+          provider: forwardProvider,
+          model: forwardModel || null,
+          reasoningEffort: forwardReasoningEffort || null,
+        });
         wsSend(connectorWs, {
           type: "claude_run",
           request_id: requestId,
@@ -3437,10 +3873,11 @@ wss.on("connection", (ws) => {
           api_key: msg?.api_key || "",
           cli_token: msg?.cli_token || "",
           allowed_tools: msg?.allowed_tools || "Read,Edit,Bash",
-          timeout_ms: msg?.timeout_ms || 300000,
+          timeout_ms: runTimeoutMs,
           session_id: msg?.session_id || "",
           plan_mode: msg?.plan_mode || false,
           ...(forwardModel ? { model: forwardModel } : {}),
+          ...(forwardReasoningEffort ? { reasoning_effort: forwardReasoningEffort } : {}),
         });
 
         // Timeout - clean up pending request if no response
@@ -3456,7 +3893,7 @@ wss.on("connection", (ws) => {
                 request_id: `relay-timeout-cancel-${requestId}`,
                 target_request_id: requestId,
                 agent_id: String(pending.agentId || ""),
-                cancel_all_for_agent: !!pending.agentId,
+                cancel_all_for_agent: false,
               });
             }
             if (pending.browserWs) {
@@ -3468,7 +3905,7 @@ wss.on("connection", (ws) => {
               });
             }
           }
-        }, (msg?.timeout_ms || 300000) + 10000);
+        }, runTimeoutMs + 10000);
         pendingEntry.timeoutId = timeoutId;
 
         return;
@@ -3916,7 +4353,7 @@ wss.on("connection", (ws) => {
         msgType.startsWith("computer_use_") ||
         msgType.startsWith("email_") ||
         msgType.startsWith("whatsapp_") ||
-        msgType.startsWith("schedule_trigger") ||
+        msgType.startsWith("schedule_") ||
         msgType.startsWith("site_") ||
         msgType.startsWith("skills_") ||
         msgType === "terminal_exec" ||
@@ -4033,7 +4470,7 @@ wss.on("connection", (ws) => {
       }
 
       if (msg?.type === "schedule_sync_request") {
-        const fetched = await fetchScheduledJobs({ deviceId });
+        const fetched = await fetchScheduledJobs({ deviceId, userId });
         if (fetched.error) {
           wsSend(ws, { type: "schedule_sync", ok: false, error: fetched.error });
           return;
@@ -4073,7 +4510,7 @@ wss.on("connection", (ws) => {
             ? msg.whatsapp_target_recipient_query.trim()
             : "";
 
-        const lookedUp = await fetchScheduledJobForDevice({ jobId, deviceId });
+        const lookedUp = await fetchScheduledJobForDevice({ jobId, deviceId, userId });
         if (!lookedUp.job) {
           // Ignore reports for unknown jobs (may have been deleted)
           return;
@@ -4234,8 +4671,13 @@ wss.on("connection", (ws) => {
       if (msg?.type === "claude_run_progress") {
         const requestId = String(msg?.request_id || "");
         const pending = pendingRequests.get(requestId);
-        if (!pending || pending.type !== "claude_run") return;
+        if (!pending) return;
         if (pending.userId !== userId || pending.deviceId !== deviceId) return;
+        if (pending.type === "agent_task_run_internal") {
+          queueAgentTaskProgress(pending, msg);
+          return;
+        }
+        if (pending.type !== "claude_run") return;
 
         // Forward progress to browser
         if (pending.browserWs) {
@@ -4255,6 +4697,19 @@ wss.on("connection", (ws) => {
         const requestId = String(msg?.request_id || "");
         const pending = pendingRequests.get(requestId);
         if (!pending) return;
+        if (pending.type === "agent_task_run_internal") {
+          if (pending.userId !== userId || pending.deviceId !== deviceId) return;
+          void deliverAgentTaskCompletion(
+            pending,
+            msg && typeof msg === "object" ? msg : {}
+          ).catch((error) => {
+            console.warn(
+              "[relay] agent task completion handler failed:",
+              error instanceof Error ? error.message : String(error)
+            );
+          });
+          return;
+        }
         if (pending.type === "connector_rpc_internal" || pending.type === "connector_rpc") {
           pendingRequests.delete(requestId);
           if (pending.timeoutId) clearTimeout(pending.timeoutId);
@@ -4634,6 +5089,15 @@ wss.on("connection", (ws) => {
       }
       for (const [requestId, pending] of pendingRequests.entries()) {
         if (pending?.deviceId !== info.deviceId) continue;
+        if (pending?.type === "agent_task_run_internal") {
+          void deliverAgentTaskCompletion(pending, {
+            type: "claude_run_result",
+            request_id: requestId,
+            ok: false,
+            error: "device_not_online",
+          });
+          continue;
+        }
         if (pending?.type !== "connector_rpc_internal" && pending?.type !== "connector_rpc") continue;
         if (
           pending?.type === "connector_rpc" &&
@@ -4697,3 +5161,47 @@ const PORT = Number(process.env.PORT || 8787);
 server.listen(PORT, () => {
   console.log(`FLOW relay listening on :${PORT}`);
 });
+
+let schedulerTickInFlight = false;
+async function triggerCloudSchedulerTick() {
+  if (!SCHEDULER_CRON_SECRET || schedulerTickInFlight) return;
+  schedulerTickInFlight = true;
+  try {
+    const response = await fetch(new URL("/api/scheduler/run", GROOVY_APP_URL), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SCHEDULER_CRON_SECRET}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ cronTick: true }),
+      signal: AbortSignal.timeout(790_000),
+    });
+    if (!response.ok) {
+      console.warn("[relay] scheduler tick failed", {
+        status: response.status,
+        body: (await response.text()).slice(0, 500),
+      });
+    }
+  } catch (error) {
+    console.warn("[relay] scheduler tick error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    schedulerTickInFlight = false;
+  }
+}
+
+if (SCHEDULER_CRON_SECRET) {
+  const initialSchedulerTick = setTimeout(() => {
+    void triggerCloudSchedulerTick();
+  }, 5_000);
+  initialSchedulerTick.unref();
+  const schedulerTickInterval = setInterval(() => {
+    void triggerCloudSchedulerTick();
+  }, 60_000);
+  schedulerTickInterval.unref();
+} else {
+  console.warn(
+    "[relay] SCHEDULER_CRON_SECRET is not configured; connector-independent schedule ticks are disabled"
+  );
+}

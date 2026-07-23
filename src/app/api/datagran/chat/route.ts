@@ -7,6 +7,7 @@ import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import { getDatagranSystemPrompt, type DatagranProvider } from "@/lib/datagran/prompts";
+import { createDatagranLinkToken, resolveDatagranLinkOrigin } from "@/lib/datagran/linkToken";
 import {
   completeAgentTrace,
   createAgentTrace,
@@ -164,6 +165,38 @@ function sanitizeDatagranHeaders(headers?: Record<string, string>): Record<strin
   return safe;
 }
 
+function maybeBroadenGmailMessageSearch(url: URL, provider?: string): void {
+  if (provider !== "gmail") return;
+  if (!url.pathname.endsWith("/api/proxy/gmail/gmail/v1/users/me/messages")) return;
+  if (url.searchParams.has("includeSpamTrash")) return;
+
+  const query = url.searchParams.get("q") || "";
+  if (!query.trim()) return;
+
+  const lower = query.toLowerCase();
+  const explicitlyAllOrSpamTrash =
+    lower.includes("in:anywhere") ||
+    lower.includes("in:spam") ||
+    lower.includes("in:trash") ||
+    /\b(spam|trash)\b/.test(lower);
+  const explicitlyNarrowMailbox =
+    /\bin:(inbox|sent|drafts|draft|chats|important|starred|snoozed)\b/.test(lower) ||
+    /\blabel:/.test(lower);
+  const senderRecipientSearch = /\b(from|to|cc|bcc):\S+/i.test(query);
+  const emailOrDomainSearch =
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(query) ||
+    /\b[A-Z0-9-]+(?:\.[A-Z0-9-]+)+\b/i.test(query);
+  const hasSearchOperator = /\b[a-z_]+:\S+/i.test(query);
+  const freeTextSearch = !hasSearchOperator && /[A-Z0-9]/i.test(query);
+
+  if (
+    explicitlyAllOrSpamTrash ||
+    (!explicitlyNarrowMailbox && (senderRecipientSearch || emailOrDomainSearch || freeTextSearch))
+  ) {
+    url.searchParams.set("includeSpamTrash", "true");
+  }
+}
+
 // Execute Datagran API call server-side
 async function executeDatagranApiCall(
   apiKey: string,
@@ -180,6 +213,7 @@ async function executeDatagranApiCall(
       return { success: false, error: "Invalid Datagran API endpoint", status: 400 };
     }
     const url = new URL(safeEndpoint, "https://www.datagran.io");
+    maybeBroadenGmailMessageSearch(url, provider);
     
     // For web_pixel provider, inject site_id instead of connection_id for pixel endpoints
     if (provider === "web_pixel" && safeEndpoint.includes("/api/pixel/")) {
@@ -1280,34 +1314,24 @@ export async function POST(req: Request) {
               console.log("[datagran-chat] Authorization required, generating link token...");
               // Generate a fresh link token for re-auth
               try {
-                const origin = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+                const origin = resolveDatagranLinkOrigin(req.url, "http://localhost:3000");
                 const providerNorm = String(config.provider || "").trim().toLowerCase();
                 const scopes = providerNorm === "gmail" ? GMAIL_REQUIRED_SCOPES : undefined;
-                const linkTokenRes = await fetch("https://www.datagran.io/api/link/token", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": datagranApiKey,
-                  },
-                  body: JSON.stringify({
-                    endUser: {
-                      externalId: `flow_${user.id}`,
-                      email: user.email || undefined,
-                    },
-                    origin,
-                    provider: config.provider,
-                    ...(Array.isArray(scopes) && scopes.length > 0 ? { scopes } : {}),
-                  }),
+                const linkTokenRes = await createDatagranLinkToken({
+                  apiKeys: [datagranApiKey, process.env.DATAGRAN_API_KEY],
+                  endUserExternalId: `flow_${user.id}`,
+                  email: user.email || undefined,
+                  origin,
+                  provider: config.provider,
+                  scopes,
                 });
 
                 if (linkTokenRes.ok) {
-                  const linkTokenData = await linkTokenRes.json();
-                  const linkToken = linkTokenData.linkToken || linkTokenData.link_token;
                   sendSSE(controller, encoder, {
                     type: "needs_reauth",
                     provider: config.provider,
                     agentId,
-                    linkToken,
+                    linkToken: linkTokenRes.linkToken,
                     error: result.error,
                   });
                 } else {

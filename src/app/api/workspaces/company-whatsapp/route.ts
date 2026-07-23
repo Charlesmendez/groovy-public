@@ -4,6 +4,7 @@ import { getAuthedUser } from "@/lib/workspaces";
 import { createKapsoCustomer, createKapsoSetupLink } from "@/lib/whatsapp/kapso";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
 import { syncWorkspaceAddonSubscription } from "@/lib/billing/addons";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type Body = {
   action?: "request" | "update" | "setup_link";
@@ -11,19 +12,31 @@ type Body = {
 };
 
 export async function GET() {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
     const { data: membership, error: memberErr } = await admin
       .from("workspace_members")
-      .select("workspace_id")
+      .select("workspace_id, role")
       .eq("user_id", user.id)
       .limit(1)
       .single();
     if (memberErr || !membership) {
       logWarn("kapso.company_whatsapp.get.no_workspace", { user_id: user.id });
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    }
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
     }
     const { data, error } = await admin
       .from("workspace_company_whatsapp")
@@ -60,6 +73,12 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const user = await getAuthedUser();

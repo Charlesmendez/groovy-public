@@ -31,6 +31,12 @@ export function MarketingHeader() {
             Integrations
           </Link>
           <Link
+            href="/account/downloads"
+            className="px-3 lg:px-5 py-2.5 text-sm font-medium text-zinc-300 hover:text-white transition-colors"
+          >
+            Download
+          </Link>
+          <Link
             href="/#pricing"
             className="px-3 lg:px-5 py-2.5 text-sm font-medium text-zinc-300 hover:text-white transition-colors"
           >
@@ -80,6 +86,7 @@ export function MarketingHeader() {
           <div className="px-4 py-3 grid grid-cols-2 gap-2">
             {[
               { label: "Integrations", href: "/integrations" },
+              { label: "Download", href: "/account/downloads" },
               { label: "Pricing", href: "/#pricing" },
               { label: "Setup", href: "/setup" },
               { label: "Sign in", href: "/login" },

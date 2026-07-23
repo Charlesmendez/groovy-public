@@ -31,6 +31,21 @@ function byteLength(value: unknown): number {
   return Buffer.byteLength(safeJson(value), "utf8");
 }
 
+function linkTurnAbort(
+  controller: AbortController,
+  signal?: AbortSignal,
+): () => void {
+  const abort = () =>
+    controller.abort(
+      signal?.reason instanceof Error
+        ? signal.reason
+        : new Error("orchestrator_run_aborted"),
+    );
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  return () => signal?.removeEventListener("abort", abort);
+}
+
 function previewPayload(value: unknown, maxChars = 4000): Record<string, unknown> {
   const serialized = safeJson(value);
   if (serialized.length <= maxChars) {
@@ -384,6 +399,10 @@ async function executeHttpAction(args: {
     const timeoutMs = Number.isFinite(action.timeoutMs) ? Number(action.timeoutMs) : 15000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const unlinkTurnAbort = linkTurnAbort(
+      controller,
+      args.context.abortSignal,
+    );
 
     try {
       const response = await fetch(url.toString(), {
@@ -440,6 +459,7 @@ async function executeHttpAction(args: {
       };
     } finally {
       clearTimeout(timer);
+      unlinkTurnAbort();
     }
   } catch (error) {
     return {
@@ -598,6 +618,10 @@ async function executeRunnerAction(args: {
     const timeoutMs = Number.isFinite(action.timeoutMs) ? Number(action.timeoutMs) : 30000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs + 2000);
+    const unlinkTurnAbort = linkTurnAbort(
+      controller,
+      args.context.abortSignal,
+    );
 
     try {
       const response = await fetch(url.toString(), {
@@ -688,6 +712,7 @@ async function executeRunnerAction(args: {
       };
     } finally {
       clearTimeout(timer);
+      unlinkTurnAbort();
     }
   } catch (error) {
     return {

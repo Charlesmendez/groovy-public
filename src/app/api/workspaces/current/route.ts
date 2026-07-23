@@ -1,10 +1,20 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { getAuthedUser, getOrCreateWorkspaceForUser } from "@/lib/workspaces";
+import {
+  getAuthedUser,
+  getOrCreateWorkspaceForUser,
+  isWorkspaceOperatorRole,
+} from "@/lib/workspaces";
 
 export async function GET() {
   try {
     const workspace = await getOrCreateWorkspaceForUser();
+    if (!isWorkspaceOperatorRole(workspace.role)) {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
+    }
     return NextResponse.json({ workspace });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to load workspace";

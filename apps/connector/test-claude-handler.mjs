@@ -50,7 +50,7 @@ console.log("");
 const prompt = String(msg.prompt || "").trim();
 const cwdRaw = typeof msg.cwd === "string" && msg.cwd.trim() ? msg.cwd.trim() : os.homedir();
 const passedApiKey = typeof msg.api_key === "string" ? msg.api_key.trim() : "";
-const timeoutMs = Number.isFinite(Number(msg.timeout_ms)) ? Number(msg.timeout_ms) : 5 * 60 * 1000;
+const timeoutMs = Number.isFinite(Number(msg.timeout_ms)) ? Number(msg.timeout_ms) : 20 * 60 * 1000;
 const sessionId = typeof msg.session_id === "string" ? msg.session_id.trim() : "";
 
 if (!prompt) {

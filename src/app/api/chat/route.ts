@@ -20,6 +20,7 @@ import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
 import { insertBillingUsageEventBestEffort } from "@/lib/billing/events";
 import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
 import { usageChargeTypeForKeyMode } from "@/lib/billing/pricing";
+import { scheduleAfterResponse } from "@/lib/runtime/afterResponse";
 
 type IncomingMessage = {
   id?: string;
@@ -354,6 +355,8 @@ export async function POST(req: Request) {
         userEmail: user.email || undefined,
         maxContextChars: 2000,
         llmApiKey: decryptedApiKey || undefined,
+        llmProvider: provider,
+        llmModel: modelName,
         supabase,
       }
     );
@@ -506,17 +509,22 @@ export async function POST(req: Request) {
       await completeAgentTrace(supabase, { traceId, response: responseText });
       // AI-decided memory storage (async, don't block response)
       if (memoryConnectionId) {
-        maybeStoreConversation(
-          memoryConnectionId,
-          userText || "[image]",
-          responseText,
-          memoryContext,
-          { llmApiKey: decryptedApiKey || undefined }
-        ).then((result) => {
+        await scheduleAfterResponse(async () => {
+          const result = await maybeStoreConversation(
+            memoryConnectionId,
+            userText || "[image]",
+            responseText,
+            memoryContext,
+            {
+              llmApiKey: decryptedApiKey || undefined,
+              llmProvider: provider,
+              llmModel: modelName,
+            }
+          );
           if (result.stored) {
             console.log("[chat/route] Memory stored:", result.label, result.memoryNote?.slice(0, 50));
           }
-        }).catch(() => {});
+        }, "image chat memory storage");
       }
     }
 
@@ -598,17 +606,22 @@ export async function POST(req: Request) {
         await completeAgentTrace(supabase, { traceId, response: text });
         // AI-decided memory storage (async, don't block response)
         if (memoryConnectionId) {
-          maybeStoreConversation(
-            memoryConnectionId,
-            userText || "[image]",
-            text,
-            memoryContext,
-            { llmApiKey: decryptedApiKey || undefined }
-          ).then((result) => {
+          await scheduleAfterResponse(async () => {
+            const result = await maybeStoreConversation(
+              memoryConnectionId,
+              userText || "[image]",
+              text,
+              memoryContext,
+              {
+                llmApiKey: decryptedApiKey || undefined,
+                llmProvider: provider,
+                llmModel: modelName,
+              }
+            );
             if (result.stored) {
               console.log("[chat/route] Memory stored:", result.label, result.memoryNote?.slice(0, 50));
             }
-          }).catch(() => {});
+          }, "chat memory storage");
         }
       }
 

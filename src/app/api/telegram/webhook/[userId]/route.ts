@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { runOrchestratorRound } from "@/lib/orchestrator/runOrchestratorRound";
+import { getAppUrl } from "@/lib/config/appConfig";
 import {
   getOrCreateRuntimeSessionForAgent,
   incrementBranchTurnCount,
@@ -365,10 +366,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
               ? { cli_token: resolved.claudeCliToken }
               : { api_key: apiKey }),
             allowed_tools: "Read,Edit,Bash,Write",
-            timeout_ms: 4 * 60 * 1000,
+            timeout_ms: 20 * 60 * 1000,
             ...(cliSessionId ? { session_id: cliSessionId } : {}),
           },
-          timeoutMs: 270_000,
+          timeoutMs: 20 * 60 * 1000 + 30_000,
         });
 
         const rawReturnedSid = rpcResult.session_id;
@@ -526,17 +527,69 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
       thread_key: threadKey,
     });
 
+    const sentProgress = new Set<string>();
+    const sentProgressMessages: string[] = [];
+    const progressSends: Promise<unknown>[] = [];
+    let assistantProgressBuffer = "";
+    const queueProgressUpdate = (rawText: string) => {
+      const text = String(rawText || "").replace(/\s+/g, " ").trim();
+      if (!text || sentProgress.size >= 5) return;
+      const key = text.toLowerCase();
+      if (sentProgress.has(key)) return;
+      sentProgress.add(key);
+      sentProgressMessages.push(text);
+      progressSends.push(
+        sendTelegramText({
+          botToken,
+          chatId: parsed.chatId,
+          text,
+          messageThreadId: parsed.messageThreadId ?? undefined,
+        }).catch((err) => {
+          logWarn("telegram.webhook.progress_send_failed", {
+            user_id: userId,
+            chat_id: parsed.chatId,
+            error: err instanceof Error ? err.message : "unknown",
+          });
+        })
+      );
+    };
+    const flushAssistantProgress = () => {
+      const text = assistantProgressBuffer.replace(/\s+/g, " ").trim();
+      assistantProgressBuffer = "";
+      if (!text) return;
+      queueProgressUpdate(text.length > 220 ? `${text.slice(0, 217)}...` : text);
+    };
+    const stripProgressPrefix = (rawText: string) => {
+      const original = rawText.trim();
+      let text = original;
+      for (const progress of sentProgressMessages) {
+        if (progress && text.startsWith(progress)) {
+          text = text.slice(progress.length).replace(/^[\s:.-]+/, "").trim();
+        }
+      }
+      return text || original;
+    };
+
     const round = await runOrchestratorRound({
       supabase,
       userId,
-      appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+      appBaseUrl: getAppUrl(),
       history: [...history, { role: "user", content: userText }],
       message: userText,
       orchestratorAgentId: runtimeScope?.agentId || null,
       orchestratorSessionId: sessionId,
+      sourceProvider: PROVIDER,
+      sourceThreadKey: threadKey,
       branchCurrentTurnCount: runtimeScope?.branchTurnCount ?? null,
       branchActiveCount: runtimeScope?.activeBranchCount ?? null,
       telegramBotToken: botToken,
+      onAssistantTextDelta: (event) => {
+        if (assistantProgressBuffer.length < 1000) assistantProgressBuffer += event.text;
+      },
+      onToolEvent: (event) => {
+        if (event.phase !== "start") return;
+        flushAssistantProgress();
+      },
     });
 
     const runtimeScopeAfterRound = await resolveRuntimeScope({
@@ -553,8 +606,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
       duration_ms: Date.now() - startedAt,
     });
 
+    if (progressSends.length > 0) await Promise.allSettled(progressSends);
+
     if (round.kind === "final") {
-      const replyText = typeof round.text === "string" ? round.text.trim() : "";
+      const replyText =
+        typeof round.text === "string" ? stripProgressPrefix(round.text) : "";
 
       await supabase.from("orchestrator_messages").insert({
         session_id: sessionId,
@@ -581,15 +637,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ userId:
           messageThreadId: parsed.messageThreadId ?? undefined,
         });
       }
-    }
-
-    if (round.kind === "needs_connector") {
-      await sendTelegramText({
-        botToken,
-        chatId: parsed.chatId,
-        text: "Working on it...",
-        messageThreadId: parsed.messageThreadId ?? undefined,
-      });
     }
 
     return NextResponse.json({ ok: true });

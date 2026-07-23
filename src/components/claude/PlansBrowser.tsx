@@ -15,13 +15,17 @@ import {
   Loader2,
   WifiOff,
   Inbox,
+  Network,
 } from "lucide-react";
 import type { ClaudePlan } from "@/hooks/useClaudePlans";
+import { canonicalWorkspacePath } from "@/lib/workspaces/path";
 
 type CodeAgentOption = {
   id: string;
   name: string;
   codeCliProvider?: "claude" | "codex";
+  deviceId?: string | null;
+  workspaceRootPath?: string | null;
 };
 
 type PlansBrowserProps = {
@@ -30,7 +34,10 @@ type PlansBrowserProps = {
   error: string | null;
   onRefresh: () => void;
   codeAgents: CodeAgentOption[];
-  onExecute: (plan: ClaudePlan, agentId: string | null) => void;
+  onExecute: (
+    plan: ClaudePlan,
+    target: { type: "orchestrator" } | { type: "agent"; agentId: string } | { type: "new_agent" }
+  ) => Promise<{ ok: boolean; error?: string }>;
   onClose: () => void;
 };
 
@@ -78,10 +85,6 @@ function planProviderLabel(plan: ClaudePlan): string {
   return planProvider(plan) === "codex" ? "Codex" : "Claude";
 }
 
-function agentProvider(agent: CodeAgentOption): "claude" | "codex" {
-  return agent.codeCliProvider === "codex" ? "codex" : "claude";
-}
-
 export function PlansBrowser({
   plans,
   isLoading,
@@ -97,6 +100,8 @@ export function PlansBrowser({
   const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<Set<string>>(new Set());
   const [executeMenuPlanId, setExecuteMenuPlanId] = useState<string | null>(null);
+  const [executingPlanId, setExecutingPlanId] = useState<string | null>(null);
+  const [executionErrors, setExecutionErrors] = useState<Record<string, string>>({});
   const searchRef = useRef<HTMLInputElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -226,11 +231,27 @@ export function PlansBrowser({
   );
 
   const handleExecute = useCallback(
-    (plan: ClaudePlan, agentId: string | null) => {
+    async (
+      plan: ClaudePlan,
+      target: { type: "orchestrator" } | { type: "agent"; agentId: string } | { type: "new_agent" }
+    ) => {
+      const id = planId(plan);
       setExecuteMenuPlanId(null);
-      onExecute(plan, agentId);
+      setExecutingPlanId(id);
+      setExecutionErrors((prev) => ({ ...prev, [id]: "" }));
+      try {
+        const result = await onExecute(plan, target);
+        if (!result.ok) {
+          setExecutionErrors((prev) => ({
+            ...prev,
+            [id]: result.error || "Could not queue this plan",
+          }));
+        }
+      } finally {
+        setExecutingPlanId(null);
+      }
     },
-    [onExecute]
+    [onExecute, planId]
   );
 
   return (
@@ -394,8 +415,18 @@ export function PlansBrowser({
                           const isMenuOpen = executeMenuPlanId === id;
                           const provider = planProvider(plan);
                           const providerLabel = planProviderLabel(plan);
-                          const matchingAgents = codeAgents.filter((agent) => agentProvider(agent) === provider);
-                          const newAgentLabel = `New ${providerLabel} Agent`;
+                          const planWorkspace = canonicalWorkspacePath(plan.workspaceRoot);
+                          const agentsWithCompatibility = codeAgents.map((agent) => ({
+                            ...agent,
+                            compatible:
+                              !!planWorkspace &&
+                              canonicalWorkspacePath(agent.workspaceRootPath) === planWorkspace,
+                          }));
+                          const matchingAgents = agentsWithCompatibility.filter(
+                            (agent) => agent.compatible
+                          );
+                          const isExecuting = executingPlanId === id;
+                          const newAgentLabel = `New agent for ${workspaceLabel(plan.workspaceRoot)}`;
                           return (
                             <div
                               key={id}
@@ -462,47 +493,17 @@ export function PlansBrowser({
                                     </span>
 
                                     <div className="relative flex items-center gap-1.5 shrink-0">
-                                      {matchingAgents.length === 0 ? (
-                                        <button
-                                          type="button"
-                                          onClick={() => handleExecute(plan, null)}
-                                          className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-cyan-500/15 text-cyan-400 hover:bg-cyan-500/25 transition-colors"
-                                        >
-                                          <Plus className="w-3 h-3" />
-                                          {newAgentLabel}
-                                        </button>
-                                      ) : matchingAgents.length === 1 ? (
-                                        <>
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              handleExecute(plan, matchingAgents[0].id)
-                                            }
-                                            className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-cyan-500/15 text-cyan-400 hover:bg-cyan-500/25 transition-colors"
-                                          >
-                                            <Play className="w-3 h-3" />
-                                            Run on {matchingAgents[0].name}
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => handleExecute(plan, null)}
-                                            className="flex items-center gap-1.5 px-2 py-1.5 text-[11px] rounded-lg text-zinc-400 hover:text-zinc-200 hover:bg-white/5 transition-colors"
-                                            title="Create new agent"
-                                          >
-                                            <Plus className="w-3 h-3" />
-                                          </button>
-                                        </>
-                                      ) : (
-                                        <>
+                                      <>
                                           <button
                                             type="button"
                                             onClick={() =>
                                               setExecuteMenuPlanId(isMenuOpen ? null : id)
                                             }
+                                            disabled={isExecuting}
                                             className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-lg bg-cyan-500/15 text-cyan-400 hover:bg-cyan-500/25 transition-colors"
                                           >
-                                            <Play className="w-3 h-3" />
-                                            Execute
+                                            {isExecuting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                                            Run with
                                             <ChevronDown className="w-3 h-3" />
                                           </button>
 
@@ -513,22 +514,42 @@ export function PlansBrowser({
                                             >
                                               <div className="px-3 py-2 border-b border-white/5">
                                                 <p className="text-[10px] text-zinc-500 uppercase tracking-wider font-medium">
-                                                  Run on agent
+                                                  Choose executor
                                                 </p>
                                               </div>
                                               <div className="py-1 max-h-48 overflow-y-auto">
-                                                {matchingAgents.map((agent) => (
+                                                <button
+                                                  type="button"
+                                                  onClick={() => void handleExecute(plan, { type: "orchestrator" })}
+                                                  className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
+                                                >
+                                                  <Network className="w-3 h-3 text-violet-300 shrink-0" />
+                                                  <span className="min-w-0">
+                                                    <span className="block text-[12px] text-zinc-200">Orchestrator</span>
+                                                    <span className="block text-[10px] text-zinc-500">Plans and routes execution</span>
+                                                  </span>
+                                                </button>
+                                                {agentsWithCompatibility.map((agent) => (
                                                   <button
                                                     key={agent.id}
                                                     type="button"
                                                     onClick={() =>
-                                                      handleExecute(plan, agent.id)
+                                                      agent.compatible &&
+                                                      void handleExecute(plan, { type: "agent", agentId: agent.id })
                                                     }
-                                                    className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
+                                                    disabled={!agent.compatible}
+                                                    className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors disabled:cursor-not-allowed disabled:opacity-45"
                                                   >
                                                     <Play className="w-3 h-3 text-cyan-400 shrink-0" />
-                                                    <span className="text-[12px] text-zinc-300 truncate">
-                                                      {agent.name}
+                                                    <span className="min-w-0">
+                                                      <span className="block text-[12px] text-zinc-300 truncate">{agent.name}</span>
+                                                      <span className="block text-[10px] text-zinc-500 truncate">
+                                                        {agent.compatible
+                                                          ? "Attached to this workspace"
+                                                          : agent.workspaceRootPath
+                                                            ? `Different workspace: ${workspaceLabel(agent.workspaceRootPath)}`
+                                                            : "No workspace attached"}
+                                                      </span>
                                                     </span>
                                                   </button>
                                                 ))}
@@ -536,7 +557,7 @@ export function PlansBrowser({
                                               <div className="border-t border-white/5 py-1">
                                                 <button
                                                   type="button"
-                                                  onClick={() => handleExecute(plan, null)}
+                                                  onClick={() => void handleExecute(plan, { type: "new_agent" })}
                                                   className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 transition-colors"
                                                 >
                                                   <Plus className="w-3 h-3 text-zinc-400 shrink-0" />
@@ -547,10 +568,19 @@ export function PlansBrowser({
                                               </div>
                                             </div>
                                           )}
-                                        </>
-                                      )}
+                                      </>
                                     </div>
                                   </div>
+                                  <div className="border-t border-white/5 px-3.5 py-2 text-[10px] text-zinc-500">
+                                    {matchingAgents.length > 0
+                                      ? `${matchingAgents.length} existing agent${matchingAgents.length === 1 ? " is" : "s are"} attached to this workspace.`
+                                      : "No existing agent is attached to this workspace. The orchestrator can route it or you can create an agent."}
+                                  </div>
+                                  {executionErrors[id] && (
+                                    <div className="mx-3.5 mb-3 rounded-lg border border-red-400/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-200">
+                                      {executionErrors[id]}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </div>

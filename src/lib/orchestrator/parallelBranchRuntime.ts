@@ -2,6 +2,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { ModelMessage } from "ai";
 import type { ConnectorClientPlatform } from "@/lib/connector/platform";
 import type { BranchControllerSettings } from "./branchController";
+import type { HarnessProfile } from "./harnessProfiles";
 import {
   finalizeWorkerBranch,
   getActiveBranchCount,
@@ -36,6 +37,7 @@ export type ParallelBranchRuntimeContext = {
   localTimezone?: string;
   scheduledMode?: boolean;
   traceId?: string;
+  harnessProfile?: HarnessProfile | null;
 };
 
 type ParallelBranchWorkerResult = {
@@ -324,6 +326,7 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
             codeWorkspaceRootPath: state.context.codeWorkspaceRootPath || null,
             history: cloneMessages(worker.history),
             message: "",
+            profile: state.context.harnessProfile,
             memoryEnabled: false,
             cookies: args.cookies,
             deviceToken: args.deviceToken || undefined,

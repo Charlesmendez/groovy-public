@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
+import { getActiveProfileId } from "@/lib/harnessProfileClient";
 import { extractWhatsAppSendConfirmation } from "@/lib/whatsapp/pendingSend";
 import { extractTelegramSendConfirmation } from "@/lib/telegram/pendingSend";
 
@@ -43,6 +44,152 @@ function summarizeNames(names: string[], limit = 6): string {
   const shown = clean.slice(0, limit);
   const extra = clean.length - shown.length;
   return extra > 0 ? `${shown.join(", ")} (+${extra} more)` : shown.join(", ");
+}
+
+type InlineOrchestratorFile = {
+  mediaType: string;
+  base64: string;
+  filename?: string | null;
+};
+
+type PreparedInlineOrchestratorFile = InlineOrchestratorFile & {
+  byteSize: number;
+};
+
+const VISION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const VISION_IMAGE_EXTENSIONS: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+const MAX_INLINE_IMAGE_FILES = 3;
+const MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_INLINE_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024;
+const MAX_INLINE_IMAGE_DIMENSION = 1600;
+const INLINE_IMAGE_JPEG_QUALITIES = [0.86, 0.78, 0.68, 0.58, 0.48];
+
+function getVisionImageMediaType(file: File): string | null {
+  if (VISION_IMAGE_TYPES.has(file.type)) return file.type;
+  const ext = file.name.toLowerCase().split(".").pop() || "";
+  return VISION_IMAGE_EXTENSIONS[ext] || null;
+}
+
+function isVisionImageFile(file: File): boolean {
+  return !!getVisionImageMediaType(file);
+}
+
+function readBlobAsBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read image"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("Could not prepare image"))),
+      type,
+      quality
+    );
+  });
+}
+
+async function loadDrawableImage(file: File): Promise<{
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+  close: () => void;
+}> {
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(file);
+      return {
+        source: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        close: () => bitmap.close(),
+      };
+    } catch {
+      // Fall back to an HTMLImageElement below.
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Could not load image"));
+      img.src = objectUrl;
+    });
+    return {
+      source: image,
+      width: image.naturalWidth || image.width,
+      height: image.naturalHeight || image.height,
+      close: () => URL.revokeObjectURL(objectUrl),
+    };
+  } catch (error) {
+    URL.revokeObjectURL(objectUrl);
+    throw error;
+  }
+}
+
+async function prepareVisionImageFile(file: File): Promise<PreparedInlineOrchestratorFile> {
+  const originalMediaType = getVisionImageMediaType(file) || "image/png";
+  if (file.size <= MAX_INLINE_IMAGE_BYTES) {
+    return {
+      mediaType: originalMediaType,
+      base64: await readBlobAsBase64(file),
+      filename: file.name || null,
+      byteSize: file.size,
+    };
+  }
+
+  const drawable = await loadDrawableImage(file);
+  try {
+    const longestSide = Math.max(drawable.width, drawable.height);
+    let scale = Math.min(1, MAX_INLINE_IMAGE_DIMENSION / Math.max(1, longestSide));
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const width = Math.max(1, Math.round(drawable.width * scale));
+      const height = Math.max(1, Math.round(drawable.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Could not prepare image");
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(drawable.source, 0, 0, width, height);
+
+      for (const quality of INLINE_IMAGE_JPEG_QUALITIES) {
+        const blob = await canvasToBlob(canvas, "image/jpeg", quality);
+        if (blob.size <= MAX_INLINE_IMAGE_BYTES) {
+          return {
+            mediaType: "image/jpeg",
+            base64: await readBlobAsBase64(blob),
+            filename: file.name || null,
+            byteSize: blob.size,
+          };
+        }
+      }
+
+      scale *= 0.72;
+    }
+  } finally {
+    drawable.close();
+  }
+
+  throw new Error(`${file.name || "Image"} is too large to attach. Try a smaller image or screenshot.`);
 }
 
 function buildLlmHistoryContent(
@@ -146,6 +293,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 const CODE_CLI_TIMEOUT_CONTINUE_PROMPT =
   "Continue from where you left off. Do not repeat completed tool calls or duplicate file edits. Finish the current task and return the final answer directly.";
+const ORCHESTRATOR_INFLIGHT_STORAGE_KEY = "groovy_orchestrator_inflight";
+const ORCHESTRATOR_INFLIGHT_MAX_AGE_MS = 22 * 60 * 1000;
 
 function pickConnectorSessionId(...values: unknown[]): string | null {
   for (const value of values) {
@@ -449,6 +598,12 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
   const sessionIdByAgentIdRef = useRef<Map<string, string>>(new Map());
   const reloadCurrentSessionTimerRef = useRef<number | null>(null);
   const loadSessionRef = useRef<null | ((sessionId: string) => Promise<void>)>(null);
+  const loadSessionRequestIdRef = useRef(0);
+  const activeTurnRef = useRef<{
+    sessionId: string;
+    turnId: string;
+    startedAt: number;
+  } | null>(null);
 
   const loadSessions = useCallback(async () => {
     try {
@@ -544,19 +699,23 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
     }, 250);
   }, []);
 
-  const scheduleReloadCurrentSession = useCallback(
-    (sessionId: string) => {
-      if (reloadCurrentSessionTimerRef.current) {
-        window.clearTimeout(reloadCurrentSessionTimerRef.current);
+  const scheduleReloadCurrentSession = useCallback((sessionId: string) => {
+    if (reloadCurrentSessionTimerRef.current) {
+      window.clearTimeout(reloadCurrentSessionTimerRef.current);
+    }
+
+    const reloadWhenIdle = () => {
+      // Realtime callbacks outlive the render that created them. Read the ref so an
+      // event received during a stream cannot apply a stale pre-stream snapshot.
+      if (isStreamingRef.current) {
+        reloadCurrentSessionTimerRef.current = window.setTimeout(reloadWhenIdle, 500);
+        return;
       }
-      reloadCurrentSessionTimerRef.current = window.setTimeout(() => {
-        // Don’t clobber the UI while the user is actively streaming a dashboard message.
-        if (isStreaming) return;
-        loadSessionRef.current?.(sessionId).catch(() => {});
-      }, 250);
-    },
-    [isStreaming]
-  );
+      loadSessionRef.current?.(sessionId).catch(() => {});
+    };
+
+    reloadCurrentSessionTimerRef.current = window.setTimeout(reloadWhenIdle, 250);
+  }, []);
 
   // Load sessions on mount
   useEffect(() => {
@@ -775,11 +934,30 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
   }, [currentSessionId]);
 
   const loadSession = async (sessionId: string) => {
+    const requestId = ++loadSessionRequestIdRef.current;
+    const runIdAtStart = activeRunIdRef.current;
+    const startedWhileStreaming = isStreamingRef.current;
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/orchestrator/agents/${sessionId}`);
+      const res = await fetch(`/api/orchestrator/agents/${sessionId}?ts=${Date.now()}`, {
+        cache: "no-store",
+        headers: { "cache-control": "no-cache" },
+      });
       if (res.ok) {
         const data = await res.json();
+
+        // Ignore stale or superseded snapshots. In particular, a fetch that began
+        // before/during a local run must never replace the completed local answer.
+        if (
+          requestId !== loadSessionRequestIdRef.current ||
+          currentSessionIdRef.current !== sessionId ||
+          startedWhileStreaming ||
+          isStreamingRef.current ||
+          activeRunIdRef.current !== runIdAtStart
+        ) {
+          return;
+        }
+
         const agentId =
           typeof data?.session?.agentId === "string" && data.session.agentId.trim()
             ? data.session.agentId.trim()
@@ -803,6 +981,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
             timestamp: string;
             metadata?: unknown;
           }) => ({
+            // Database row ids are unique. Trace ids are not: a single WhatsApp
+            // or connector trace can legitimately persist multiple messages.
             id: m.id,
             role: m.role as "user" | "assistant",
             content: m.content,
@@ -1055,6 +1235,8 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       }
     ) => {
       const selectedFiles = Array.isArray(options?.files) ? options!.files! : [];
+      const inlineImageFiles = selectedFiles.filter(isVisionImageFile);
+      const filesAgentUploads = selectedFiles.filter((file) => !isVisionImageFile(file));
       const trimmed = (message || "").trim();
       if ((!trimmed && selectedFiles.length === 0) || isStreaming) {
         return { ok: false, error: "No message to send (or busy streaming)" };
@@ -1062,10 +1244,15 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       const effectiveMessage =
         trimmed || (selectedFiles.length > 0 ? "Please analyze the attached file(s)." : "");
 
+      // Stable id for one user turn across server rounds and mobile sleep/wake.
+      const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       const extraMetadata =
         options?.messageMetadata && typeof options.messageMetadata === "object"
-          ? (options.messageMetadata as Record<string, unknown>)
-          : undefined;
+          ? {
+              ...(options.messageMetadata as Record<string, unknown>),
+              client_turn_id: turnId,
+            }
+          : { client_turn_id: turnId };
       const mergeMetadata = (base?: Record<string, unknown>) =>
         extraMetadata ? { ...(base || {}), ...extraMetadata } : base;
 
@@ -1085,6 +1272,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       }
 
       setError(null);
+      isStreamingRef.current = true;
       setIsStreaming(true);
       setStreamingContent("");
       setCurrentToolCalls([]);
@@ -1176,12 +1364,13 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       };
       if (!options?.suppressUserMessage) {
         setMessages((prev) => [...prev, userMessage]);
-        persistMessage(userMessage, sessionId);
+        // The user turn must reach durable storage before the long-running
+        // request begins; otherwise closing a mobile PWA immediately can lose
+        // the only recoverable marker for the run.
+        await persistMessage(userMessage, sessionId);
       }
 
       // Build history for LLM context.
-      // Stable ID for this user "turn" (used for usage metering across multi-round loops).
-      const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
       const historySource =
         Array.isArray(options?.historyOverride) && options.historyOverride.length > 0
           ? options.historyOverride
@@ -1218,6 +1407,21 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       abortRef.current = new AbortController();
       const runId = activeRunIdRef.current + 1;
       activeRunIdRef.current = runId;
+      const activeTurn = {
+        sessionId,
+        turnId,
+        startedAt: Date.now(),
+      };
+      activeTurnRef.current = activeTurn;
+      try {
+        sessionStorage.setItem(
+          ORCHESTRATOR_INFLIGHT_STORAGE_KEY,
+          JSON.stringify(activeTurn)
+        );
+      } catch {
+        // Private browsing/storage quota: in-memory recovery still works.
+      }
+      let turnCompleted = false;
       const isRunActive = () =>
         activeRunIdRef.current === runId && !(abortRef.current?.signal.aborted ?? false);
       const throwIfRunCancelled = () => {
@@ -1229,6 +1433,23 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
 
       try {
         throwIfRunCancelled();
+        if (inlineImageFiles.length > MAX_INLINE_IMAGE_FILES) {
+          throw new Error(`Attach up to ${MAX_INLINE_IMAGE_FILES} images at a time.`);
+        }
+        const preparedInlineFiles: PreparedInlineOrchestratorFile[] =
+          inlineImageFiles.length > 0
+            ? await Promise.all(inlineImageFiles.map(prepareVisionImageFile))
+            : [];
+        const inlineImageBytes = preparedInlineFiles.reduce((sum, file) => sum + file.byteSize, 0);
+        if (inlineImageBytes > MAX_INLINE_IMAGE_TOTAL_BYTES) {
+          throw new Error("Keep attached images under 2 MB total after compression.");
+        }
+        const inlineFilesForOrchestrator: InlineOrchestratorFile[] = preparedInlineFiles.map((file) => ({
+          mediaType: file.mediaType,
+          base64: file.base64,
+          filename: file.filename,
+        }));
+
         // Inbox-action fast-path: allow natural phrasing where the command is not
         // necessarily the first token (e.g. "hey, reject 2 and ..."), while still
         // requiring action-specific signals to avoid broad false positives.
@@ -1447,6 +1668,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
               a.action === "Routed" && a.status === "running" ? { ...a, status: "complete" } : a
             )
           );
+          isStreamingRef.current = false;
           setIsStreaming(false);
           setStreamingContent("");
           abortRef.current = null;
@@ -1456,13 +1678,13 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
         // If the user attached files, upload them to the linked Files-agent session first,
         // then continue through the NORMAL orchestrator loop below.
         // This preserves file context for files_agent_request without forcing a files-only final answer.
-        if (selectedFiles.length > 0) {
+        if (filesAgentUploads.length > 0) {
           const filesActivityId = `files-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           const filesActivity: AgentActivity = {
             id: filesActivityId,
             agent: "files",
             action: "Preparing files",
-            detail: `Uploading ${selectedFiles.length} file${selectedFiles.length > 1 ? "s" : ""}`,
+            detail: `Uploading ${filesAgentUploads.length} file${filesAgentUploads.length > 1 ? "s" : ""}`,
             status: "running",
             timestamp: new Date(),
             sessionId: sessionId ?? undefined,
@@ -1498,7 +1720,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
             // We then seed Files-session chat_messages metadata with these uploads so
             // files_agent_request can attach container_upload blocks in subsequent orchestrator tool calls.
             const uploaded: Array<{ id: string; name: string; anthropicFileId?: string | null }> = [];
-            for (const f of selectedFiles) {
+            for (const f of filesAgentUploads) {
               const form = new FormData();
               form.set("sessionId", filesSessionId);
               form.set("agentId", filesAgentId);
@@ -1561,6 +1783,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
             );
             persistActivity(failedFilesActivity, sessionId);
             setError(errMsg);
+            isStreamingRef.current = false;
             setIsStreaming(false);
             setStreamingContent("");
             abortRef.current = null;
@@ -1776,6 +1999,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
             return { ok: false as const, error: errMsg };
           } finally {
             // Always ensure streaming is stopped and activity is marked done
+            isStreamingRef.current = false;
             setIsStreaming(false);
             setStreamingContent("");
             abortRef.current = null;
@@ -2044,17 +2268,17 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
               history: params.history,
               sessionId,
               agentId,
+              profileId: getActiveProfileId() || undefined,
               memoryEnabled: options?.memoryEnabled ?? true,
               suppressMemoryStore: options?.suppressMemoryStore === true ? true : undefined,
               suppressPreferenceMemory:
                 options?.suppressPreferenceMemory === true ? true : undefined,
               messageMetadata:
-                options?.messageMetadata && typeof options.messageMetadata === "object"
-                  ? options.messageMetadata
-                  : undefined,
+                extraMetadata,
               deviceId: options?.deviceId,
               obsidianVaultPath: options?.obsidianVaultPath,
               toolResults: params.toolResults,
+              files: inlineFilesForOrchestrator.length > 0 ? inlineFilesForOrchestrator : undefined,
               ...(options?.handshakeId ? {
                 handshakeId: options.handshakeId,
                 handshakePartnerSessionId: options.handshakePartnerSessionId,
@@ -2869,7 +3093,16 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           }),
         };
         setMessages((prev) => [...prev, assistantMessage]);
-        persistMessage(assistantMessage, sessionId, traceId || undefined);
+        // The stream is only a transient presentation layer. Wait until the
+        // completed message is durably available before clearing that layer.
+        await persistMessage(assistantMessage, sessionId, traceId || undefined);
+        turnCompleted = true;
+        activeTurnRef.current = null;
+        try {
+          sessionStorage.removeItem(ORCHESTRATOR_INFLIGHT_STORAGE_KEY);
+        } catch {
+          // ignore
+        }
 
         // Update session in list
         const messageCountDelta = options?.suppressUserMessage ? 1 : 2;
@@ -2888,6 +3121,12 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       } catch (err) {
         finalizeContextPrepActivity("error");
         if (err instanceof Error && err.name === "AbortError") {
+          activeTurnRef.current = null;
+          try {
+            sessionStorage.removeItem(ORCHESTRATOR_INFLIGHT_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
           return { ok: false as const, error: "aborted" };
         }
         const errorMessage = err instanceof Error ? err.message : "An error occurred";
@@ -2896,6 +3135,9 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
         return { ok: false as const, error: errorMessage };
       } finally {
         if (activeRunIdRef.current === runId) {
+          if (turnCompleted) {
+            activeTurnRef.current = null;
+          }
           // Avoid stale running context-prep activity on any exit path.
           finalizeContextPrepActivity("complete");
           // Clear the protected set since sendMessage is done
@@ -2916,10 +3158,25 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
           for (const a of finallyCompleted) {
             persistActivity(a, a.sessionId || sessionId);
           }
+          isStreamingRef.current = false;
           setIsStreaming(false);
           setStreamingContent("");
           setTimeout(() => setCurrentToolCalls([]), 2000);
           abortRef.current = null;
+
+          // Reconcile the exact conversation after every run. Realtime is a useful
+          // prompt to refresh, but it is not a completion acknowledgement and can
+          // be coalesced or arrive before the final row is readable.
+          if (currentSessionIdRef.current === sessionId) {
+            window.setTimeout(() => {
+              if (
+                !isStreamingRef.current &&
+                currentSessionIdRef.current === sessionId
+              ) {
+                loadSessionRef.current?.(sessionId).catch(() => {});
+              }
+            }, 150);
+          }
         }
       }
     },
@@ -2937,6 +3194,12 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
 
   const cancelStream = useCallback(() => {
     activeRunIdRef.current += 1;
+    activeTurnRef.current = null;
+    try {
+      sessionStorage.removeItem(ORCHESTRATOR_INFLIGHT_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
     if (abortRef.current) {
       if (!abortRef.current.signal.aborted) {
         abortRef.current.abort();
@@ -2956,6 +3219,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       }
       setPreparingMemoryContext(false);
       activeBrowserTaskActivityIdsRef.current.clear();
+      isStreamingRef.current = false;
       setIsStreaming(false);
       setStreamingContent("");
       setCurrentToolCalls([]);
@@ -3002,6 +3266,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       setCurrentSessionId(sessionId);
       setMessages(msgs);
       setAgentActivities(activities);
+      isStreamingRef.current = false;
       setIsStreaming(false);
       setStreamingContent("");
       setCurrentToolCalls([]);
@@ -3015,35 +3280,161 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
     isStreamingRef.current = isStreaming;
   }, [isStreaming]);
 
-  // Recover from mobile sleep/wake. For active runs, do not abort: connector
-  // and browser work is client-driven, so aborting the fetch kills the job
-  // halfway through. Reload only when idle.
+  // Recover from mobile sleep/wake. A completed server-side round is tagged
+  // with client_turn_id, so a suspended PWA can reconcile the exact turn from
+  // durable messages instead of leaving a stale spinner forever.
   useEffect(() => {
     let lastHiddenAt = 0;
+    let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconcileInProgress = false;
 
-    const handleWake = (source: string) => {
-      if (document.visibilityState !== "visible") return;
+    const readInflightTurn = () => {
+      if (activeTurnRef.current) return activeTurnRef.current;
+      try {
+        const raw = sessionStorage.getItem(ORCHESTRATOR_INFLIGHT_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as {
+          sessionId?: unknown;
+          turnId?: unknown;
+          startedAt?: unknown;
+        };
+        if (
+          typeof parsed.sessionId !== "string" ||
+          !parsed.sessionId.trim() ||
+          typeof parsed.turnId !== "string" ||
+          !parsed.turnId.trim() ||
+          typeof parsed.startedAt !== "number" ||
+          !Number.isFinite(parsed.startedAt)
+        ) {
+          return null;
+        }
+        const restored = {
+          sessionId: parsed.sessionId.trim(),
+          turnId: parsed.turnId.trim(),
+          startedAt: parsed.startedAt,
+        };
+        activeTurnRef.current = restored;
+        return restored;
+      } catch {
+        return null;
+      }
+    };
 
-      const sleepDurationMs = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
-      if (sleepDurationMs < 5_000) return; // skip instant tab switches
+    const clearRecoveredTurn = () => {
+      activeTurnRef.current = null;
+      try {
+        sessionStorage.removeItem(ORCHESTRATOR_INFLIGHT_STORAGE_KEY);
+      } catch {
+        // ignore
+      }
+    };
 
-      const sid = currentSessionIdRef.current;
-
-      if (isStreamingRef.current) {
-        console.log("[useOrchestrator] Woke while streaming; keeping active run alive", {
-          source,
-          sleepDurationMs,
-          sessionId: sid,
-        });
+    const reconcileInflightTurn = async (source: string) => {
+      if (reconcileInProgress || document.visibilityState !== "visible") return;
+      const inflight = readInflightTurn();
+      if (!inflight) {
+        const sid = currentSessionIdRef.current;
+        if (sid && !isStreamingRef.current) {
+          await loadSessionRef.current?.(sid);
+        }
         return;
       }
 
-      // Reload session from DB to pick up any completed messages
-      if (sid) {
-        setTimeout(() => {
-          loadSessionRef.current?.(sid);
-        }, 1500);
+      reconcileInProgress = true;
+      try {
+        const response = await fetch(
+          `/api/orchestrator/agents/${encodeURIComponent(
+            inflight.sessionId
+          )}?ts=${Date.now()}`,
+          {
+            cache: "no-store",
+            headers: { "cache-control": "no-cache" },
+          }
+        );
+        const data = response.ok ? await response.json().catch(() => ({})) : {};
+        const persistedMessages = Array.isArray(data?.messages) ? data.messages : [];
+        const completed = persistedMessages.some((message: unknown) => {
+          if (!message || typeof message !== "object") return false;
+          const row = message as {
+            role?: unknown;
+            metadata?: unknown;
+          };
+          if (row.role !== "assistant") return false;
+          const metadata =
+            row.metadata && typeof row.metadata === "object"
+              ? (row.metadata as Record<string, unknown>)
+              : null;
+          return metadata?.client_turn_id === inflight.turnId;
+        });
+
+        if (completed) {
+          console.log("[useOrchestrator] Recovered completed mobile turn", {
+            source,
+            sessionId: inflight.sessionId,
+            turnId: inflight.turnId,
+          });
+          activeRunIdRef.current += 1;
+          if (abortRef.current && !abortRef.current.signal.aborted) {
+            abortRef.current.abort();
+          }
+          abortRef.current = null;
+          clearRecoveredTurn();
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+          setStreamingContent("");
+          setCurrentToolCalls([]);
+          setPreparingMemoryContext(false);
+          setError(null);
+          if (currentSessionIdRef.current === inflight.sessionId) {
+            await loadSessionRef.current?.(inflight.sessionId);
+          }
+          return;
+        }
+
+        const elapsedMs = Date.now() - inflight.startedAt;
+        if (elapsedMs >= ORCHESTRATOR_INFLIGHT_MAX_AGE_MS) {
+          console.warn("[useOrchestrator] Mobile turn recovery expired", {
+            source,
+            sessionId: inflight.sessionId,
+            turnId: inflight.turnId,
+            elapsedMs,
+          });
+          activeRunIdRef.current += 1;
+          abortRef.current = null;
+          clearRecoveredTurn();
+          isStreamingRef.current = false;
+          setIsStreaming(false);
+          setStreamingContent("");
+          setCurrentToolCalls([]);
+          setPreparingMemoryContext(false);
+          setError(
+            "The live connection ended before this orchestrator turn completed. Any delegated agent task continues in the background."
+          );
+          await loadSessionRef.current?.(inflight.sessionId);
+          return;
+        }
+
+        reconcileTimer = setTimeout(() => {
+          void reconcileInflightTurn("mobile-retry");
+        }, 3_500);
+      } catch (error) {
+        console.warn("[useOrchestrator] Mobile turn reconciliation failed:", error);
+        reconcileTimer = setTimeout(() => {
+          void reconcileInflightTurn("mobile-retry-after-error");
+        }, 3_500);
+      } finally {
+        reconcileInProgress = false;
       }
+    };
+
+    const handleWake = (source: string) => {
+      if (document.visibilityState !== "visible") return;
+      const sleepDurationMs = lastHiddenAt ? Date.now() - lastHiddenAt : 0;
+      if (sleepDurationMs < 5_000 && !readInflightTurn()) return;
+      if (reconcileTimer) clearTimeout(reconcileTimer);
+      reconcileTimer = setTimeout(() => {
+        void reconcileInflightTurn(source);
+      }, 1_000);
     };
 
     const handleVisibilityChange = () => {
@@ -3055,7 +3446,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
     };
 
     const handlePageShow = (e: PageTransitionEvent) => {
-      if (e.persisted) handleWake("pageshow-persisted");
+      handleWake(e.persisted ? "pageshow-persisted" : "pageshow");
     };
 
     const handleFocus = () => handleWake("focus");
@@ -3063,10 +3454,16 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("pageshow", handlePageShow);
     window.addEventListener("focus", handleFocus);
+    if (readInflightTurn()) {
+      reconcileTimer = setTimeout(() => {
+        void reconcileInflightTurn("mount");
+      }, 1_000);
+    }
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("pageshow", handlePageShow);
       window.removeEventListener("focus", handleFocus);
+      if (reconcileTimer) clearTimeout(reconcileTimer);
     };
   }, []); // stable — reads from refs
 

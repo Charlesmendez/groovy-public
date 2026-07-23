@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { ensureWorkspaceStripeCustomer, getStripeServerClient } from "@/lib/billing/stripe";
 import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
+import { isSelfHosted } from "@/lib/config/edition";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,7 +34,7 @@ async function personalPriceId(stripe: ReturnType<typeof getStripeServerClient>)
 function originFromReq(req: Request): string {
   const url = new URL(req.url);
   const requestOrigin = `${url.protocol}//${url.host}`;
-  const configuredOrigin = process.env.NEXT_PUBLIC_APP_URL || "";
+  const configuredOrigin = getConfiguredAppUrl() || "";
   const isLocalRequest =
     url.hostname === "localhost" ||
     url.hostname === "127.0.0.1" ||
@@ -42,6 +44,9 @@ function originFromReq(req: Request): string {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   try {
     const supabase = await createSupabaseServerClient();
     const {

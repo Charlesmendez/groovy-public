@@ -18,6 +18,10 @@ import {
   getOrchestratorAnthropicModel,
   getOrchestratorOpenAiModel,
 } from "@/lib/ai/modelResolver";
+import {
+  isServerKeyEligibleProvider,
+  serverProviderKeysAllowed,
+} from "@/lib/keys/providerKeyPolicy";
 
 export type Provider =
   | "anthropic"
@@ -85,6 +89,8 @@ export async function resolveKeys(
   const storedKeyModes = (od.apiKeyModes as KeyModes) || {};
   const legacyApiKeyMode = od.apiKeyMode as string | undefined;
 
+  const allowServerProviderKeys = serverProviderKeysAllowed();
+
   // 2. Legacy global mode: cookie → DB → default "user"
   let globalMode: LlmKeyMode = "user";
   const cookie = cookies || "";
@@ -96,6 +102,7 @@ export async function resolveKeys(
   } else if (legacyApiKeyMode === "groovy" || legacyApiKeyMode === "user") {
     globalMode = legacyApiKeyMode;
   }
+  if (!allowServerProviderKeys) globalMode = "user";
 
   // 3. Build effective per-provider modes (per-provider > global fallback).
   // Headless mode selections are independent, but customer-owned LLM keys remain
@@ -104,23 +111,30 @@ export async function resolveKeys(
   const keyModes: KeyModes = {};
   for (const provider of LLM_PROVIDERS) {
     const storedMode = storedKeyModes[provider];
-    keyModes[provider] =
-      storedMode === "groovy" || storedMode === "user" ? storedMode : globalMode;
+    keyModes[provider] = !allowServerProviderKeys
+      ? "user"
+      : storedMode === "groovy" || storedMode === "user"
+        ? storedMode
+        : globalMode;
   }
   const headlessStoredMode = storedKeyModes[HEADLESS_PROVIDER];
   keyModes[HEADLESS_PROVIDER] =
     headlessStoredMode === "groovy" || headlessStoredMode === "user"
       ? headlessStoredMode
-      : globalMode;
+      : "groovy";
   const codexHeadlessStoredMode = storedKeyModes[CODEX_HEADLESS_PROVIDER];
   keyModes[CODEX_HEADLESS_PROVIDER] =
     codexHeadlessStoredMode === "groovy" || codexHeadlessStoredMode === "user"
       ? codexHeadlessStoredMode
-      : globalMode;
+      : "groovy";
   for (const provider of EXTRA_PROVIDER_KEYS) {
     const storedMode = storedKeyModes[provider];
     keyModes[provider] =
-      storedMode === "groovy" || storedMode === "user" ? storedMode : "user";
+      !allowServerProviderKeys && isServerKeyEligibleProvider(provider)
+        ? "user"
+        : storedMode === "groovy" || storedMode === "user"
+          ? storedMode
+          : "user";
   }
 
   // 4. Load user keys for providers that are set to "user"
@@ -159,7 +173,7 @@ export async function resolveKeys(
       userKeys.claude_cli = anthropicUserKey;
     }
     delete userKeys.anthropic;
-    if (process.env.ANTHROPIC_API_KEY) {
+    if (allowServerProviderKeys && process.env.ANTHROPIC_API_KEY) {
       console.warn(
         "[resolveKeys] Anthropic user key looks like Claude CLI OAuth token; falling back to Groovy Anthropic key."
       );

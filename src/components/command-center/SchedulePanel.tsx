@@ -17,6 +17,12 @@ import {
   Pencil,
 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
+import {
+  MODEL_CATALOG,
+  catalogModelLabel,
+  inferProviderForModelId,
+  reasoningEffortsForModel,
+} from "@/lib/ai/modelCatalog";
 
 type ScheduledJob = {
   id: string;
@@ -34,6 +40,15 @@ type ScheduledJob = {
   updated_at: string | null;
   session_id?: string | null;
   session_title?: string | null;
+  target_agent_id?: string | null;
+  target_agent_name?: string | null;
+};
+
+type WorkerOption = {
+  id: string;
+  name: string;
+  harness: "claude" | "codex";
+  configured: boolean;
 };
 
 type ScheduledJobRun = {
@@ -49,6 +64,62 @@ type ScheduledJobRun = {
   error: string | null;
   created_at: string;
 };
+
+type ScheduledModelOverride = {
+  provider: "anthropic" | "openai";
+  model: string;
+  reasoningEffort: string | null;
+} | null;
+
+function getScheduledModelOverride(task: unknown): ScheduledModelOverride {
+  const taskObj =
+    task && typeof task === "object" && !Array.isArray(task)
+      ? (task as Record<string, unknown>)
+      : null;
+  const options =
+    taskObj?.options && typeof taskObj.options === "object" && !Array.isArray(taskObj.options)
+      ? (taskObj.options as Record<string, unknown>)
+      : null;
+  const model = typeof options?.model_name === "string" ? options.model_name.trim() : "";
+  if (!model) return null;
+  const providerRaw =
+    typeof options?.model_provider === "string" ? options.model_provider.trim() : "";
+  return {
+    provider:
+      providerRaw === "anthropic" || providerRaw === "openai"
+        ? providerRaw
+        : inferProviderForModelId(model),
+    model,
+    reasoningEffort:
+      typeof options?.reasoning_effort === "string" && options.reasoning_effort.trim()
+        ? options.reasoning_effort.trim()
+        : null,
+  };
+}
+
+function withScheduledModelOverride(
+  task: unknown,
+  override: ScheduledModelOverride
+): Record<string, unknown> {
+  const taskObj =
+    task && typeof task === "object" && !Array.isArray(task)
+      ? { ...(task as Record<string, unknown>) }
+      : {};
+  const options =
+    taskObj.options && typeof taskObj.options === "object" && !Array.isArray(taskObj.options)
+      ? { ...(taskObj.options as Record<string, unknown>) }
+      : {};
+  delete options.model_name;
+  delete options.model_provider;
+  delete options.reasoning_effort;
+  if (override) {
+    options.model_name = override.model;
+    options.model_provider = override.provider;
+    if (override.reasoningEffort) options.reasoning_effort = override.reasoningEffort;
+  }
+  taskObj.options = options;
+  return taskObj;
+}
 
 function getOrchestratorTaskMessage(task: unknown): string {
   const taskObj =
@@ -252,6 +323,9 @@ export function SchedulePanel({
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
   const [editingPrompt, setEditingPrompt] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
+  const [workerOptions, setWorkerOptions] = useState<WorkerOption[]>([]);
+  const [retargetingJobId, setRetargetingJobId] = useState<string | null>(null);
+  const [updatingModelJobId, setUpdatingModelJobId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -261,16 +335,25 @@ export function SchedulePanel({
       const { data, error } = await supabase
         .from("scheduled_jobs")
         .select(
-          "id,name,device_id,kind,command,task,schedule,enabled,skip_next_run,last_run_at,last_status,last_exit_code,updated_at,session_id,orchestrator_sessions(title)"
+          "id,name,device_id,kind,command,task,schedule,enabled,skip_next_run,last_run_at,last_status,last_exit_code,updated_at,session_id,target_agent_id,orchestrator_sessions(title),target_agent:agents!scheduled_jobs_target_agent_id_fkey(name)"
         )
         .order("updated_at", { ascending: false })
         .limit(100);
       if (error) throw error;
-      // Map joined session title and filter out heartbeat jobs
-      const mapped = ((data || []) as Array<ScheduledJob & { orchestrator_sessions?: { title?: string } | null }>).map((j) => ({
+      // Map joined session title + target agent, filter out heartbeat jobs
+      const mapped = (
+        (data || []) as Array<
+          ScheduledJob & {
+            orchestrator_sessions?: { title?: string } | null;
+            target_agent?: { name?: string } | null;
+          }
+        >
+      ).map((j) => ({
         ...j,
         session_title: j.orchestrator_sessions?.title || null,
+        target_agent_name: j.target_agent?.name || null,
         orchestrator_sessions: undefined,
+        target_agent: undefined,
       }));
       const visible = mapped.filter((j) => {
         const t = j.task as Record<string, unknown> | null;
@@ -332,10 +415,120 @@ export function SchedulePanel({
     [refresh]
   );
 
+  const refreshWorkerOptions = useCallback(async () => {
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data } = await supabase
+        .from("agents")
+        .select("id, name, claude_code_agent_configs!inner(code_cli_provider,device_id)")
+        .eq("type", "claude-code")
+        .order("created_at", { ascending: true });
+      setWorkerOptions(
+        ((data || []) as Array<{
+          id: string;
+          name: string;
+          claude_code_agent_configs?:
+            | Array<{ code_cli_provider?: string; device_id?: string | null }>
+            | { code_cli_provider?: string; device_id?: string | null }
+            | null;
+        }>).map((row) => {
+          const config = Array.isArray(row.claude_code_agent_configs)
+            ? row.claude_code_agent_configs[0]
+            : row.claude_code_agent_configs;
+          return {
+            id: row.id,
+            name: row.name,
+            harness:
+              config?.code_cli_provider === "codex" ? ("codex" as const) : ("claude" as const),
+            configured: typeof config?.device_id === "string" && config.device_id.length > 0,
+          };
+        })
+      );
+    } catch {
+      // picker degrades to Orchestrator-only
+    }
+  }, []);
+
+  const retargetJob = useCallback(
+    async (job: ScheduledJob, targetAgentId: string | null) => {
+      setRetargetingJobId(job.id);
+      try {
+        const supabase = getSupabaseBrowserClient();
+        const currentOverride = getScheduledModelOverride(job.task);
+        const nextWorker = workerOptions.find((worker) => worker.id === targetAgentId);
+        const expectedProvider = nextWorker
+          ? nextWorker.harness === "codex"
+            ? "openai"
+            : "anthropic"
+          : null;
+        const clearIncompatibleOverride =
+          !!currentOverride && !!expectedProvider && currentOverride.provider !== expectedProvider;
+        let latestTask = job.task;
+        if (clearIncompatibleOverride) {
+          const { data: latestJob, error: readError } = await supabase
+            .from("scheduled_jobs")
+            .select("task")
+            .eq("id", job.id)
+            .maybeSingle();
+          if (readError) throw readError;
+          latestTask = latestJob?.task ?? job.task;
+        }
+        const { error } = await supabase
+          .from("scheduled_jobs")
+          .update({
+            target_agent_id: targetAgentId,
+            ...(clearIncompatibleOverride
+              ? { task: withScheduledModelOverride(latestTask, null) }
+              : {}),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", job.id);
+        if (error) throw error;
+        await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRetargetingJobId(null);
+      }
+    },
+    [refresh, workerOptions]
+  );
+
+  const updateScheduledModel = useCallback(
+    async (job: ScheduledJob, override: ScheduledModelOverride) => {
+      setUpdatingModelJobId(job.id);
+      setError(null);
+      try {
+        const supabase = getSupabaseBrowserClient();
+        const { data: latestJob, error: readError } = await supabase
+          .from("scheduled_jobs")
+          .select("task")
+          .eq("id", job.id)
+          .maybeSingle();
+        if (readError) throw readError;
+        const { error: updateError } = await supabase
+          .from("scheduled_jobs")
+          .update({
+            task: withScheduledModelOverride(latestJob?.task ?? job.task, override),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", job.id);
+        if (updateError) throw updateError;
+        await refresh();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setUpdatingModelJobId(null);
+      }
+    },
+    [refresh]
+  );
+
   useEffect(() => {
     if (!isOpen) return;
     refreshAll().catch(() => {});
-  }, [isOpen, refreshAll]);
+    refreshWorkerOptions().catch(() => {});
+  }, [isOpen, refreshAll, refreshWorkerOptions]);
 
   // Group runs by job_id
   const runsByJobId = useMemo(() => {
@@ -407,7 +600,12 @@ export function SchedulePanel({
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
           <div className="flex items-center gap-2">
             <Clock className="w-5 h-5 text-blue-400" />
-            <h3 className="text-lg font-semibold text-white">Scheduled Jobs</h3>
+            <div>
+              <h3 className="text-lg font-semibold text-white">Scheduled Jobs</h3>
+              <p className="text-[11px] text-zinc-500">
+                Orchestrator or worker-owned tasks, run by an awake connected machine
+              </p>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -434,14 +632,17 @@ export function SchedulePanel({
           {topJobs.length === 0 && !loading ? (
             <div className="text-center py-10">
               <div className="text-sm text-zinc-400">
-                Create one in chat with <span className="text-zinc-200">@schedule</span> or{" "}
-                <span className="text-zinc-200">at schedule</span>.
+                Create one by telling the Orchestrator when the task should run and which agent
+                should own it.
               </div>
               <div className="text-xs text-zinc-600 mt-2">
-                Example:{" "}
+                Try:{" "}
                 <span className="text-zinc-300">
-                  at schedule every day at 7:30 run &quot;~/bin/organize_downloads.sh&quot;
+                  &quot;Every day at 7:30, have Scout triage new issues.&quot;
                 </span>
+              </div>
+              <div className="text-[11px] text-zinc-600 mt-3">
+                The selected agent keeps its own harness, workspace, model, skills, and docs.
               </div>
             </div>
           ) : (
@@ -454,6 +655,24 @@ export function SchedulePanel({
                 const isEditingPrompt = editingJobId === j.id;
                 const isOrchestratorJob = (j.kind || "shell") === "orchestrator";
                 const isSavingPromptForThisJob = isPromptSaveInFlightForJob(j.id);
+                const scheduledModel = getScheduledModelOverride(j.task);
+                const targetWorker = workerOptions.find(
+                  (worker) => worker.id === j.target_agent_id
+                );
+                const modelGroups = j.target_agent_id
+                  ? MODEL_CATALOG.filter((group) =>
+                      targetWorker?.harness === "codex"
+                        ? group.provider === "openai"
+                        : group.provider === "anthropic"
+                    )
+                  : MODEL_CATALOG;
+                const modelIsInCatalog = modelGroups.some((group) =>
+                  group.models.some((model) => model.id === scheduledModel?.model)
+                );
+                const scheduledEfforts = reasoningEffortsForModel(
+                  scheduledModel?.model,
+                  j.target_agent_id ? "cli" : "api"
+                );
 
                 return (
                   <div
@@ -462,12 +681,24 @@ export function SchedulePanel({
                   >
                     {/* Job header */}
                     <div className="p-4">
-                      <div className="flex items-start justify-between gap-3">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 mb-1">
+                          <div className="mb-1 flex flex-wrap items-center gap-2">
                             <span className="text-[10px] px-2 py-0.5 rounded-full border border-white/10 text-zinc-400 bg-white/5">
                               {summary.label}
                             </span>
+                            {isOrchestratorJob && (
+                              <span
+                                className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                                  j.target_agent_id
+                                    ? "border-cyan-500/30 text-cyan-300 bg-cyan-500/10"
+                                    : "border-white/10 text-zinc-500 bg-white/5"
+                                }`}
+                                title="Which agent runs this schedule"
+                              >
+                                → {j.target_agent_name || "Orchestrator"}
+                              </span>
+                            )}
                             <span
                               className={`text-[10px] px-2 py-0.5 rounded-full border ${
                                 j.enabled
@@ -511,6 +742,96 @@ export function SchedulePanel({
                               Agent: <span className="text-cyan-400">{j.session_title}</span>
                             </div>
                           )}
+                          {isOrchestratorJob && (
+                            <div className="mt-1.5 space-y-1.5">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="w-10 shrink-0 text-[10px] text-zinc-500">Runs on</span>
+                                <select
+                                  value={j.target_agent_id || ""}
+                                  disabled={retargetingJobId === j.id || loading || savingEdit}
+                                  onChange={(e) =>
+                                    void retargetJob(j, e.target.value || null)
+                                  }
+                                  className="min-w-0 max-w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
+                                >
+                                  <option value="">Orchestrator (default)</option>
+                                  {workerOptions.map((worker) => (
+                                    <option
+                                      key={worker.id}
+                                      value={worker.id}
+                                      disabled={!worker.configured && j.target_agent_id !== worker.id}
+                                    >
+                                      {worker.name} ({worker.harness === "codex" ? "Codex" : "Claude Code"})
+                                      {!worker.configured ? " — setup needed" : ""}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="w-10 shrink-0 text-[10px] text-zinc-500">Model</span>
+                                <select
+                                  value={scheduledModel?.model || ""}
+                                  disabled={updatingModelJobId === j.id || loading || savingEdit}
+                                  onChange={(event) => {
+                                    const model = event.target.value;
+                                    void updateScheduledModel(
+                                      j,
+                                      model
+                                        ? {
+                                            provider: inferProviderForModelId(model),
+                                            model,
+                                            reasoningEffort: null,
+                                          }
+                                        : null
+                                    );
+                                  }}
+                                  className="min-w-0 max-w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
+                                  title="Model used only by this scheduled task"
+                                >
+                                  <option value="">
+                                    {j.target_agent_id ? "Agent default" : "Orchestrator default"}
+                                  </option>
+                                  {scheduledModel && !modelIsInCatalog && (
+                                    <option value={scheduledModel.model}>
+                                      {catalogModelLabel(scheduledModel.model)} (custom)
+                                    </option>
+                                  )}
+                                  {modelGroups.map((group) => (
+                                    <optgroup key={group.provider} label={group.group}>
+                                      {group.models.map((model) => (
+                                        <option key={model.id} value={model.id}>
+                                          {model.label}{model.hint ? ` — ${model.hint}` : ""}
+                                        </option>
+                                      ))}
+                                    </optgroup>
+                                  ))}
+                                </select>
+                                {scheduledModel && scheduledEfforts.length > 0 && (
+                                  <select
+                                    value={scheduledModel.reasoningEffort || ""}
+                                    disabled={updatingModelJobId === j.id || loading || savingEdit}
+                                    onChange={(event) =>
+                                      void updateScheduledModel(j, {
+                                        ...scheduledModel,
+                                        reasoningEffort: event.target.value || null,
+                                      })
+                                    }
+                                    className="min-w-0 rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
+                                    title="Reasoning effort for this scheduled task"
+                                  >
+                                    <option value="">Default effort</option>
+                                    {scheduledEfforts.map((effort) => (
+                                      <option key={effort} value={effort}>
+                                        {effort === "xhigh"
+                                          ? "Extra high"
+                                          : effort.charAt(0).toUpperCase() + effort.slice(1)}
+                                      </option>
+                                    ))}
+                                  </select>
+                                )}
+                              </div>
+                            </div>
+                          )}
                           {isEditingPrompt ? (
                             <div className="mt-2">
                               <textarea
@@ -552,15 +873,15 @@ export function SchedulePanel({
                         </div>
 
                         {/* Actions */}
-                        <div className="flex flex-col gap-2 shrink-0">
-                          <div className="flex items-center gap-1.5">
+                        <div className="w-full shrink-0 sm:w-auto">
+                          <div className="flex flex-wrap items-center gap-1.5 sm:justify-end">
                             {onTriggerJob && (
                               <button
                                 onClick={() => onTriggerJob(j.id, j.device_id || null)}
                                 disabled={
                                   loading || runningJobIds?.has(j.id) || isSavingPromptForThisJob
                                 }
-                                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border transition-colors text-xs ${
+                                className={`inline-flex h-11 min-h-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors sm:h-9 sm:px-2.5 ${
                                   runningJobIds?.has(j.id)
                                     ? "bg-blue-500/20 border-blue-500/30 text-blue-200"
                                     : "bg-emerald-500/10 border-emerald-500/20 text-emerald-200 hover:bg-emerald-500/20"
@@ -587,7 +908,7 @@ export function SchedulePanel({
                                   isEditingPrompt ? cancelPromptEdit() : beginPromptEdit(j)
                                 }
                                 disabled={loading || savingEdit}
-                                className={`p-1.5 rounded-lg border transition-colors disabled:opacity-50 ${
+                                className={`flex h-11 w-11 min-h-0 items-center justify-center rounded-lg border transition-colors disabled:opacity-50 sm:h-9 sm:w-9 ${
                                   isEditingPrompt
                                     ? "bg-cyan-500/15 border-cyan-500/30 text-cyan-200"
                                     : "bg-white/5 border-white/10 text-zinc-300 hover:bg-white/10"
@@ -600,7 +921,7 @@ export function SchedulePanel({
                             <button
                               onClick={() => updateJob(j.id, { enabled: !j.enabled })}
                               disabled={loading || savingEdit}
-                              className="p-1.5 rounded-lg bg-white/5 border border-white/10 text-zinc-300 hover:bg-white/10 disabled:opacity-50 transition-colors"
+                              className="flex h-11 w-11 min-h-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-300 transition-colors hover:bg-white/10 disabled:opacity-50 sm:h-9 sm:w-9"
                               title={j.enabled ? "Pause job" : "Resume job"}
                             >
                               {j.enabled ? (
@@ -612,7 +933,7 @@ export function SchedulePanel({
                             <button
                               onClick={() => updateJob(j.id, { skip_next_run: true })}
                               disabled={loading || savingEdit || !j.enabled}
-                              className="p-1.5 rounded-lg bg-white/5 border border-white/10 text-zinc-300 hover:bg-white/10 disabled:opacity-50 transition-colors"
+                              className="flex h-11 w-11 min-h-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-300 transition-colors hover:bg-white/10 disabled:opacity-50 sm:h-9 sm:w-9"
                               title="Skip next run"
                             >
                               <SkipForward className="w-4 h-4 text-amber-300" />
@@ -626,7 +947,7 @@ export function SchedulePanel({
                                 await deleteJob(j.id);
                               }}
                               disabled={loading || savingEdit}
-                              className="p-1.5 rounded-lg bg-red-500/10 border border-red-500/20 text-red-300 hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+                              className="flex h-11 w-11 min-h-0 items-center justify-center rounded-lg border border-red-500/20 bg-red-500/10 text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50 sm:h-9 sm:w-9"
                               title="Delete job"
                             >
                               <Trash2 className="w-4 h-4" />

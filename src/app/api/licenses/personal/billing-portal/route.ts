@@ -2,16 +2,21 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getStripeServerClient } from "@/lib/billing/stripe";
+import { isSelfHosted } from "@/lib/config/edition";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function originFromReq(req: Request): string {
   const url = new URL(req.url);
-  return (process.env.NEXT_PUBLIC_APP_URL || `${url.protocol}//${url.host}`).replace(/\/+$/, "");
+  return (getConfiguredAppUrl() || `${url.protocol}//${url.host}`).replace(/\/+$/, "");
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },

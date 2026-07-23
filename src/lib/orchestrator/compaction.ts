@@ -205,6 +205,50 @@ SUMMARY:`;
 }
 
 /**
+ * Summarize a transcript for cross-agent context transfer.
+ * Same fast-model machinery as compaction, with a handoff-oriented prompt:
+ * the output is injected into another agent's next prompt.
+ */
+export async function summarizeForTransfer(
+  messages: CompactableMessage[],
+  provider: ProviderId,
+  apiKey?: string
+): Promise<{ summary: string; provider: ProviderId; model: string }> {
+  const historyText = messagesToText(messages);
+
+  const transferPrompt = `You are preparing a context handoff between two AI agents.
+
+Below is the source agent's conversation/work history. Write a concise but complete briefing for the receiving agent that captures:
+1. The goal being worked on and its current state (done / in progress / blocked)
+2. Key decisions made and their rationale
+3. Concrete artifacts: files touched, commands run, URLs, identifiers, data values
+4. Known constraints, gotchas, and things already ruled out
+5. The most useful next steps from where the source agent left off
+
+Write it as a direct briefing ("The goal is...", "So far..."), not as a summary of a conversation. No preamble.
+
+SOURCE HISTORY:
+${historyText}
+
+BRIEFING:`;
+
+  try {
+    const modelName = provider === "openai" ? "gpt-4o-mini" : "claude-haiku-4-5-20251001";
+    const model = resolveChatModel(provider, modelName, apiKey ? { apiKey } : undefined);
+    const result = await generateText({ model, prompt: transferPrompt });
+    return { summary: result.text.trim(), provider, model: modelName };
+  } catch (error) {
+    console.error("[compaction] transfer summarization failed:", error);
+    const truncated = historyText.slice(0, SUMMARY_TARGET_TOKENS * CHARS_PER_TOKEN);
+    return {
+      summary: `[Context handoff - source history truncated]\n${truncated}`,
+      provider,
+      model: provider === "openai" ? "gpt-4o-mini" : "claude-haiku-4-5-20251001",
+    };
+  }
+}
+
+/**
  * Main compaction function.
  * Takes system prompt (never modified) and messages array.
  * Returns potentially compacted messages array.

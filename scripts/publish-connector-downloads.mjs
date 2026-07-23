@@ -37,11 +37,11 @@ loadEnvFile(path.resolve(process.cwd(), ".env.local"));
 function usage() {
   console.error(`Usage:
   node scripts/publish-connector-downloads.mjs \\
-    --version 0.22.84 \\
+    --version 0.22.86 \\
     --macos-dmg apps/connector/dist/Groovy-Connector-macOS.dmg
 
   node scripts/publish-connector-downloads.mjs \\
-    --version 0.22.84 \\
+    --version 0.22.86 \\
     --windows-exe apps/connector/dist/Groovy-Connector-windows.exe
 
 Options:
@@ -55,6 +55,16 @@ Options:
   --platform-windows <value>                  Default: windows
   --release-notes-url <url>
   --dry-run
+
+Groovy Desktop (Electron) artifacts — all three must be provided together:
+  --desktop-macos <path-to-dmg>               Signed+notarized Groovy Desktop DMG
+  --desktop-macos-zip <path-to-zip>           electron-builder ZIP (used by auto-update)
+  --desktop-feed <path-to-latest-mac.yml>     electron-builder update feed manifest
+
+  Desktop artifacts are chunk-uploaded under <prefix>/macos-desktop/ and the
+  latest-mac.yml is stored as a plain object in that same directory; the
+  /api/updates/desktop-feed route derives its location from the DMG row's
+  file_url. Rows: platform 'macos-desktop' (dmg) + 'macos-desktop-zip' (zip).
 `);
   process.exit(2);
 }
@@ -90,6 +100,9 @@ function parseArgs(argv) {
     else if (key === "--windows-exe") args.windowsExe = next();
     else if (key === "--platform-windows") args.windowsPlatform = next();
     else if (key === "--release-notes-url") args.releaseNotesUrl = next();
+    else if (key === "--desktop-macos") args.desktopMacosDmg = next();
+    else if (key === "--desktop-macos-zip") args.desktopMacosZip = next();
+    else if (key === "--desktop-feed") args.desktopFeed = next();
     else if (key === "--dry-run") args.dryRun = true;
     else usage();
   }
@@ -97,7 +110,14 @@ function parseArgs(argv) {
   if (!args.version || !String(args.version).trim()) usage();
   args.version = String(args.version).trim().replace(/^v/i, "");
   args.prefix = String(args.prefix || `connector/releases/${args.version}`).replace(/^\/+|\/+$/g, "");
-  if (!args.macosDmg && !args.windowsExe) usage();
+  const desktopFlags = [args.desktopMacosDmg, args.desktopMacosZip, args.desktopFeed];
+  const desktopFlagCount = desktopFlags.filter(Boolean).length;
+  if (desktopFlagCount > 0 && desktopFlagCount < 3) {
+    throw new Error(
+      "--desktop-macos, --desktop-macos-zip and --desktop-feed must be provided together"
+    );
+  }
+  if (!args.macosDmg && !args.windowsExe && !args.desktopMacosDmg) usage();
   if (!["stable", "beta", "dev", "enterprise"].includes(args.channel)) {
     throw new Error(`Invalid channel: ${args.channel}`);
   }
@@ -285,7 +305,9 @@ async function uploadChunkedArtifact(config, artifact, options) {
   const size = fs.statSync(artifact.path).size;
   const checksum = `sha256:${sha256Hex(artifact.path)}`;
   const contentType = artifact.contentType || contentTypeFor(filename);
-  const artifactPrefix = `${options.prefix}/${artifact.platform}/${filename}`;
+  // storageDir lets multiple downloads rows (e.g. macos-desktop +
+  // macos-desktop-zip) share one storage directory per release.
+  const artifactPrefix = `${options.prefix}/${artifact.storageDir || artifact.platform}/${filename}`;
   const chunks = [];
   const fd = fs.openSync(artifact.path, "r");
 
@@ -391,6 +413,35 @@ async function main() {
     });
   }
 
+  let desktopFeedPath = null;
+  if (args.desktopMacosDmg) {
+    const desktopDmgPath = path.resolve(args.desktopMacosDmg);
+    const desktopZipPath = path.resolve(args.desktopMacosZip);
+    desktopFeedPath = path.resolve(args.desktopFeed);
+    for (const [label, filePath] of [
+      ["desktop DMG", desktopDmgPath],
+      ["desktop ZIP", desktopZipPath],
+      ["desktop feed (latest-mac.yml)", desktopFeedPath],
+    ]) {
+      if (!fs.existsSync(filePath)) throw new Error(`Missing ${label}: ${filePath}`);
+    }
+
+    console.log(`[publish-downloads] verifying notarized Groovy Desktop DMG: ${desktopDmgPath}`);
+    verifyMacosDmg(desktopDmgPath);
+    artifacts.push({
+      path: desktopDmgPath,
+      platform: "macos-desktop",
+      storageDir: "macos-desktop",
+      contentType: "application/x-apple-diskimage",
+    });
+    artifacts.push({
+      path: desktopZipPath,
+      platform: "macos-desktop-zip",
+      storageDir: "macos-desktop",
+      contentType: "application/zip",
+    });
+  }
+
   const config = supabaseConfig();
   const published = [];
   for (const artifact of artifacts) {
@@ -405,6 +456,25 @@ async function main() {
         releaseNotesUrl: args.releaseNotesUrl,
         dryRun: args.dryRun,
       })
+    );
+  }
+
+  // Upload latest-mac.yml as a PLAIN storage object in the shared desktop
+  // directory before activating rows so /api/updates/desktop-feed never sees
+  // an active row without its feed manifest.
+  if (desktopFeedPath) {
+    const feedObjectPath = `${args.prefix}/macos-desktop/latest-mac.yml`;
+    if (!args.dryRun) {
+      await uploadStorageObject(
+        config,
+        args.bucket,
+        feedObjectPath,
+        fs.readFileSync(desktopFeedPath),
+        "text/yaml"
+      );
+    }
+    console.log(
+      `[publish-downloads] ${args.dryRun ? "prepared" : "uploaded"} desktop feed: ${feedObjectPath}`
     );
   }
 

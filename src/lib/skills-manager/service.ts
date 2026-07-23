@@ -1,6 +1,11 @@
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
-import { getAuthedUser, getOrCreateWorkspaceForUser, type WorkspaceInfo } from "@/lib/workspaces";
+import {
+  getAuthedUser,
+  getOrCreateWorkspaceForUser,
+  isWorkspaceOperatorRole,
+  type WorkspaceInfo,
+} from "@/lib/workspaces";
 
 type AuthedContext = {
   userId: string;
@@ -25,10 +30,38 @@ type ConnectorArtifact = {
   metadata?: unknown;
   riskFlags?: unknown;
   risk_flags?: unknown;
+  contentSnapshot?: unknown;
+  content_snapshot?: unknown;
+  contentSnapshotTruncated?: unknown;
+  content_snapshot_truncated?: unknown;
 };
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function truncateUtf8(value: string, maxBytes: number): {
+  value: string;
+  truncated: boolean;
+} {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return { value, truncated: false };
+  }
+  let end = Math.min(value.length, maxBytes);
+  while (end > 0) {
+    const candidate = value.slice(0, end);
+    const bytes = Buffer.byteLength(candidate, "utf8");
+    if (bytes <= maxBytes) {
+      return { value: candidate, truncated: true };
+    }
+    end = Math.max(0, end - Math.max(1, Math.ceil((bytes - maxBytes) / 2)));
+  }
+  return { value: "", truncated: true };
+}
+
+function asPositiveInteger(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -48,6 +81,10 @@ function sanitizeSlug(input: string): string {
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
+}
+
+function yamlString(value: string): string {
+  return JSON.stringify(value || "");
 }
 
 function normalizeTargets(value: unknown): string[] {
@@ -102,6 +139,9 @@ function classifyDeviceSyncStatus(result: Record<string, unknown>): "no_permissi
 async function getContext(requireAdmin = false): Promise<AuthedContext> {
   const user = await getAuthedUser();
   const workspace = await getOrCreateWorkspaceForUser();
+  if (!isWorkspaceOperatorRole(workspace.role)) {
+    throw new Error("Workspace member access required");
+  }
   if (requireAdmin && workspace.role !== "admin") {
     throw new Error("Admin access required");
   }
@@ -162,6 +202,9 @@ async function getWorkspaceForUserId(
 async function getContextForUser(userId: string, requireAdmin = false): Promise<AuthedContext> {
   const admin = createSupabaseAdminClient();
   const workspace = await getWorkspaceForUserId(admin, userId);
+  if (!isWorkspaceOperatorRole(workspace.role)) {
+    throw new Error("Workspace member access required");
+  }
   if (requireAdmin && workspace.role !== "admin") {
     throw new Error("Admin access required");
   }
@@ -212,6 +255,16 @@ function normalizeConnectorArtifact(row: ConnectorArtifact, fallbackCommitSha: s
   const fallbackSlug = exactFilename ? exactFilename.replace(/\.md$/i, "") : relativePath;
   const slug = sanitizeSlug(asString(row.slug) || fallbackSlug);
   if (!slug) return null;
+  const rawContent =
+    typeof row.contentSnapshot === "string"
+      ? row.contentSnapshot
+      : typeof row.content_snapshot === "string"
+        ? row.content_snapshot
+        : "";
+  const boundedContent = rawContent
+    ? truncateUtf8(rawContent, 262144)
+    : { value: "", truncated: false };
+  const contentSnapshot = boundedContent.value || null;
   return {
     artifact_type: artifactType,
     slug,
@@ -224,6 +277,14 @@ function normalizeConnectorArtifact(row: ConnectorArtifact, fallbackCommitSha: s
     commit_sha: asString(row.commitSha || row.commit_sha) || fallbackCommitSha,
     metadata: asRecord(row.metadata),
     risk_flags: asArray(row.riskFlags || row.risk_flags),
+    content_snapshot: contentSnapshot,
+    content_snapshot_truncated:
+      row.contentSnapshotTruncated === true ||
+      row.content_snapshot_truncated === true ||
+      boundedContent.truncated,
+    content_snapshot_updated_at: contentSnapshot
+      ? new Date().toISOString()
+      : null,
     lifecycle: "active",
     updated_at: new Date().toISOString(),
   };
@@ -250,7 +311,7 @@ async function upsertArtifactsFromSync(
     .from("workspace_skill_artifacts")
     .upsert(rows, { onConflict: "repository_id,relative_path" })
     .select(
-      "id,workspace_id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,lifecycle,metadata,risk_flags,created_at,updated_at"
+      "id,workspace_id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,lifecycle,metadata,risk_flags,content_snapshot_updated_at,created_at,updated_at"
     );
   if (error) throw new Error(error.message);
   return data || [];
@@ -367,6 +428,7 @@ export async function listSkillsManagerState() {
     auditsRes,
     agentsRes,
     codeConfigsRes,
+    runtimeSkillsRes,
   ] = await Promise.all([
     ctx.admin
       .from("workspace_skill_repositories")
@@ -380,7 +442,7 @@ export async function listSkillsManagerState() {
       .order("updated_at", { ascending: false }),
     ctx.admin
       .from("workspace_skill_assignments")
-      .select("id,workspace_id,artifact_id,agent_id,target,scope,enabled,metadata,created_at,updated_at")
+      .select("id,workspace_id,artifact_id,agent_id,profile_id,target,scope,enabled,metadata,created_at,updated_at")
       .eq("workspace_id", ctx.workspace.id)
       .order("updated_at", { ascending: false }),
     ctx.admin
@@ -405,9 +467,16 @@ export async function listSkillsManagerState() {
     ctx.admin
       .from("claude_code_agent_configs")
       .select("agent_id,code_cli_provider"),
+    memberIds.length
+      ? ctx.admin
+          .from("orchestrator_skills")
+          .select("id,user_id,agent_id,slug,name,description,lifecycle,runner,latest_version,active_version_id,rollback_version_id,created_at,updated_at")
+          .in("user_id", memberIds)
+          .order("updated_at", { ascending: false })
+      : Promise.resolve({ data: [], error: null }),
   ]);
 
-  for (const res of [reposRes, artifactsRes, assignmentsRes, syncsRes, auditsRes, agentsRes, codeConfigsRes]) {
+  for (const res of [reposRes, artifactsRes, assignmentsRes, syncsRes, auditsRes, agentsRes, codeConfigsRes, runtimeSkillsRes]) {
     if (res.error) throw new Error(res.error.message);
   }
 
@@ -438,6 +507,65 @@ export async function listSkillsManagerState() {
       updatedAt: asString(agent.updated_at) || null,
     };
   });
+  const agentById = new Map(agents.map((agent) => [agent.id, agent]));
+
+  const runtimeSkillRows = (runtimeSkillsRes.data || []) as Array<Record<string, unknown>>;
+  const runtimeSkillIds = runtimeSkillRows
+    .map((skill) => asString(skill.id))
+    .filter((id): id is string => !!id);
+  let runtimeVersionRows: Array<Record<string, unknown>> = [];
+  if (runtimeSkillIds.length > 0) {
+    const { data, error } = await ctx.admin
+      .from("orchestrator_skill_versions")
+      .select("id,skill_id,version,lifecycle,runner,validation_status,validation_task,validated_at,created_at,updated_at")
+      .in("skill_id", runtimeSkillIds)
+      .order("version", { ascending: false });
+    if (error) throw new Error(error.message);
+    runtimeVersionRows = (data as Array<Record<string, unknown>> | null) || [];
+  }
+
+  const runtimeVersionsBySkill = new Map<string, Array<Record<string, unknown>>>();
+  for (const version of runtimeVersionRows) {
+    const skillId = asString(version.skill_id);
+    if (!skillId) continue;
+    const versions = runtimeVersionsBySkill.get(skillId) || [];
+    versions.push({
+      id: asString(version.id),
+      skill_id: skillId,
+      version: asPositiveInteger(version.version),
+      lifecycle: asString(version.lifecycle) || "draft",
+      runner: asString(version.runner) || "code_cli_run",
+      validation_status: asString(version.validation_status) || "unvalidated",
+      validation_task: asString(version.validation_task) || null,
+      validated_at: asString(version.validated_at) || null,
+      created_at: asString(version.created_at) || null,
+      updated_at: asString(version.updated_at) || null,
+    });
+    runtimeVersionsBySkill.set(skillId, versions);
+  }
+
+  const runtimeSkills = runtimeSkillRows.map((skill) => {
+    const id = asString(skill.id);
+    const agentId = asString(skill.agent_id);
+    const agent = agentById.get(agentId) || null;
+    return {
+      id,
+      user_id: asString(skill.user_id),
+      agent_id: agentId,
+      agent_name: agent?.name || "Orchestrator agent",
+      slug: asString(skill.slug),
+      name: asString(skill.name) || asString(skill.slug) || "Skill",
+      description: asString(skill.description),
+      lifecycle: asString(skill.lifecycle) || "draft",
+      runner: asString(skill.runner) || "code_cli_run",
+      latest_version: asPositiveInteger(skill.latest_version),
+      active_version_id: asString(skill.active_version_id) || null,
+      rollback_version_id: asString(skill.rollback_version_id) || null,
+      created_at: asString(skill.created_at) || null,
+      updated_at: asString(skill.updated_at) || null,
+      versions: runtimeVersionsBySkill.get(id) || [],
+    };
+  });
 
   return {
     currentUserId: ctx.userId,
@@ -448,10 +576,11 @@ export async function listSkillsManagerState() {
     syncs: syncsRes.data || [],
     auditEvents: auditsRes.data || [],
     agents,
+    runtimeSkills,
     privacy: {
-      storesContents: false,
+      storesContents: true,
       summary:
-        "Flow stores repo metadata, checksums, assignments, and sync status. Skill and Markdown bodies stay in the customer's Git repo and local connector checkout.",
+        "Git remains the source of truth. Groovy stores a bounded Markdown snapshot for assigned cross-surface context; local connector materialization is still used for scripts and full skill directories.",
     },
   };
 }
@@ -553,6 +682,64 @@ export async function syncSkillsRepository(input: { repositoryId: string; device
   return { ...result, upsertedArtifacts };
 }
 
+export async function pushSkillsRepositoryChanges(input: { repositoryId: string; deviceId: string }) {
+  const ctx = await getContext(true);
+  const repositoryId = asString(input.repositoryId);
+  const deviceId = asString(input.deviceId);
+  if (!repositoryId || !deviceId) throw new Error("repositoryId and deviceId are required");
+  const repo = await getRepository(ctx, repositoryId);
+  const result = await callSkillsConnectorRpc({
+    ctx,
+    deviceId,
+    rpcType: "skills_repo_push",
+    timeoutMs: 5 * 60 * 1000,
+    payload: {
+      repository_id: repositoryId,
+      workspace_id: ctx.workspace.id,
+      repo_url: asString(repo.repo_url),
+      ref: asString(repo.default_ref) || "main",
+      commit_message: "Sync Groovy skills repo",
+    },
+  });
+  const commitSha = asString(result.commitSha || result.commit_sha) || null;
+  const artifacts = asArray(result.artifacts);
+  const syncMeta = await recordSyncResult({
+    ctx,
+    repositoryId,
+    deviceId,
+    operation: "sync",
+    result,
+    artifactCount: artifacts.length,
+  });
+  let upsertedArtifacts: unknown[] = [];
+  if (result.ok === true) {
+    upsertedArtifacts = await upsertArtifactsFromSync(ctx, repositoryId, commitSha, artifacts);
+    await ctx.admin
+      .from("workspace_skill_repositories")
+      .update({
+        status: "active",
+        last_commit_sha: commitSha,
+        last_synced_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", repositoryId)
+      .eq("workspace_id", ctx.workspace.id);
+    await audit(ctx, "skills_repo_pushed", {
+      repositoryId,
+      metadata: { commitSha, artifactCount: upsertedArtifacts.length },
+    });
+  } else {
+    await audit(ctx, "skills_repo_push_failed", {
+      repositoryId,
+      metadata: {
+        status: syncMeta.status,
+        error: syncMeta.errorMessage,
+      },
+    });
+  }
+  return { ...result, upsertedArtifacts };
+}
+
 export async function createSkillsArtifact(input: {
   repositoryId: string;
   deviceId: string;
@@ -562,6 +749,8 @@ export async function createSkillsArtifact(input: {
   name?: string;
   description?: string;
   targets?: string[];
+  overwrite?: boolean;
+  commitMessage?: string;
 }) {
   const ctx = await getContext(true);
   const repositoryId = asString(input.repositoryId);
@@ -578,7 +767,7 @@ export async function createSkillsArtifact(input: {
     ctx,
     deviceId,
     rpcType: "skills_artifact_create",
-    timeoutMs: 90_000,
+    timeoutMs: 3 * 60 * 1000,
     payload: {
       repository_id: repositoryId,
       workspace_id: ctx.workspace.id,
@@ -590,6 +779,8 @@ export async function createSkillsArtifact(input: {
       name: asString(input.name),
       description: asString(input.description),
       targets: normalizeTargets(input.targets),
+      overwrite: input.overwrite === true,
+      commit_message: asString(input.commitMessage),
     },
   });
   await recordSyncResult({
@@ -600,7 +791,17 @@ export async function createSkillsArtifact(input: {
     result,
     artifactCount: asArray(result.artifacts).length,
   });
-  if (result.ok !== true) return result;
+  if (result.ok !== true) {
+    console.warn("[skills-manager] artifact create failed", {
+      repositoryId,
+      deviceId,
+      artifactType: input.artifactType,
+      relativePath: asString(input.relativePath),
+      error: asString(result.error || result.error_code || result.code),
+      diagnostics: asRecord(result.diagnostics),
+    });
+    return result;
+  }
   const syncResult = await syncSkillsRepository({ repositoryId, deviceId });
   await audit(ctx, "skills_artifact_created", {
     repositoryId,
@@ -612,13 +813,115 @@ export async function createSkillsArtifact(input: {
   return { ...result, syncResult };
 }
 
-export async function setSkillAssignment(input: {
+function renderRuntimeSkillMarkdown(args: {
+  skill: Record<string, unknown>;
+  version: Record<string, unknown>;
+}) {
+  const name = asString(args.skill.name) || asString(args.skill.slug) || "Orchestrator Skill";
+  const description = asString(args.skill.description) || "Orchestrator-authored runtime skill.";
+  const source = asString(args.version.source) || "# No runtime source found.";
+  const runner = asString(args.version.runner || args.skill.runner) || "code_cli_run";
+  const validationStatus = asString(args.version.validation_status) || "unvalidated";
+  return [
+    "---",
+    `name: ${yamlString(name)}`,
+    `description: ${yamlString(description)}`,
+    "targets: [flow]",
+    "metadata:",
+    `  source: ${yamlString("orchestrator_runtime")}`,
+    `  groovy_runtime_skill_id: ${yamlString(asString(args.skill.id))}`,
+    `  groovy_runtime_skill_version_id: ${yamlString(asString(args.version.id))}`,
+    `  runner: ${yamlString(runner)}`,
+    `  validation_status: ${yamlString(validationStatus)}`,
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    description,
+    "",
+    "## Runtime Source",
+    "",
+    source,
+    "",
+  ].join("\n");
+}
+
+export async function exportRuntimeSkillToRepository(input: {
+  runtimeSkillId: string;
+  repositoryId: string;
+  deviceId: string;
+}) {
+  const ctx = await getContext(true);
+  const runtimeSkillId = asString(input.runtimeSkillId);
+  const repositoryId = asString(input.repositoryId);
+  const deviceId = asString(input.deviceId);
+  if (!runtimeSkillId || !repositoryId || !deviceId) {
+    throw new Error("runtimeSkillId, repositoryId, and deviceId are required");
+  }
+
+  const memberIds = ctx.workspace.members.map((m) => m.user_id);
+  const { data: skill, error: skillErr } = await ctx.admin
+    .from("orchestrator_skills")
+    .select("id,user_id,agent_id,slug,name,description,lifecycle,runner,latest_version,active_version_id,created_at,updated_at")
+    .eq("id", runtimeSkillId)
+    .in("user_id", memberIds)
+    .maybeSingle();
+  if (skillErr) throw new Error(skillErr.message);
+  if (!skill?.id) throw new Error("Runtime skill not found");
+
+  const activeVersionId = asString((skill as Record<string, unknown>).active_version_id);
+  let versionQuery = ctx.admin
+    .from("orchestrator_skill_versions")
+    .select("id,skill_id,version,lifecycle,runner,source,validation_status,created_at,updated_at")
+    .eq("skill_id", runtimeSkillId)
+    .eq("user_id", asString((skill as Record<string, unknown>).user_id));
+  versionQuery = activeVersionId
+    ? versionQuery.eq("id", activeVersionId)
+    : versionQuery.order("version", { ascending: false }).limit(1);
+  const { data: version, error: versionErr } = await versionQuery.maybeSingle();
+  if (versionErr) throw new Error(versionErr.message);
+  if (!version?.id) throw new Error("Runtime skill version not found");
+
+  const slug = sanitizeSlug(asString((skill as Record<string, unknown>).slug) || asString((skill as Record<string, unknown>).name) || "runtime-skill");
+  const relativePath = `skills/${slug || "runtime-skill"}/SKILL.md`;
+  const result = await createSkillsArtifact({
+    repositoryId,
+    deviceId,
+    artifactType: "skill",
+    relativePath,
+    content: renderRuntimeSkillMarkdown({
+      skill: skill as Record<string, unknown>,
+      version: version as Record<string, unknown>,
+    }),
+    name: asString((skill as Record<string, unknown>).name),
+    description: asString((skill as Record<string, unknown>).description),
+    targets: ["flow"],
+    overwrite: true,
+    commitMessage: `Sync runtime skill: ${asString((skill as Record<string, unknown>).name) || slug}`,
+  });
+  await audit(ctx, "runtime_skill_exported_to_repo", {
+    repositoryId,
+    metadata: {
+      runtimeSkillId,
+      relativePath,
+      ok: (result as Record<string, unknown>).ok === true,
+    },
+  });
+  return {
+    ...result,
+    relativePath,
+  };
+}
+
+async function setSkillAssignmentWithContext(
+  ctx: AuthedContext,
+  input: {
   artifactId: string;
   agentId?: string | null;
   target?: "all" | "flow" | "claude" | "codex";
   enabled?: boolean;
-}) {
-  const ctx = await getContext(true);
+  }
+) {
   const artifactId = asString(input.artifactId);
   if (!artifactId) throw new Error("artifactId is required");
   const target = input.target === "flow" || input.target === "claude" || input.target === "codex" ? input.target : "all";
@@ -637,7 +940,8 @@ export async function setSkillAssignment(input: {
       .delete()
       .eq("workspace_id", ctx.workspace.id)
       .eq("artifact_id", artifactId)
-      .eq("target", target);
+      .eq("target", target)
+      .is("profile_id", null);
     deleteQuery = agentId ? deleteQuery.eq("agent_id", agentId) : deleteQuery.is("agent_id", null);
     const { error } = await deleteQuery;
     if (error) throw new Error(error.message);
@@ -670,7 +974,8 @@ export async function setSkillAssignment(input: {
     .select("id")
     .eq("workspace_id", ctx.workspace.id)
     .eq("artifact_id", artifactId)
-    .eq("target", target);
+    .eq("target", target)
+    .is("profile_id", null);
   existingQuery = agentId ? existingQuery.eq("agent_id", agentId) : existingQuery.is("agent_id", null);
   const { data: existing, error: existingErr } = await existingQuery.maybeSingle();
   if (existingErr) throw new Error(existingErr.message);
@@ -679,6 +984,7 @@ export async function setSkillAssignment(input: {
     workspace_id: ctx.workspace.id,
     artifact_id: artifactId,
     agent_id: agentId,
+    profile_id: null,
     target,
     scope: agentId ? "agent" : "workspace",
     enabled: true,
@@ -695,7 +1001,7 @@ export async function setSkillAssignment(input: {
     : ctx.admin.from("workspace_skill_assignments").insert(payload);
 
   const { data, error } = await writeQuery
-    .select("id,workspace_id,artifact_id,agent_id,target,scope,enabled,metadata,created_at,updated_at")
+    .select("id,workspace_id,artifact_id,agent_id,profile_id,target,scope,enabled,metadata,created_at,updated_at")
     .single();
   if (error || !data?.id) throw new Error(error?.message || "Failed to assign artifact");
   await audit(ctx, "skills_assignment_set", {
@@ -704,6 +1010,66 @@ export async function setSkillAssignment(input: {
     metadata: { agentId, target },
   });
   return { ok: true, assignment: data };
+}
+
+export async function setSkillAssignment(input: {
+  artifactId: string;
+  agentId?: string | null;
+  target?: "all" | "flow" | "claude" | "codex";
+  enabled?: boolean;
+}) {
+  const ctx = await getContext(true);
+  return setSkillAssignmentWithContext(ctx, input);
+}
+
+export async function setSkillAssignmentForUser(input: {
+  userId: string;
+  artifactId: string;
+  agentId?: string | null;
+  target?: "all" | "flow" | "claude" | "codex";
+  enabled?: boolean;
+}) {
+  const ctx = await getContextForUser(input.userId, true);
+  return setSkillAssignmentWithContext(ctx, input);
+}
+
+export async function listSkillsAndDocsForUser(input: {
+  userId: string;
+  query?: string;
+}) {
+  const ctx = await getContextForUser(input.userId, false);
+  const query = asString(input.query).toLowerCase();
+  const [{ data: artifacts, error: artifactError }, { data: assignments, error: assignmentError }] =
+    await Promise.all([
+      ctx.admin
+        .from("workspace_skill_artifacts")
+        .select(
+          "id,artifact_type,slug,name,description,relative_path,exact_filename,targets,lifecycle,repository_id"
+        )
+        .eq("workspace_id", ctx.workspace.id)
+        .neq("lifecycle", "archived")
+        .order("name", { ascending: true }),
+      ctx.admin
+        .from("workspace_skill_assignments")
+        .select("id,artifact_id,agent_id,profile_id,target,scope,enabled,updated_at")
+        .eq("workspace_id", ctx.workspace.id)
+        .eq("enabled", true)
+        .order("updated_at", { ascending: false }),
+    ]);
+  if (artifactError) throw new Error(artifactError.message);
+  if (assignmentError) throw new Error(assignmentError.message);
+  const filtered = ((artifacts || []) as Array<Record<string, unknown>>).filter((artifact) => {
+    if (!query) return true;
+    return [artifact.name, artifact.slug, artifact.description, artifact.relative_path]
+      .map((value) => asString(value).toLowerCase())
+      .some((value) => value.includes(query));
+  });
+  return {
+    workspaceId: ctx.workspace.id,
+    role: ctx.workspace.role,
+    artifacts: filtered,
+    assignments: assignments || [],
+  };
 }
 
 export async function reassignSkillAssignment(input: {
@@ -717,12 +1083,15 @@ export async function reassignSkillAssignment(input: {
 
   const { data: assignment, error: assignmentErr } = await ctx.admin
     .from("workspace_skill_assignments")
-    .select("id,workspace_id,artifact_id,agent_id,target,scope,enabled")
+    .select("id,workspace_id,artifact_id,agent_id,profile_id,target,scope,enabled")
     .eq("id", assignmentId)
     .eq("workspace_id", ctx.workspace.id)
     .maybeSingle();
   if (assignmentErr) throw new Error(assignmentErr.message);
   if (!assignment?.id) throw new Error("Assignment not found");
+  if (assignment.profile_id) {
+    throw new Error("Mind assignments must be changed from the Mind capabilities editor");
+  }
   if (!assignment.agent_id || assignment.scope !== "agent") {
     throw new Error("Only agent assignments can be reassigned");
   }
@@ -771,6 +1140,7 @@ export async function reassignSkillAssignment(input: {
     .eq("workspace_id", ctx.workspace.id)
     .eq("artifact_id", asString(assignment.artifact_id))
     .eq("agent_id", toAgentId)
+    .is("profile_id", null)
     .eq("target", nextTarget)
     .maybeSingle();
   if (existingErr) throw new Error(existingErr.message);
@@ -839,14 +1209,38 @@ async function loadAssignedArtifactsForTarget(
   ctx: AuthedContext,
   input: {
     agentId?: string | null;
+    profileId?: string | null;
     target: "flow" | "claude" | "codex";
   }
 ) {
   const target = input.target === "codex" || input.target === "claude" ? input.target : "flow";
   const agentId = asString(input.agentId || "") || null;
+  const profileId =
+    asString(input.profileId || "") && input.profileId !== "__default__"
+      ? asString(input.profileId)
+      : null;
+  let inheritWorkspaceSkills = true;
+  if (profileId) {
+    const { data: profile, error: profileError } = await ctx.admin
+      .from("orchestrator_profiles")
+      .select("id,workspace_id,user_id,inherit_workspace_skills")
+      .eq("id", profileId)
+      .maybeSingle();
+    if (profileError) throw new Error(profileError.message);
+    const belongsToContext =
+      profile?.workspace_id === ctx.workspace.id ||
+      (
+        profile?.workspace_id == null &&
+        profile?.user_id === ctx.userId
+      );
+    if (!profile || !belongsToContext) {
+      throw new Error("Harness profile is unavailable for skill assignment resolution");
+    }
+    inheritWorkspaceSkills = profile.inherit_workspace_skills !== false;
+  }
   const { data: assignments, error: assignmentErr } = await ctx.admin
     .from("workspace_skill_assignments")
-    .select("id,artifact_id,agent_id,target,scope,workspace_skill_artifacts!inner(id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,metadata,risk_flags)")
+    .select("id,artifact_id,agent_id,profile_id,target,scope,workspace_skill_artifacts!inner(id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,metadata,risk_flags,content_snapshot,content_snapshot_truncated,content_snapshot_updated_at)")
     .eq("workspace_id", ctx.workspace.id)
     .eq("enabled", true)
     .in("target", ["all", target]);
@@ -854,11 +1248,18 @@ async function loadAssignedArtifactsForTarget(
 
   const selected = ((assignments || []) as Array<Record<string, unknown>>).filter((row) => {
     const rowAgentId = asString(row.agent_id);
+    const rowProfileId = asString(row.profile_id);
+    if (rowProfileId) return Boolean(profileId && rowProfileId === profileId);
+    if (!inheritWorkspaceSkills) return false;
     return !rowAgentId || (agentId && rowAgentId === agentId);
   });
   const artifacts = selected
     .map((row) => row.workspace_skill_artifacts)
-    .filter((row): row is Record<string, unknown> => !!row && typeof row === "object" && !Array.isArray(row));
+    .filter((row): row is Record<string, unknown> => !!row && typeof row === "object" && !Array.isArray(row))
+    .filter(
+      (artifact, index, rows) =>
+        rows.findIndex((candidate) => asString(candidate.id) === asString(artifact.id)) === index,
+    );
   return { target, agentId, artifacts };
 }
 
@@ -867,6 +1268,7 @@ async function preflightAgentSkillsWithContext(
   input: {
     deviceId: string;
     agentId?: string | null;
+    profileId?: string | null;
     target: "flow" | "claude" | "codex";
   }
 ) {
@@ -922,6 +1324,7 @@ async function preflightAgentSkillsWithContext(
 export async function preflightAgentSkills(input: {
   deviceId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target: "flow" | "claude" | "codex";
 }) {
   const ctx = await getContext(false);
@@ -932,6 +1335,7 @@ export async function preflightAgentSkillsForUser(input: {
   userId: string;
   deviceId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target: "flow" | "claude" | "codex";
 }) {
   const ctx = await getContextForUser(input.userId, false);
@@ -943,17 +1347,17 @@ async function buildAssignedSkillsPromptContextWithContext(
   input: {
     deviceId: string;
     agentId?: string | null;
+    profileId?: string | null;
     target: "flow" | "claude" | "codex";
   }
 ): Promise<{ text: string; artifactCount: number }> {
   const deviceId = asString(input.deviceId);
-  if (!deviceId) return { text: "", artifactCount: 0 };
   const { artifacts } = await loadAssignedArtifactsForTarget(ctx, input);
   if (artifacts.length === 0) return { text: "", artifactCount: 0 };
 
   const repoIds = Array.from(new Set(artifacts.map((artifact) => asString(artifact.repository_id)).filter(Boolean)));
   const [reposRes, syncsRes] = await Promise.all([
-    repoIds.length
+    repoIds.length && deviceId
       ? ctx.admin
           .from("workspace_skill_repositories")
           .select("id,label,repo_url,last_commit_sha")
@@ -996,9 +1400,34 @@ async function buildAssignedSkillsPromptContextWithContext(
     }
   }
 
+  const materializedPaths = Array.from(new Set(pathByRepoAndRel.values())).slice(0, 20);
+  const contentByPath = new Map<string, { content: string; truncated: boolean }>();
+  if (deviceId && materializedPaths.length > 0) {
+    const readResult = await callSkillsConnectorRpc({
+      ctx,
+      deviceId,
+      rpcType: "skills_assigned_context_read",
+      timeoutMs: 30_000,
+      payload: { paths: materializedPaths },
+    });
+    if (readResult.ok === true) {
+      for (const raw of asArray(readResult.items)) {
+        const item = asRecord(raw);
+        const itemPath = asString(item.path);
+        const content = typeof item.content === "string" ? item.content : "";
+        if (item.ok === true && itemPath && content) {
+          contentByPath.set(itemPath, {
+            content,
+            truncated: item.truncated === true,
+          });
+        }
+      }
+    }
+  }
+
   const lines = [
     "## Groovy Skills Manager Context",
-    "Use these assigned local capabilities when relevant. Flow stores only metadata and assignments; the skill and instruction bodies stay in the user's Git repo/local connector checkout.",
+    "Use these explicitly assigned capabilities when relevant. Git is the source of truth; Groovy uses the local connector copy when available and otherwise the bounded server snapshot created by the latest sync.",
   ];
 
   for (const artifact of artifacts.slice(0, 20)) {
@@ -1007,17 +1436,41 @@ async function buildAssignedSkillsPromptContextWithContext(
     const sync = syncByRepo.get(repoId);
     const relativePath = asString(artifact.relative_path);
     const localPath = pathByRepoAndRel.get(`${repoId}:${relativePath}`);
+    const snapshot =
+      typeof artifact.content_snapshot === "string"
+        ? artifact.content_snapshot
+        : "";
+    const snapshotTruncated = artifact.content_snapshot_truncated === true;
     const kind = asString(artifact.artifact_type) === "skill" ? "Skill" : "Instruction";
     const label = asString(artifact.name) || asString(artifact.slug) || relativePath;
     const repoLabel = asString(repo?.label) || "skills repo";
     const commit = asString(sync?.commit_sha || artifact.commit_sha || repo?.last_commit_sha);
     if (localPath) {
+      const localContent = contentByPath.get(localPath);
       lines.push(
-        `- ${kind}: ${label} (${repoLabel}, ${commit ? commit.slice(0, 8) : "unsynced"}) -> read/follow local path: ${localPath}`
+        `\n### ${kind}: ${label}\nSource: ${repoLabel} at ${commit ? commit.slice(0, 8) : "unsynced"} (${localPath})`
+      );
+      if (localContent) {
+        lines.push(
+          `<assigned_artifact>\n${localContent.content}\n${localContent.truncated ? "\n[Content truncated by Groovy's context limit.]" : ""}\n</assigned_artifact>`
+        );
+      } else if (snapshot) {
+        lines.push(
+          `<assigned_artifact>\n${snapshot}\n${snapshotTruncated ? "\n[Content truncated by Groovy's snapshot limit.]" : ""}\n</assigned_artifact>`,
+        );
+      } else {
+        lines.push("The assigned body could not be read. Do not claim this assignment was applied.");
+      }
+    } else if (snapshot) {
+      lines.push(
+        `\n### ${kind}: ${label}\nSource: ${repoLabel} at ${commit ? commit.slice(0, 8) : "unsynced"} (server snapshot)`,
+      );
+      lines.push(
+        `<assigned_artifact>\n${snapshot}\n${snapshotTruncated ? "\n[Content truncated by Groovy's snapshot limit.]" : ""}\n</assigned_artifact>`,
       );
     } else {
       lines.push(
-        `- ${kind}: ${label} (${repoLabel}) is assigned but is not materialized on this connector yet. Ask the user to run Skills preflight if you need it.`
+        `- ${kind}: ${label} (${repoLabel}) is assigned but has no readable snapshot yet. Ask a workspace admin to sync the Skills library.`
       );
     }
   }
@@ -1028,6 +1481,7 @@ async function buildAssignedSkillsPromptContextWithContext(
 export async function buildAssignedSkillsPromptContext(input: {
   deviceId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target: "flow" | "claude" | "codex";
 }): Promise<{ text: string; artifactCount: number }> {
   const ctx = await getContext(false);
@@ -1038,6 +1492,7 @@ export async function buildAssignedSkillsPromptContextForUser(input: {
   userId: string;
   deviceId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target: "flow" | "claude" | "codex";
 }): Promise<{ text: string; artifactCount: number }> {
   const ctx = await getContextForUser(input.userId, false);

@@ -10,6 +10,7 @@ import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
 import { signedArtifactUrl } from "@/lib/downloads/artifacts";
 import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
+import { getConfiguredAppUrl, getRelayUrl } from "@/lib/config/appConfig";
 
 function isAllowedEmail(email?: string | null) {
   const allowlist = process.env.HOSTED_MAC_ADMIN_EMAILS || "";
@@ -112,8 +113,14 @@ export async function POST(req: Request) {
       ? decryptLlmApiKey(assignment.ssh_password_enc)
       : null;
 
-    const relayUrl = process.env.GROOVY_RELAY_URL || "wss://groovy-relay.fly.dev";
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || "";
+    const relayUrl = getRelayUrl() || "";
+    const appUrl = getConfiguredAppUrl() || "";
+    if (!relayUrl || !appUrl) {
+      return NextResponse.json(
+        { error: "GROOVY_APP_URL and GROOVY_RELAY_URL must be configured" },
+        { status: 503 }
+      );
+    }
     const pairingCode = validHostedMacValue(body.pairing_code, 128);
     const requestId = validHostedMacValue(body.request_id, 128);
     const sharedRoot = validHostedMacValue(body.shared_root, 512);

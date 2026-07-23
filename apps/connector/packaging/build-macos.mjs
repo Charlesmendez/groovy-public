@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
 import { buildRnnoiseNativeAddon } from "./rnnoiseNative.mjs";
+import { bundleConnectorRuntime } from "./bundle-connector-runtime.mjs";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const connectorDir = path.resolve(__dirname, "..");
@@ -26,10 +27,25 @@ function runCapture(cmd, args, opts = {}) {
     .trim();
 }
 
-function assertExists(targetPath, label) {
-  if (!fs.existsSync(targetPath)) {
-    throw new Error(`[macos-build] Missing required path: ${label}`);
+function requireBuildUrl(name, protocols) {
+  const value = process.env[name]?.trim() || "";
+  if (!value) {
+    throw new Error(`${name} is required when building the macOS connector`);
   }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} must be a valid URL`);
+  }
+  if (!protocols.includes(parsed.protocol)) {
+    throw new Error(`${name} must use ${protocols.join(" or ")}`);
+  }
+  return value.replace(/\/$/, "");
+}
+
+function shellQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function writeMacosEntitlements(targetPath) {
@@ -202,7 +218,9 @@ function ensurePngToIcns(pngPath, outIcnsPath) {
   // Pad to 1024x1024. Try transparent padding first; fall back if sips rejects alpha.
   execSync(`sips --padToHeightWidth 1024 1024 "${scaledPng}" --out "${squarePng}" >/dev/null`);
 
-  const sizes = [16, 32, 64, 128, 256, 512, 1024];
+  // iconutil only accepts Apple's canonical iconset filenames. Extra 64px /
+  // 1024px entries or temporary PNGs make the entire iconset invalid.
+  const sizes = [16, 32, 128, 256, 512];
   for (const s of sizes) {
     const p1x = path.join(iconsetDir, `icon_${s}x${s}.png`);
     const p2x = path.join(iconsetDir, `icon_${s}x${s}@2x.png`);
@@ -211,9 +229,20 @@ function ensurePngToIcns(pngPath, outIcnsPath) {
     execSync(`sips -z ${s2} ${s2} "${squarePng}" --out "${p2x}" >/dev/null`);
   }
 
-  // Convert iconset -> icns
-  execSync(`iconutil -c icns "${iconsetDir}" -o "${outIcnsPath}"`);
-  fs.rmSync(iconsetDir, { recursive: true, force: true });
+  fs.rmSync(scaledPng, { force: true });
+  fs.rmSync(squarePng, { force: true });
+
+  // Convert iconset -> icns. Some macOS beta iconutil builds reject even a
+  // canonical iconset; an icon must never prevent producing a testable app.
+  try {
+    execSync(`iconutil -c icns "${iconsetDir}" -o "${outIcnsPath}"`);
+  } catch (error) {
+    console.warn(
+      `[macos-build] iconutil rejected the generated iconset; continuing without a generated icon: ${error?.message || error}`
+    );
+  } finally {
+    fs.rmSync(iconsetDir, { recursive: true, force: true });
+  }
 }
 
 function main() {
@@ -226,6 +255,8 @@ function main() {
   const notaryKeychainProfile = process.env.MACOS_NOTARY_KEYCHAIN_PROFILE?.trim() || "";
   const shouldSign = signingIdentity.length > 0;
   const shouldNotarize = notaryKeychainProfile.length > 0;
+  const configuredAppUrl = requireBuildUrl("GROOVY_APP_URL", ["http:", "https:"]);
+  const configuredRelayUrl = requireBuildUrl("GROOVY_RELAY_URL", ["ws:", "wss:"]);
 
   if (shouldNotarize && !shouldSign) {
     throw new Error("MACOS_NOTARY_KEYCHAIN_PROFILE was set, but MACOS_SIGN_IDENTITY was not set.");
@@ -252,83 +283,17 @@ function main() {
     console.warn(`Icon PNG not found at ${iconPng}; app will use default icon.`);
   }
 
-  // Copy connector files to Resources
-  const mjsFiles = [
-    "connector.mjs",
-    "codexPlans.mjs",
-    "browser.mjs",
-    "browserTask.mjs",
-    "credentials.mjs",
-    "files.mjs",
-    "obsidian.mjs",
-    "siteDev.mjs",
-    "whatsapp.mjs",
-    "aiyraVoice.mjs",
-    "aec.mjs",
-    "rnnoise.mjs",
-    "linkdb.mjs",
-    "sqlitedb.mjs",
-    "sqliteProjects.mjs",
-  ];
-  for (const f of mjsFiles) {
-    const src = path.join(connectorDir, f);
-    assertExists(src, f);
-    fs.copyFileSync(src, path.join(resourcesDir, f));
-  }
-  const platformDir = path.join(connectorDir, "platform");
-  assertExists(platformDir, "platform");
-  fs.cpSync(platformDir, path.join(resourcesDir, "platform"), { recursive: true });
-  const nativeDir = path.join(connectorDir, "native");
-  assertExists(nativeDir, "native");
-  fs.cpSync(nativeDir, path.join(resourcesDir, "native"), { recursive: true });
-  const wakewordsDir = path.join(connectorDir, "wakewords");
-  if (fs.existsSync(wakewordsDir)) {
-    fs.cpSync(wakewordsDir, path.join(resourcesDir, "wakewords"), {
-      recursive: true,
-    });
-  }
-  const packageJsonPath = path.join(connectorDir, "package.json");
-  assertExists(packageJsonPath, "package.json");
-  fs.copyFileSync(
-    packageJsonPath,
-    path.join(resourcesDir, "package.json")
-  );
-
-  // Copy node_modules (required for native modules like node-pty)
-  const srcNodeModules = path.join(connectorDir, "node_modules");
-  const destNodeModules = path.join(resourcesDir, "node_modules");
-  assertExists(srcNodeModules, "node_modules");
-
-  // Use cp -R for proper copying of symlinks and native modules
-  run("cp", ["-R", srcNodeModules, destNodeModules]);
-
-  // Make spawn-helper executable for both architectures (permissions can be lost during copy/zip)
-  const spawnHelpers = [
-    path.join(destNodeModules, "node-pty/prebuilds/darwin-arm64/spawn-helper"),
-    path.join(destNodeModules, "node-pty/prebuilds/darwin-x64/spawn-helper"),
-  ];
-  for (const helper of spawnHelpers) {
-    if (fs.existsSync(helper)) {
-      fs.chmodSync(helper, 0o755);
-    }
-  }
-
   if (process.arch !== "arm64") {
     throw new Error("[macos-build] Groovy Connector macOS builds currently support Apple Silicon hosts only.");
   }
 
-  // Download Node.js binary for macOS arm64
-  const nodeVersion = "v20.17.0";
-  const nodeDir = path.join(resourcesDir, "node");
-  fs.mkdirSync(nodeDir, { recursive: true });
-
-  const arch = "arm64";
-  const nodeTarball = `node-${nodeVersion}-darwin-${arch}.tar.gz`;
-  const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/${nodeTarball}`;
-  
-  console.log(`Downloading Node.js ${nodeVersion} for darwin-${arch}...`);
-  execSync(`curl -sL "${nodeUrl}" | tar xz -C "${nodeDir}" --strip-components=1`, {
-    stdio: "inherit",
+  // Copy connector sources + node_modules + standalone Node runtime to Resources
+  // (shared with Groovy Desktop's bundled-connector build).
+  bundleConnectorRuntime({
+    connectorDir,
+    destDir: resourcesDir,
+    includeNode: true,
+    arch: "arm64",
   });
 
   // Create launcher script
@@ -337,7 +302,8 @@ DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 NODE="$DIR/node/bin/node"
 CONNECTOR="$DIR/connector.mjs"
 CONFIG_FILE="$HOME/.groovy/connector.json"
-DEFAULT_APP_URL="https://www.gogroovy.ai"
+CONFIGURED_APP_URL=${shellQuote(configuredAppUrl)}
+CONFIGURED_RELAY_URL=${shellQuote(configuredRelayUrl)}
 LAUNCH_AGENT_LABEL="ai.gogroovy.connector"
 
 APPLE_SILICON_HW="$(/usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null || true)"
@@ -395,7 +361,7 @@ WHATSAPP_ENABLED="$(read_whatsapp_enabled)"
 GROUP_NAME="$(read_json_field whatsapp_group_name)"
 APP_URL="$(read_json_field whatsapp_app_url)"
 if [ -z "$APP_URL" ]; then
-  APP_URL="$DEFAULT_APP_URL"
+  APP_URL="$CONFIGURED_APP_URL"
 fi
 
 WA_ARGS=()
@@ -409,7 +375,7 @@ if [ "$ALREADY_PAIRED" = true ]; then
   if restart_launchagent_connector; then
     exit 0
   fi
-  exec "$NODE" "$CONNECTOR" --relay "wss://groovy-relay.fly.dev" "\${WA_ARGS[@]}" --kill-others
+  exec "$NODE" "$CONNECTOR" --relay "$CONFIGURED_RELAY_URL" "\${WA_ARGS[@]}" --kill-others
 fi
 
 # Not paired yet - prompt for pairing code
@@ -420,7 +386,7 @@ if [ -z "$CODE" ]; then
 fi
 
 # Pair and then run (WhatsApp only if enabled in config)
-exec "$NODE" "$CONNECTOR" --relay "wss://groovy-relay.fly.dev" --pair "$CODE" "\${WA_ARGS[@]}" --kill-others
+exec "$NODE" "$CONNECTOR" --relay "$CONFIGURED_RELAY_URL" --pair "$CODE" "\${WA_ARGS[@]}" --kill-others
 `;
 
   const launcherPath = path.join(macosDir, "launcher");

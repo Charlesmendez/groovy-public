@@ -9,7 +9,8 @@ Included:
 - One personal user.
 - Two activated devices.
 - Personal downloads.
-- Current source snapshots while active.
+- The right to run Groovy releases published while the license is active.
+- Packaged source snapshots and signed installers while active.
 - Updates while active.
 - Local or self-hosted personal use.
 
@@ -28,7 +29,8 @@ Expiration:
 
 - The last paid installed version may continue to work for personal, non-commercial use.
 - The app should show an expired license state.
-- New downloads, source snapshots, updates, activations, device resets, and support stop until renewal.
+- New portal downloads, packaged source snapshots, signed installers, updates, activations, device resets, and support stop until renewal.
+- New public source releases may remain visible, but the expired license does not grant the right to run releases published after entitlement ended.
 
 Recommended enforcement:
 

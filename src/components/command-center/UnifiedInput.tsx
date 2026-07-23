@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect, KeyboardEvent, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 // #disabled - Mic, MicOff removed because of major implementation change (realtime voice)
-import { Brain, Send, Loader2, X, AtSign, Globe, FileText, BookOpen, Database, Flame, Server, BarChart3, Facebook, Instagram, Linkedin, Terminal, Paperclip, FileSpreadsheet, Presentation, File, MessageCircle, MessageSquare, Clock, User } from "lucide-react";
+import { Brain, Send, Loader2, X, AtSign, Globe, FileText, BookOpen, Database, Flame, Server, BarChart3, Facebook, Instagram, Linkedin, Terminal, Plus, FileSpreadsheet, Presentation, File, MessageCircle, MessageSquare, Clock, User, Image as ImageIcon } from "lucide-react";
 
 type UnifiedInputProps = {
   onSend: (message: string, files?: File[]) => void;
@@ -42,10 +42,11 @@ type UnifiedInputProps = {
   teamMembers?: Array<{ id: string; handle: string; label: string; description?: string }>;
 };
 
-const FILE_ACCEPT = ".xlsx,.pptx,.docx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const FILE_ACCEPT = "image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif,.xlsx,.pptx,.docx,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
-function getUploadIcon(name: string) {
-  const ext = name.toLowerCase().split(".").pop();
+function getUploadIcon(file: File) {
+  if (file.type.startsWith("image/")) return ImageIcon;
+  const ext = file.name.toLowerCase().split(".").pop();
   switch (ext) {
     case "xlsx":
     case "xls":
@@ -1064,7 +1065,7 @@ export function UnifiedInput({
             >
               <div className="flex flex-wrap gap-2">
                 {selectedFiles.map((f, idx) => {
-                  const Icon = getUploadIcon(f.name);
+                  const Icon = getUploadIcon(f);
                   return (
                     <span
                       key={`${f.name}-${idx}`}
@@ -1090,6 +1091,25 @@ export function UnifiedInput({
         </AnimatePresence>
 
         <div className="flex items-end gap-2 p-3">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={FILE_ACCEPT}
+            multiple
+            className="hidden"
+            onChange={onPickFiles}
+          />
+
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center text-zinc-400 bg-white/5 border border-white/10 hover:text-zinc-100 hover:bg-white/10 transition-all"
+            title="Attach image or file"
+            disabled={isStreaming}
+          >
+            <Plus className="w-5 h-5" />
+          </button>
+
           {/* #disabled - Voice button removed because of major implementation change (realtime voice)
           <button
             onClick={onVoiceToggle}
@@ -1117,7 +1137,7 @@ export function UnifiedInput({
           */}
 
           {/* Text input with overlay */}
-          <div className="flex-1 relative">
+          <div className="flex-1 min-w-0 relative">
             {/* Colored overlay */}
             {mentionsInInput.length > 0 && !disableMentionOverlay && (
               <div 
@@ -1149,26 +1169,6 @@ export function UnifiedInput({
 
           {/* Right side controls */}
           <div className="flex items-center gap-2 shrink-0">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept={FILE_ACCEPT}
-              multiple
-              className="hidden"
-              onChange={onPickFiles}
-            />
-
-            {/* File upload */}
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-zinc-300 hover:bg-white/5 transition-all"
-              title="Attach files (xlsx, docx, pptx, pdf)"
-              disabled={isStreaming}
-            >
-              <Paperclip className="w-4 h-4" />
-            </button>
-
             {/* @ mention button */}
             <button
               onClick={() => {

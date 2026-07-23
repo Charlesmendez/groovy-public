@@ -13,6 +13,7 @@ import {
   getWorkspaceAddonSummary,
 } from "@/lib/billing/addons";
 import { resolveWorkspaceTokenBillingPolicy } from "@/lib/billing/policy";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,6 +24,9 @@ const ADDON_PRICING_EXPLANATION =
   "Recurring addons: Groovy Mac is $15 per workspace member/month (minimum 10 seats). Kapso Company WhatsApp is $2 per allowlisted phone/month.";
 
 export async function GET() {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
@@ -145,6 +149,9 @@ type PatchBody = {
 };
 
 export async function PATCH(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },

@@ -6,7 +6,11 @@
  */
 
 import { generateText } from "ai";
-import { resolveChatModel } from "@/lib/ai/modelResolver";
+import {
+  resolveChatModel,
+  type ProviderId,
+} from "@/lib/ai/modelResolver";
+import type { WikiLearningTarget } from "./wikiMemory";
 
 export type MemoryPlannerInput = {
   userMessage: string;
@@ -18,9 +22,15 @@ export type MemoryPlannerOutput = {
   questions: string[];
   reasoning?: string;
   // Optional billing/debug metadata
-  provider?: "anthropic" | "openai";
+  provider?: ProviderId;
   model?: string;
   usage?: unknown;
+};
+
+export type MemoryPlannerOptions = {
+  apiKey?: string;
+  provider?: ProviderId;
+  model?: string;
 };
 
 const PLANNER_SYSTEM_PROMPT = `You are a memory query planner. Your job is to decide what questions to ask the user's memory system to retrieve relevant context for their request.
@@ -102,7 +112,7 @@ function normalizeStoredMemory(
  */
 export async function planMemoryQueries(
   input: MemoryPlannerInput,
-  options?: { apiKey?: string }
+  options?: MemoryPlannerOptions
 ): Promise<MemoryPlannerOutput> {
   const { userMessage, recentHistory, isNewSession } = input;
 
@@ -123,23 +133,8 @@ Output the JSON:`;
   try {
     // Use a fast model for planning (haiku or gpt-4o-mini)
     // Prefer Anthropic if available, fall back to OpenAI
-    let model;
-    let providerId: "anthropic" | "openai" | null = null;
-    let modelNameUsed: string | null = null;
-    if (options?.apiKey) {
-      // User key - use same provider
-      providerId = "anthropic";
-      modelNameUsed = MEMORY_PLANNER_ANTHROPIC_MODEL;
-      model = resolveChatModel("anthropic", modelNameUsed, { apiKey: options.apiKey });
-    } else if (process.env.ANTHROPIC_API_KEY) {
-      providerId = "anthropic";
-      modelNameUsed = MEMORY_PLANNER_ANTHROPIC_MODEL;
-      model = resolveChatModel("anthropic", modelNameUsed);
-    } else if (process.env.OPENAI_API_KEY) {
-      providerId = "openai";
-      modelNameUsed = "gpt-4o-mini";
-      model = resolveChatModel("openai", modelNameUsed);
-    } else {
+    const resolvedModel = resolveMemoryPlannerModel(options);
+    if (!resolvedModel) {
       // No API key available - return empty questions
       console.warn("[memoryPlanner] No API key available, skipping planning");
       return {
@@ -149,7 +144,7 @@ Output the JSON:`;
     }
 
     const result = await generateText({
-      model,
+      model: resolvedModel.model,
       system: PLANNER_SYSTEM_PROMPT,
       prompt: userPrompt,
     });
@@ -177,8 +172,8 @@ Output the JSON:`;
     return {
       questions,
       reasoning,
-      provider: providerId || undefined,
-      model: modelNameUsed || undefined,
+      provider: resolvedModel.provider,
+      model: resolvedModel.modelName,
       usage: (result as unknown as { usage?: unknown }).usage,
     };
   } catch (err) {
@@ -200,8 +195,14 @@ export async function shouldStoreMemory(
     assistantResponse: string;
     existingMemoryContext?: string;
   },
-  options?: { apiKey?: string }
-): Promise<{ shouldStore: boolean; memoryNote?: string; label?: string; reason?: string }> {
+  options?: MemoryPlannerOptions
+): Promise<{
+  shouldStore: boolean;
+  memoryNote?: string;
+  label?: string;
+  reason?: string;
+  wikiTarget?: WikiLearningTarget;
+}> {
   const { userMessage, assistantResponse, existingMemoryContext } = input;
 
   const systemPrompt = `You decide whether a conversation exchange should be stored in long-term memory.
@@ -226,6 +227,9 @@ Output JSON:
   "shouldStore": true/false,
   "memoryNote": "Concise note to store (if shouldStore is true)",
   "label": "Category label (e.g. 'project', 'preference', 'constraint')",
+  "wikiCategory": "entities | concepts | projects",
+  "wikiPage": "kebab-case page name without .md",
+  "wikiTitle": "Human-readable page title",
   "reason": "Brief explanation"
 }
 
@@ -233,6 +237,13 @@ If the memory is a preference/constraint:
 - set label to "preference"
 - write memoryNote as a normalized rule beginning with "Preference:"
 - keep the rule explicit and actionable
+
+Choose the Wiki target that will compound cleanly over time:
+- entities: named people, companies, products, organizations, and places
+- projects: named active projects, initiatives, roadmaps, and workstreams
+- concepts: preferences, constraints, standing decisions, recurring methods, and uncategorized durable learnings
+- reuse a stable page name for related learnings instead of creating one page per conversation
+- use only a short kebab-case page name, never a directory or file extension
 
 Keep memoryNote under 200 chars - distill the key info only.`;
 
@@ -243,19 +254,13 @@ ${existingMemoryContext ? `Existing memory context: "${existingMemoryContext.sli
 Should this be stored?`;
 
   try {
-    let model;
-    if (options?.apiKey) {
-      model = resolveChatModel("anthropic", MEMORY_PLANNER_ANTHROPIC_MODEL, { apiKey: options.apiKey });
-    } else if (process.env.ANTHROPIC_API_KEY) {
-      model = resolveChatModel("anthropic", MEMORY_PLANNER_ANTHROPIC_MODEL);
-    } else if (process.env.OPENAI_API_KEY) {
-      model = resolveChatModel("openai", "gpt-4o-mini");
-    } else {
+    const resolvedModel = resolveMemoryPlannerModel(options);
+    if (!resolvedModel) {
       return { shouldStore: false, reason: "No API key available" };
     }
 
     const result = await generateText({
-      model,
+      model: resolvedModel.model,
       system: systemPrompt,
       prompt: userPrompt,
     });
@@ -270,6 +275,9 @@ Should this be stored?`;
       shouldStore?: boolean;
       memoryNote?: string;
       label?: string;
+      wikiCategory?: string;
+      wikiPage?: string;
+      wikiTitle?: string;
       reason?: string;
     };
 
@@ -283,14 +291,87 @@ Should this be stored?`;
       label = normalized.label;
     }
 
+    const wikiCategory =
+      parsed.wikiCategory === "entities" ||
+      parsed.wikiCategory === "concepts" ||
+      parsed.wikiCategory === "projects"
+        ? parsed.wikiCategory
+        : undefined;
+    const wikiPage =
+      typeof parsed.wikiPage === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/.test(parsed.wikiPage)
+        ? parsed.wikiPage
+        : undefined;
+    const wikiTitle =
+      typeof parsed.wikiTitle === "string" && parsed.wikiTitle.trim()
+        ? parsed.wikiTitle.trim().slice(0, 100)
+        : undefined;
+
     return {
       shouldStore,
       memoryNote,
       label,
+      wikiTarget:
+        shouldStore && (wikiCategory || wikiPage || wikiTitle)
+          ? {
+              category: wikiCategory,
+              page: wikiPage,
+              title: wikiTitle,
+            }
+          : undefined,
       reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
     };
   } catch (err) {
     console.error("[memoryPlanner] Error deciding storage:", err);
     return { shouldStore: false, reason: `Error: ${err instanceof Error ? err.message : String(err)}` };
   }
+}
+
+function resolveMemoryPlannerModel(options?: MemoryPlannerOptions): {
+  model: ReturnType<typeof resolveChatModel>;
+  provider: ProviderId;
+  modelName: string;
+} | null {
+  if (options?.apiKey && options.provider) {
+    const modelName =
+      options.provider === "anthropic"
+        ? MEMORY_PLANNER_ANTHROPIC_MODEL
+        : options.provider === "openai"
+          ? "gpt-4o-mini"
+          : options.model;
+    if (modelName) {
+      return {
+        model: resolveChatModel(options.provider, modelName, { apiKey: options.apiKey }),
+        provider: options.provider,
+        modelName,
+      };
+    }
+  }
+
+  if (options?.apiKey) {
+    return {
+      model: resolveChatModel("anthropic", MEMORY_PLANNER_ANTHROPIC_MODEL, {
+        apiKey: options.apiKey,
+      }),
+      provider: "anthropic",
+      modelName: MEMORY_PLANNER_ANTHROPIC_MODEL,
+    };
+  }
+
+  if (process.env.ANTHROPIC_API_KEY) {
+    return {
+      model: resolveChatModel("anthropic", MEMORY_PLANNER_ANTHROPIC_MODEL),
+      provider: "anthropic",
+      modelName: MEMORY_PLANNER_ANTHROPIC_MODEL,
+    };
+  }
+
+  if (process.env.OPENAI_API_KEY) {
+    return {
+      model: resolveChatModel("openai", "gpt-4o-mini"),
+      provider: "openai",
+      modelName: "gpt-4o-mini",
+    };
+  }
+
+  return null;
 }

@@ -6,7 +6,9 @@ export default function AccountSourcePage() {
       <section className="mx-auto max-w-4xl px-6 py-16">
         <h1 className="text-3xl font-semibold">Source Snapshots</h1>
         <p className="mt-4 text-zinc-400">
-          Current source snapshots are available to active paid users through the portal and CLI. The public GitHub mirror may be delayed.
+          Tagged source releases are visible in the public GitHub mirror. Active
+          licensed users can also download packaged snapshots and signed artifacts
+          through the portal and CLI.
         </p>
         <SourceSnapshotsPanel />
       </section>

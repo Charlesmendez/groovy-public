@@ -2,7 +2,20 @@
 
 Groovy is a source-available AI agent platform for running personal and enterprise workflows with your own model provider credentials, local connector runtimes, memory, Datagran/data integrations, and self-hosted deployment options.
 
-Groovy is **source-available, not open source**. Public source is provided through a delayed public mirror for transparency, evaluation, security review, documentation, and contributions. Viewing, cloning, or forking the public mirror does not grant production, commercial, internal business, hosted, resale, sublicensing, or managed-service rights.
+## Architecture at a glance
+
+One brain, many faces, many rooms: every surface (team chat, dashboard, messaging, customer-facing API) talks to the same harness kernel through a personalizable harness profile, and the kernel delegates real work to agents.
+
+<p align="center">
+  <img src="docs/assets/harness-architecture.svg" alt="Groovy harness architecture: team surfaces and customer endpoints feeding into a workspace of harness profiles, a shared kernel, and worker agents" width="680" />
+</p>
+
+Groovy is **source-available, not open source**. Each tagged source release is
+published to the public mirror from the same `source-v*` tag used by the private
+release. The private repository remains the development source of truth and
+unreleased commits remain private. Viewing, cloning, or forking the public
+mirror does not grant production, commercial, internal business, hosted,
+resale, sublicensing, or managed-service rights.
 
 Use of Groovy requires a paid license unless Groovy has explicitly granted different written rights.
 
@@ -27,7 +40,12 @@ Read:
 
 Yes, public GitHub repositories can be forked.
 
-That does **not** mean forks are free to use commercially. A fork of the delayed public mirror is allowed for evaluation, review, and contribution, but the license still controls usage rights. If someone wants to use Groovy for a company, client, team, revenue-generating project, hosted service, resale, or internal business workflow, they need the correct Groovy license.
+That does **not** mean forks are free to use. A fork of the public mirror is
+allowed for evaluation, review, and contribution, but the license still
+controls usage rights. Personal use requires Groovy Personal. A company,
+client, team, revenue-generating project, hosted service, resale, or internal
+business workflow requires the applicable Enterprise, reseller, or partner
+rights.
 
 The paid product is not GitHub access alone. Paid access includes license rights, account portal access, downloads, updates, source snapshots, support, enterprise terms, and renewal/fallback rights.
 
@@ -46,7 +64,9 @@ Customers bring their own provider credentials, such as:
 - Mistral
 - Datagran
 
-Datagran is required when you want Groovy Memory or Datagran-backed Data Integrations. Developers and enterprise customers who enable those features need a Datagran account and a `DATAGRAN_API_KEY`. If Datagran is not configured, memory and Datagran integrations should be disabled or treated as unavailable.
+Datagran is required when you want Groovy semantic Memory or Datagran-backed Data Integrations. Developers and enterprise customers who enable those features need a Datagran account and a `DATAGRAN_API_KEY`. Groovy also maintains a private structured Wiki for durable project, entity, preference, decision, and reusable-learning pages. The orchestrator can use either layer or both; `remember` syncs durable learnings to Datagran and the Wiki, while Wiki-only filing remains available for knowledge that does not need fuzzy semantic recall.
+
+If Datagran is not configured, semantic `remember`/`recall` and Datagran integrations should be disabled or treated as unavailable. The private Wiki is a separate Supabase Storage-backed capability.
 
 Token-consumption billing is only available for authorized enterprise resellers or partners whose license explicitly enables it.
 
@@ -129,13 +149,20 @@ Contact sales -> sign agreement -> receive enterprise account/license -> downloa
 
 Updates do not come from giving every customer direct access to the private GitHub repo.
 
-The intended flow is:
+The release flow is:
 
 ```text
-private Groovy repo -> tagged source snapshot/release -> Groovy portal and CLI -> licensed users
+private Groovy repo -> source-v* release tag -> public source mirror
+                                         \----> portal/CLI snapshots and signed artifacts
 ```
 
-When a user's license is active, the portal and CLI can show the latest version they are entitled to download. If a personal license expires, the already-installed version can continue for personal use, but the user loses access to new downloads, new activations, updates, and support.
+Pushing the source tag publishes the reviewed release to the public mirror; it
+does not publish every private `main` commit. When a user's license is active,
+the portal and CLI can also show the packaged source and signed artifacts they
+are entitled to download. If a personal license expires, the already-installed
+version can continue for personal use, but the user loses the right to run
+newer releases plus access to new portal downloads, activations, updates, and
+support.
 
 ## Repository Roles
 
@@ -144,10 +171,10 @@ The private production repository is for:
 - current product development
 - Vercel deployment
 - unreleased source
-- current paid source snapshots
+- release source snapshots
 - internal release preparation
 
-The delayed public GitHub mirror is for:
+The release-synchronized public GitHub mirror is for:
 
 - source code
 - documentation
@@ -163,7 +190,11 @@ The separate private `groovy-releases` repository is for:
 - checksums
 - CI-produced release artifacts
 
-GitHub is not the payment, license, or public download authority. The Groovy account portal and license system control paid access, device activation, downloads, updates, and enterprise source snapshots. Current connector downloads should be served through the portal with private storage and signed URLs.
+GitHub is the public source and contribution surface, not the payment, license,
+or signed-binary authority. The Groovy account portal and license system
+control usage rights, device activation, packaged downloads, updates, and
+enterprise entitlements. Current connector downloads should be served through
+the portal with private storage and signed URLs.
 
 ## Contributing
 

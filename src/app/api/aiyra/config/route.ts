@@ -6,6 +6,7 @@ import {
   encryptLlmApiKey,
   hashLlmApiKey,
 } from "@/lib/crypto/llmKey";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -208,7 +209,7 @@ function getMaterialQueryAuthSecret(): string | null {
 }
 
 function resolveManagedMaterialQueryOrigin(_req: Request): string | null {
-  const envOrigin = normalizeOrigin(process.env.NEXT_PUBLIC_APP_URL || "");
+  const envOrigin = normalizeOrigin(getConfiguredAppUrl() || "");
   if (envOrigin) return envOrigin;
   return null;
 }

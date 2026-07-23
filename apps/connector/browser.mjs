@@ -331,6 +331,67 @@ async function getPuppeteer() {
 }
 
 /**
+ * The packaged connector does not ship Puppeteer's external browser cache.
+ * Prefer an installed Chromium-family browser so low-level browser tools do not
+ * depend on ~/.cache/puppeteer having Puppeteer's exact pinned Chrome revision.
+ */
+function detectBrowserExecutable() {
+  const envCandidates = [
+    process.env.GROOVY_BROWSER_CHROME_PATH,
+    process.env.GROOVY_CHROME_PATH,
+    process.env.GROOVY_WHATSAPP_CHROME_PATH,
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
+  ];
+
+  const macApp = (appName, executableName = appName) => [
+    path.join("/Applications", `${appName}.app`, "Contents", "MacOS", executableName),
+    path.join(os.homedir(), "Applications", `${appName}.app`, "Contents", "MacOS", executableName),
+  ];
+
+  let platformCandidates = [];
+  if (process.platform === "darwin") {
+    platformCandidates = [
+      ...macApp("Google Chrome"),
+      ...macApp("Google Chrome Beta"),
+      ...macApp("Chromium"),
+      ...macApp("Microsoft Edge"),
+      ...macApp("Brave Browser"),
+      ...macApp("Arc"),
+    ];
+  } else if (process.platform === "win32") {
+    platformCandidates = [
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
+      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
+    ];
+  } else {
+    platformCandidates = [
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+      "/usr/bin/microsoft-edge",
+      "/usr/bin/microsoft-edge-stable",
+      "/usr/bin/brave-browser",
+    ];
+  }
+
+  const candidates = [...envCandidates, ...platformCandidates].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // skip
+    }
+  }
+  return null;
+}
+
+/**
  * Initialize browser instance
  */
 export async function initBrowser(options = {}) {
@@ -370,16 +431,24 @@ export async function initBrowser(options = {}) {
     // Clean up stale locks from crashed/killed browser processes
     await cleanupStaleBrowserLocks(userDataDir);
 
+    const executablePath = detectBrowserExecutable();
+    if (executablePath) {
+      console.log("[browser] using installed browser", { executablePath });
+    }
+
     // Use dimensions that match what we tell Claude for Computer Use
     browser = await pptr.launch({
       headless: options.headless !== false ? "new" : false,
       userDataDir,
+      ...(executablePath ? { executablePath } : {}),
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
         "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
         `--window-size=${DISPLAY_WIDTH},${DISPLAY_HEIGHT}`,
       ],
       defaultViewport: {

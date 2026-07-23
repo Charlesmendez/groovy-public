@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { normalizeUsageChargeType, type UsageChargeType } from "@/lib/billing/pricing";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export type TokenBillingPolicy = {
   tokenConsumptionBillingEnabled: boolean;
@@ -34,6 +35,12 @@ export async function resolveWorkspaceTokenBillingPolicy(args: {
   workspaceId?: string | null;
   admin?: SupabaseClient;
 }): Promise<TokenBillingPolicy> {
+  if (isSelfHosted()) {
+    return {
+      ...TOKEN_BILLING_DISABLED_POLICY,
+      reason: "token_consumption_billing_disabled_for_self_hosted",
+    };
+  }
   const workspaceId = args.workspaceId?.trim();
   if (!workspaceId) return TOKEN_BILLING_DISABLED_POLICY;
 

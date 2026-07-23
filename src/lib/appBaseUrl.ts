@@ -1,3 +1,5 @@
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
+
 function trimmed(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -66,7 +68,7 @@ function getHostOrigin(req: Request): string | null {
 }
 
 export function resolveAppBaseUrl(req: Request): string | null {
-  const envOrigin = parseOrigin(process.env.NEXT_PUBLIC_APP_URL || "")?.origin ?? null;
+  const envOrigin = parseOrigin(getConfiguredAppUrl() || "")?.origin ?? null;
   if (envOrigin) return envOrigin;
 
   const requestOrigin = getRequestOrigin(req);

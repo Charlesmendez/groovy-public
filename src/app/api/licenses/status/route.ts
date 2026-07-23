@@ -4,6 +4,9 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getWorkspaceMembershipsForUser, type MembershipRow } from "@/lib/billing/state";
 import { signLicensePayload } from "@/lib/licensing/server";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
+import type { GroovyLicensePayload, GroovySignedEnvelope } from "@/lib/licensing/types";
+import { FREE_TRIAL_DAYS, getFreeTrialStatus } from "@/lib/licensing/access";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +15,29 @@ const LICENSE_SELECT =
   "*, license_devices(id, device_hash, device_name, platform, app_version, activated_at, last_seen_at, deactivated_at)";
 
 type LicenseRow = Record<string, unknown>;
+
+function storedOrFreshSignedLicense(
+  row: LicenseRow
+): GroovySignedEnvelope<GroovyLicensePayload> {
+  const stored = row.signed_license_payload;
+  if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+    const envelope = stored as Partial<GroovySignedEnvelope<GroovyLicensePayload>>;
+    if (
+      envelope.alg === "Ed25519" &&
+      envelope.typ === "groovy-license" &&
+      envelope.payload &&
+      typeof envelope.payload === "object" &&
+      typeof envelope.signature === "string" &&
+      envelope.signature.trim()
+    ) {
+      return envelope as GroovySignedEnvelope<GroovyLicensePayload>;
+    }
+  }
+
+  // Legacy or malformed rows may not contain the persisted envelope. Only
+  // those rows need the private signing key; normal status reads do not.
+  return signLicensePayload(row);
+}
 
 function validUntilMs(row: LicenseRow): number {
   const validUntil = typeof row.valid_until === "string" ? new Date(row.valid_until).getTime() : 0;
@@ -28,6 +54,16 @@ function isWorkspaceLicense(row: LicenseRow): boolean {
 
 function isActiveishStatus(status: unknown): boolean {
   return status === "active" || status === "past_due";
+}
+
+function entitlementIsActive(entry: ReturnType<typeof buildEntitlement>): boolean {
+  const payload = entry.license.payload;
+  const validUntil = payload?.valid_until ? new Date(payload.valid_until).getTime() : 0;
+  return (
+    isActiveishStatus(payload?.status) &&
+    Number.isFinite(validUntil) &&
+    validUntil >= Date.now()
+  );
 }
 
 function canManageLicense(args: {
@@ -73,7 +109,7 @@ function buildEntitlement(args: {
     workspaceId,
     workspaceName: workspaceId ? args.workspaceNameById.get(workspaceId) || null : null,
     role: membership?.role || null,
-    license: signLicensePayload(row),
+    license: storedOrFreshSignedLicense(row),
     licenseKey: decryptVisibleLicenseKey(row, canManage),
     devices: canManage && Array.isArray(row.license_devices) ? row.license_devices : [],
     canManageLicense: canManage,
@@ -88,6 +124,31 @@ export async function GET() {
   } = await supabase.auth.getUser();
   if (authErr || !user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  if (isSelfHosted()) {
+    return NextResponse.json({
+      licensed: true,
+      hasAccess: true,
+      accessStatus: "licensed",
+      status: "self_hosted",
+      workspaceId: null,
+      license: null,
+      licenseKey: null,
+      devices: [],
+      canManageLicense: false,
+      licenses: [],
+      trial: {
+        status: "not_started",
+        eligible: false,
+        startedAt: null,
+        endsAt: null,
+        remainingMs: 0,
+        daysRemaining: 0,
+        durationDays: FREE_TRIAL_DAYS,
+      },
+      requiresPurchase: false,
+    });
   }
 
   const admin = createSupabaseAdminClient();
@@ -150,36 +211,81 @@ export async function GET() {
     return licenseSortMs(b) - licenseSortMs(a);
   });
 
-  const entitlements = rows.map((row) =>
-    buildEntitlement({
-      row,
-      userId: user.id,
-      membershipByWorkspace,
-      workspaceNameById,
-    })
-  );
+  let entitlements;
+  try {
+    entitlements = rows.map((row) =>
+      buildEntitlement({
+        row,
+        userId: user.id,
+        membershipByWorkspace,
+        workspaceNameById,
+      })
+    );
+  } catch (error) {
+    console.error("[licenses/status] Failed to build license entitlement", error);
+    return NextResponse.json(
+      { error: "The stored license could not be read. Check the server license-signing configuration." },
+      { status: 500 }
+    );
+  }
 
-  if (entitlements.length === 0) {
+  const activePrimary =
+    entitlements.find((entry) => entry.scope === "workspace" && entitlementIsActive(entry)) ||
+    entitlements.find((entry) => entry.scope === "personal" && entitlementIsActive(entry)) ||
+    null;
+  const trial = activePrimary
+    ? {
+        status: "not_started" as const,
+        eligible: false,
+        startedAt: null,
+        endsAt: null,
+        remainingMs: 0,
+        daysRemaining: 0,
+      }
+    : await getFreeTrialStatus({
+        userId: user.id,
+        admin,
+        eligible: (personalRows || []).length === 0,
+      });
+
+  if (!activePrimary) {
+    const accessStatus =
+      trial.status === "active"
+        ? "trial"
+        : trial.status === "not_started" && trial.eligible
+          ? "trial_available"
+          : "expired";
+    const fallback = entitlements[0] || null;
     return NextResponse.json({
       licensed: false,
-      status: "unlicensed",
-      workspaceId,
-      licenses: [],
+      hasAccess: trial.status === "active",
+      accessStatus,
+      status: accessStatus,
+      workspaceId: fallback?.workspaceId || workspaceId,
+      license: fallback?.license || null,
+      licenseKey: fallback?.licenseKey || null,
+      devices: fallback?.devices || [],
+      canManageLicense: fallback?.canManageLicense || false,
+      licenses: entitlements,
+      trial: { ...trial, durationDays: FREE_TRIAL_DAYS },
+      requiresPurchase: accessStatus === "expired",
     });
   }
 
-  const primary =
-    entitlements.find((entry) => entry.scope === "workspace" && isActiveishStatus(entry.license.payload?.status)) ||
-    entitlements.find((entry) => entry.scope === "personal" && isActiveishStatus(entry.license.payload?.status)) ||
-    entitlements[0];
+  const primary = activePrimary;
 
   return NextResponse.json({
     licensed: true,
+    hasAccess: true,
+    accessStatus: "licensed",
+    status: "licensed",
     workspaceId: primary.workspaceId || workspaceId,
     license: primary.license,
     licenseKey: primary.licenseKey,
     devices: primary.devices,
     canManageLicense: primary.canManageLicense,
     licenses: entitlements,
+    trial: { ...trial, durationDays: FREE_TRIAL_DAYS },
+    requiresPurchase: false,
   });
 }

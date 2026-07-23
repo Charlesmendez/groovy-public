@@ -1,0 +1,69 @@
+name: groovy
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: ${GROOVY_APP_URL:-http://localhost:3000}
+        NEXT_PUBLIC_RELAY_URL: ${GROOVY_RELAY_URL:-ws://localhost:8080}
+        NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Groovy}
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?Set NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:?Set NEXT_PUBLIC_SUPABASE_ANON_KEY}
+    restart: unless-stopped
+    ports:
+      - "${GROOVY_WEB_PORT:-3000}:3000"
+    environment:
+      GROOVY_EDITION: self-hosted
+      GROOVY_APP_URL: ${GROOVY_APP_URL:-http://localhost:3000}
+      NEXT_PUBLIC_APP_URL: ${GROOVY_APP_URL:-http://localhost:3000}
+      NEXT_PUBLIC_BRAND_NAME: ${NEXT_PUBLIC_BRAND_NAME:-Groovy}
+      NEXT_PUBLIC_RELAY_URL: ${GROOVY_RELAY_URL:-ws://localhost:8080}
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?Set NEXT_PUBLIC_SUPABASE_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:?Set NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?Set SUPABASE_SERVICE_ROLE_KEY}
+      RELAY_JWT_SECRET: ${RELAY_JWT_SECRET:?Set RELAY_JWT_SECRET}
+      LLM_KEY_ENCRYPTION_KEY: ${LLM_KEY_ENCRYPTION_KEY:?Set LLM_KEY_ENCRYPTION_KEY}
+      HARNESS_THREAD_TOKEN_SECRET: ${HARNESS_THREAD_TOKEN_SECRET:?Set HARNESS_THREAD_TOKEN_SECRET}
+      SCHEDULER_CRON_SECRET: ${SCHEDULER_CRON_SECRET:?Set SCHEDULER_CRON_SECRET}
+      DATAGRAN_API_KEY: ${DATAGRAN_API_KEY:-}
+      DATAGRAN_CHAT_MODEL: ${DATAGRAN_CHAT_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      relay:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api/app-version').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+
+  relay:
+    build:
+      context: ./apps/relay
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${GROOVY_RELAY_PORT:-8080}:8080"
+    environment:
+      PORT: 8080
+      GROOVY_EDITION: self-hosted
+      GROOVY_APP_URL: http://web:3000
+      SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?Set NEXT_PUBLIC_SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:?Set NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?Set SUPABASE_SERVICE_ROLE_KEY}
+      RELAY_JWT_SECRET: ${RELAY_JWT_SECRET:?Set RELAY_JWT_SECRET}
+      SCHEDULER_CRON_SECRET: ${SCHEDULER_CRON_SECRET:?Set SCHEDULER_CRON_SECRET}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

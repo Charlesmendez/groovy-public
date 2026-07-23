@@ -3,6 +3,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getWorkspaceMembershipsForUser } from "@/lib/billing/state";
 import { hashRequestValue, signedArtifactUrl } from "@/lib/downloads/artifacts";
+import { getProductAccessForUser } from "@/lib/licensing/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -83,12 +84,14 @@ export async function GET(req: Request) {
     ...workspaceRows,
   ]);
 
-  if (licenseRows.length === 0) {
+  const productAccess = await getProductAccessForUser({ userId: user.id, admin });
+  const trialAccess = productAccess.accessStatus === "trial";
+  if (licenseRows.length === 0 && !trialAccess) {
     return NextResponse.json({ licensed: false, downloads: [], sourceSnapshots: [] });
   }
 
   const activeLicenses = licenseRows.filter(licenseAllowsUpdates);
-  if (activeLicenses.length === 0) {
+  if (activeLicenses.length === 0 && !trialAccess) {
     const mostRecent = licenseRows[0] || {};
     return NextResponse.json({
       licensed: true,
@@ -100,9 +103,11 @@ export async function GET(req: Request) {
     });
   }
 
-  const licenseTypes = Array.from(
-    new Set(activeLicenses.map((row) => String(row.license_type || "personal")))
-  );
+  const licenseTypes = trialAccess
+    ? ["personal"]
+    : Array.from(
+        new Set(activeLicenses.map((row) => String(row.license_type || "personal")))
+      );
   const downloadResponses = await Promise.all(
     licenseTypes.map((licenseType) =>
       admin
@@ -113,16 +118,18 @@ export async function GET(req: Request) {
         .order("created_at", { ascending: false })
     )
   );
-  const snapshotResponses = await Promise.all(
-    licenseTypes.map((licenseType) =>
-      admin
-        .from("source_snapshots")
-        .select("id, version, channel, git_ref, archive_url, checksum, release_notes_url, public_mirror_after, created_at")
-        .eq("is_active", true)
-        .contains("license_type_allowed", [licenseType])
-        .order("created_at", { ascending: false })
-    )
-  );
+  const snapshotResponses = trialAccess
+    ? []
+    : await Promise.all(
+        licenseTypes.map((licenseType) =>
+          admin
+            .from("source_snapshots")
+            .select("id, version, channel, git_ref, archive_url, checksum, release_notes_url, public_mirror_after, created_at")
+            .eq("is_active", true)
+            .contains("license_type_allowed", [licenseType])
+            .order("created_at", { ascending: false })
+        )
+      );
 
   const downloadError = downloadResponses.find((response) => response.error)?.error;
   const snapshotError = snapshotResponses.find((response) => response.error)?.error;
@@ -162,7 +169,7 @@ export async function GET(req: Request) {
     ...signedDownloads.map((download) =>
       admin.from("download_events").insert({
         organization_id: organizationId,
-        license_id: String(licenseRow.id),
+        license_id: typeof licenseRow.id === "string" ? licenseRow.id : null,
         user_id: user.id,
         download_id: String((download as Record<string, unknown>).id),
         ip_hash: hashRequestValue(ip),
@@ -172,7 +179,7 @@ export async function GET(req: Request) {
     ...signedSourceSnapshots.map((snapshot) =>
       admin.from("download_events").insert({
         organization_id: organizationId,
-        license_id: String(licenseRow.id),
+        license_id: typeof licenseRow.id === "string" ? licenseRow.id : null,
         user_id: user.id,
         source_snapshot_id: String((snapshot as Record<string, unknown>).id),
         ip_hash: hashRequestValue(ip),
@@ -182,9 +189,11 @@ export async function GET(req: Request) {
   ]).catch(() => {});
 
   return NextResponse.json({
-    licensed: true,
+    licensed: !trialAccess,
+    hasAccess: true,
+    accessStatus: trialAccess ? "trial" : "licensed",
     canReceiveUpdates: true,
-    licenseStatus: licenseRow.status,
+    licenseStatus: trialAccess ? "trial" : licenseRow.status,
     downloads: signedDownloads,
     sourceSnapshots: signedSourceSnapshots,
   });

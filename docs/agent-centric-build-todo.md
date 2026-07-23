@@ -9,7 +9,7 @@ This is the execution checklist for the agent-centric runtime migration.
 - [x] Wire orchestrator tool context to carry `orchestratorAgentId`.
 - [x] Update schedule tool writes so new jobs persist `agent_id`.
 - [x] Keep context compaction enabled, but scope it per agent runtime.
-- [x] Keep durable memory in Datagran as the source of truth.
+- [x] Keep Datagran as the semantic memory source and use the private Wiki as the complementary structured knowledge layer.
 
 ## Phase 2 - Branch Controller + Safety
 

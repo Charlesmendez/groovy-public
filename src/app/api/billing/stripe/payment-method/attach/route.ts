@@ -3,6 +3,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import { attachPaymentMethodToWorkspace } from "@/lib/billing/stripe";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,6 +13,9 @@ type Body = {
 };
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },

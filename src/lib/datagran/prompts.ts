@@ -446,6 +446,19 @@ Note: dateRange uses raw colons, but URNs in List() must be URL-encoded (%3A for
 \`\`\`json
 { "method": "GET", "endpoint": "/api/proxy/gmail/gmail/v1/users/me/threads/THREAD_ID?format=metadata" }
 \`\`\`
+
+## Gmail Search Rules
+
+- For requests like "find an email from X", "respond to X", or "stop X from emailing me", first locate the exact message/thread before composing or sending anything.
+- For sender searches, use exact Gmail search variants such as:
+  - \`from:sender@example.com\`
+  - \`from:example.com\`
+  - \`"Display Name"\`
+  - \`example.com\` or a distinctive domain fragment
+- Unless the user explicitly restricts the search to the inbox or sent mail, search all mail. Use \`in:anywhere\` in the Gmail query and include \`includeSpamTrash=true\` on message-list endpoints when checking spam/trash/all mail.
+- Do not say spam or trash were checked unless the message-list request included \`includeSpamTrash=true\` or a tool result explicitly proves those folders were covered.
+- For a possible match, fetch message metadata with at least \`From\`, \`To\`, \`Cc\`, \`Subject\`, and \`Date\`, then fetch the thread before drafting a reply.
+- If no match is found, report the exact sender/email/domain queries and mailbox scope that were checked. Do not claim other Gmail accounts were checked; each connected Gmail account is a separate agent chosen by the orchestrator.
 `,
 
   tiktok: `

@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { encryptLlmApiKey, sha256Hex } from "@/lib/crypto/llmKey";
 import {
   getDatagranChatModel,
   getFilesAgentModel,
 } from "@/lib/ai/modelResolver";
 import { rehomeScheduledJobsForDeletedAgent } from "@/lib/orchestrator/scheduledJobLifecycle";
+import { ensureOrchestratorIntegrationAssignment } from "@/lib/integrations/assignments";
+import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
+import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 
 type PostBody = {
   type?: unknown;
@@ -36,6 +41,24 @@ function toStringOrNull(v: unknown): string | null {
   return String(v);
 }
 
+export async function GET() {
+  const supabase = await createSupabaseServerClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const agents = await listWorkerAgents(user.id, { supabase }).catch(() => []);
+  return NextResponse.json({
+    agents: agents.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      harness: agent.harness,
+      model: agent.model,
+      deviceOnline: agent.deviceOnline,
+    })),
+  });
+}
+
 export async function POST(req: Request) {
   const supabase = await createSupabaseServerClient();
   const {
@@ -49,7 +72,18 @@ export async function POST(req: Request) {
   const type = toStringOrNull(body.type) || "";
   
   if (type === "datagran") {
-    return handleDatagranCreation(supabase, user.id, body);
+    const workspace = await getOrCreateWorkspaceForUser();
+    if (workspace.role !== "admin") {
+      return NextResponse.json(
+        { error: "Only workspace admins can manage integrations" },
+        { status: 403 },
+      );
+    }
+    return handleDatagranCreation(
+      createSupabaseAdminClient(),
+      workspace.billing_admin_user_id,
+      body,
+    );
   }
 
   if (type === "cursor") {
@@ -117,7 +151,7 @@ export async function POST(req: Request) {
 }
 
 async function handleDatagranCreation(
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
+  supabase: SupabaseClient,
   userId: string,
   body: PostBody
 ) {
@@ -202,6 +236,14 @@ async function handleDatagranCreation(
       { status: 500 }
     );
   }
+
+  await ensureOrchestratorIntegrationAssignment({
+    supabase,
+    userId,
+    integrationId: String(agent.id),
+  }).catch((error) => {
+    console.warn("[agents] failed to auto-assign Datagran integration", error);
+  });
 
   // Create an initial session for the agent
   const { data: session, error: sessErr } = await supabase
@@ -363,22 +405,36 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ error: "Agent ID is required" }, { status: 400 });
   }
 
-  // First verify the agent belongs to the user
-  const { data: agent, error: fetchError } = await supabase
+  const admin = createSupabaseAdminClient();
+  const { data: candidate, error: fetchError } = await admin
     .from("agents")
-    .select("id, type")
+    .select("id, type, user_id")
     .eq("id", agentId)
-    .eq("user_id", user.id)
-    .single();
+    .maybeSingle();
 
-  if (fetchError || !agent) {
+  if (fetchError || !candidate) {
+    return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+  }
+  let operationClient: SupabaseClient = supabase;
+  let operationUserId = user.id;
+  if (candidate.type === "datagran") {
+    const workspace = await getOrCreateWorkspaceForUser();
+    if (
+      workspace.role !== "admin" ||
+      candidate.user_id !== workspace.billing_admin_user_id
+    ) {
+      return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+    }
+    operationClient = admin;
+    operationUserId = workspace.billing_admin_user_id;
+  } else if (candidate.user_id !== user.id) {
     return NextResponse.json({ error: "Agent not found" }, { status: 404 });
   }
 
   try {
     await rehomeScheduledJobsForDeletedAgent({
-      supabase,
-      userId: user.id,
+      supabase: operationClient,
+      userId: operationUserId,
       deletedAgentId: agentId,
     });
   } catch (error) {
@@ -391,11 +447,11 @@ export async function DELETE(req: Request) {
 
   // Configs and chat sessions reference agents with ON DELETE CASCADE. Delete the
   // parent row only after scheduled jobs have been safely rehomed.
-  const { error: deleteError } = await supabase
+  const { error: deleteError } = await operationClient
     .from("agents")
     .delete()
     .eq("id", agentId)
-    .eq("user_id", user.id);
+    .eq("user_id", operationUserId);
 
   if (deleteError) {
     console.error("[agents] delete error:", deleteError);
@@ -425,12 +481,36 @@ export async function PATCH(req: Request) {
     return NextResponse.json({ error: "Name is required" }, { status: 400 });
   }
 
-  // Verify ownership and update
-  const { data: agent, error } = await supabase
+  const admin = createSupabaseAdminClient();
+  const { data: candidate } = await admin
+    .from("agents")
+    .select("id,type,user_id")
+    .eq("id", body.id)
+    .maybeSingle();
+  if (!candidate) {
+    return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+  }
+  let operationClient: SupabaseClient = supabase;
+  let operationUserId = user.id;
+  if (candidate.type === "datagran") {
+    const workspace = await getOrCreateWorkspaceForUser();
+    if (
+      workspace.role !== "admin" ||
+      candidate.user_id !== workspace.billing_admin_user_id
+    ) {
+      return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+    }
+    operationClient = admin;
+    operationUserId = workspace.billing_admin_user_id;
+  } else if (candidate.user_id !== user.id) {
+    return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+  }
+
+  const { data: agent, error } = await operationClient
     .from("agents")
     .update({ name: newName, updated_at: new Date().toISOString() })
     .eq("id", body.id)
-    .eq("user_id", user.id)
+    .eq("user_id", operationUserId)
     .select("id, name")
     .single();
 

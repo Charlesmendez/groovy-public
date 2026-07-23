@@ -94,6 +94,39 @@ function emitProgressSafe(onProgress, text) {
   }
 }
 
+function isClaudeInvalidAuthText(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text) return false;
+  if (text.includes("invalid authentication credentials")) return true;
+  if (text.includes("authentication_error")) return true;
+  if (text.includes("incorrect api key")) return true;
+  if (text.includes("invalid api key")) return true;
+  if (text.includes("api key") && text.includes("invalid")) return true;
+  if (text.includes("x-api-key") && text.includes("invalid")) return true;
+  if (text.includes("401") && (text.includes("auth") || text.includes("credential"))) return true;
+  return false;
+}
+
+function isInvalidClaudeAuthSpawnResult(spawnResult) {
+  if (!spawnResult || typeof spawnResult !== "object") return false;
+  const exitCode = Number.isFinite(Number(spawnResult.code)) ? Number(spawnResult.code) : null;
+  if (exitCode === 0) return false;
+  const eventText = Array.isArray(spawnResult.streamEvents)
+    ? spawnResult.streamEvents
+        .map((event) => {
+          try {
+            return JSON.stringify(event);
+          } catch {
+            return "";
+          }
+        })
+        .join("\n")
+    : "";
+  return isClaudeInvalidAuthText(
+    `${spawnResult.stderr || ""}\n${spawnResult.stdout || ""}\n${eventText}`
+  );
+}
+
 function summarizePlaywrightToolUse(block) {
   const b = block && typeof block === "object" ? block : null;
   if (!b || b.type !== "tool_use") return "";
@@ -212,6 +245,7 @@ const PLAYWRIGHT_ALLOWED_TOOLS = [
 
 const PLAYWRIGHT_LOGIN_USERNAME_SECRET = "GROOVY_LOGIN_USERNAME";
 const PLAYWRIGHT_LOGIN_PASSWORD_SECRET = "GROOVY_LOGIN_PASSWORD";
+const GROOVY_PLAYWRIGHT_AUTOFILL_SECRETS_FILE = "GROOVY_PLAYWRIGHT_AUTOFILL_SECRETS_FILE";
 
 function dotenvQuote(value) {
   return JSON.stringify(String(value ?? ""));
@@ -246,7 +280,6 @@ function preparePlaywrightAutoLoginInitPage() {
   }
 
   const file = path.join(dir, "groovy-autofill.cjs");
-  const credentialsModuleUrl = new URL("./credentials.mjs", import.meta.url).href;
   const source = `
 module.exports = {
   default: async function groovyAutoFillInitPage({ page }) {
@@ -262,34 +295,115 @@ module.exports = {
       }
     }
 
-    const credentialsModuleUrl = ${JSON.stringify(credentialsModuleUrl)};
-    let credentialGetSecret = null;
-    const cache = new Map();
-    const cacheTtlMs = 30_000;
+    const usernameSecretName = ${JSON.stringify(PLAYWRIGHT_LOGIN_USERNAME_SECRET)};
+    const passwordSecretName = ${JSON.stringify(PLAYWRIGHT_LOGIN_PASSWORD_SECRET)};
+    const secretsFile = String(process.env[${JSON.stringify(GROOVY_PLAYWRIGHT_AUTOFILL_SECRETS_FILE)}] || "").trim();
+    const allowedCredentialDomain = normalizeCredentialDomain(
+      process.env.GROOVY_PLAYWRIGHT_CREDENTIAL_DOMAIN || ""
+    );
+    let cachedSecret = undefined;
 
-    async function loadCredential(domain) {
-      const now = Date.now();
-      const cached = cache.get(domain);
-      if (cached && now - cached.ts < cacheTtlMs) return cached.value;
-      if (!credentialGetSecret) {
-        const mod = await import(credentialsModuleUrl);
-        credentialGetSecret = mod.credentialGetSecret;
+    function normalizeCredentialDomain(value) {
+      const raw = String(value || "").trim().toLowerCase();
+      if (!raw) return "";
+      let host = raw;
+      try {
+        host = new URL(raw.includes("://") ? raw : "https://" + raw).hostname;
+      } catch {
+        host = raw.replace(/^https?:\\/\\//, "").replace(/\\/.*$/, "");
       }
-      const value = await credentialGetSecret({ domain }).catch(() => null);
-      cache.set(domain, { ts: now, value });
-      return value;
+      return host.replace(/^www\\./, "").replace(/^m\\./, "");
     }
 
-    async function fillOnce() {
-      let domain = "";
-      try {
-        domain = new URL(page.url()).hostname.toLowerCase();
-      } catch {
-        return;
+    function credentialDomainAllowed(domain) {
+      const d = normalizeCredentialDomain(domain);
+      if (!d || !allowedCredentialDomain) return false;
+      if (
+        d === allowedCredentialDomain ||
+        d.endsWith("." + allowedCredentialDomain) ||
+        allowedCredentialDomain.endsWith("." + d)
+      ) {
+        return true;
       }
-      if (!domain) return;
 
-      const loginLike = await page.evaluate(() => {
+      const dTail = domainTail(d);
+      const allowedTail = domainTail(allowedCredentialDomain);
+      return !!dTail && dTail === allowedTail;
+    }
+
+    function domainTail(domain) {
+      const parts = normalizeCredentialDomain(domain).split(".").filter(Boolean);
+      if (parts.length < 2) return "";
+      const publicSecondLevel = new Set(["ac", "co", "com", "edu", "gov", "net", "org"]);
+      const tld = parts[parts.length - 1] || "";
+      const sld = parts[parts.length - 2] || "";
+      if (parts.length >= 3 && tld.length === 2 && publicSecondLevel.has(sld)) {
+        return parts.slice(-3).join(".");
+      }
+      return parts.slice(-2).join(".");
+    }
+
+    function frameHost(frame) {
+      try {
+        const raw = String(frame?.url?.() || "");
+        if (!raw || raw === "about:blank") return "";
+        return new URL(raw).hostname.toLowerCase();
+      } catch {
+        return "";
+      }
+    }
+
+    function parseDotenvValue(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      try {
+        if (
+          (raw.startsWith('"') && raw.endsWith('"')) ||
+          (raw.startsWith("'") && raw.endsWith("'"))
+        ) {
+          return JSON.parse(raw);
+        }
+      } catch {
+        // fall through to raw value
+      }
+      return raw;
+    }
+
+    function readCredentialFromSecretsFile() {
+      if (cachedSecret !== undefined) return cachedSecret;
+      cachedSecret = null;
+      if (!secretsFile) return cachedSecret;
+      try {
+        const fs = require("fs");
+        const text = fs.readFileSync(secretsFile, "utf8");
+        const values = {};
+        for (const line of text.split(/\\r?\\n/)) {
+          const m = /^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.*?)\\s*$/.exec(line);
+          if (!m) continue;
+          values[m[1]] = parseDotenvValue(m[2]);
+        }
+        const password = String(values[passwordSecretName] || "");
+        if (!password) return cachedSecret;
+        cachedSecret = {
+          ok: true,
+          hasCredential: true,
+          username: String(values[usernameSecretName] || ""),
+          password,
+        };
+        return cachedSecret;
+      } catch {
+        cachedSecret = null;
+        return cachedSecret;
+      }
+    }
+
+    async function loadCredential(domain) {
+      if (!credentialDomainAllowed(domain)) return null;
+      return readCredentialFromSecretsFile();
+    }
+
+    async function frameLooksLoginLike(frame) {
+      return frame.evaluate(() => {
         function isVisible(el) {
           try {
             return !!(el && el.offsetParent !== null);
@@ -304,20 +418,26 @@ module.exports = {
           'input[id*="email" i]',
           'input[name*="user" i]',
           'input[id*="user" i]',
+          'input[name*="userid" i]',
+          'input[id*="userid" i]',
+          'input[name*="userId" i]',
+          'input[id*="userId" i]',
           'input[name*="login" i]',
           'input[id*="login" i]',
+          'input[name*="loginid" i]',
+          'input[id*="loginid" i]',
+          'input[name*="loginId" i]',
+          'input[id*="loginId" i]',
         ].some((sel) => Array.from(document.querySelectorAll(sel)).some(isVisible));
         const url = String(window.location?.href || "");
         const title = String(document?.title || "");
         const hasLoginHint = /login|signin|sign-in|auth/i.test(url) || /login|sign in|signin/i.test(title);
         return hasPw || (hasUserish && hasLoginHint);
       }).catch(() => false);
-      if (!loginLike) return;
+    }
 
-      const secret = await loadCredential(domain);
-      if (!secret?.ok || !secret.hasCredential || !secret.password) return;
-
-      await page.evaluate(({ username, password, usernameToken, passwordToken }) => {
+    async function fillFrame(frame, secret) {
+      return frame.evaluate(({ username, password, usernameToken, passwordToken }) => {
         function isVisible(el) {
           try {
             return !!(el && el.offsetParent !== null);
@@ -358,12 +478,18 @@ module.exports = {
           'input[autocomplete*="email" i]',
           'input[name*="user" i]',
           'input[id*="user" i]',
+          'input[name*="userid" i]',
+          'input[id*="userid" i]',
           'input[name*="login" i]',
           'input[id*="login" i]',
+          'input[name*="loginid" i]',
+          'input[id*="loginid" i]',
           'input[placeholder*="email" i]',
           'input[placeholder*="user" i]',
+          'input[placeholder*="login" i]',
           'input[aria-label*="email" i]',
           'input[aria-label*="user" i]',
+          'input[aria-label*="login" i]',
           'input[type="text"]',
         ];
 
@@ -376,14 +502,38 @@ module.exports = {
           }
         }
 
-        setValue(userEl, username);
-        setValue(pwEl, password);
+        return {
+          usernameFilled: setValue(userEl, username),
+          passwordFilled: setValue(pwEl, password),
+        };
       }, {
         username: String(secret.username || ""),
         password: String(secret.password || ""),
         usernameToken: ${JSON.stringify(PLAYWRIGHT_LOGIN_USERNAME_SECRET)},
         passwordToken: ${JSON.stringify(PLAYWRIGHT_LOGIN_PASSWORD_SECRET)},
-      }).catch(() => {});
+      }).catch(() => ({ usernameFilled: false, passwordFilled: false }));
+    }
+
+    async function fillOnce() {
+      let pageDomain = "";
+      try {
+        pageDomain = new URL(page.url()).hostname.toLowerCase();
+      } catch {
+        return;
+      }
+      if (!pageDomain || !credentialDomainAllowed(pageDomain)) return;
+
+      const secret = await loadCredential(pageDomain);
+      if (!secret?.ok || !secret.hasCredential || !secret.password) return;
+
+      const frames = typeof page.frames === "function" ? page.frames() : [page.mainFrame()];
+      for (const frame of frames) {
+        const host = frameHost(frame);
+        if (host && !credentialDomainAllowed(host)) continue;
+        const loginLike = await frameLooksLoginLike(frame);
+        if (!loginLike) continue;
+        await fillFrame(frame, secret);
+      }
     }
 
     function scheduleFill() {
@@ -394,9 +544,7 @@ module.exports = {
 
     page.on("domcontentloaded", scheduleFill);
     page.on("load", scheduleFill);
-    page.on("framenavigated", (frame) => {
-      if (frame === page.mainFrame()) scheduleFill();
-    });
+    page.on("framenavigated", scheduleFill);
     const timer = setInterval(() => fillOnce().catch(() => {}), 1500);
     timer.unref?.();
     page.once("close", () => clearInterval(timer));
@@ -557,16 +705,14 @@ export async function runBrowserTaskViaPlaywright(opts) {
     await sleep(500);
   }
 
-  // Build the prompt: expose only Playwright MCP secret names, never values.
+  // Build the prompt: explain autofill availability without exposing values or
+  // passing Playwright MCP global secret substitutions.
   let credentialHint = "";
   const credentialSecrets = await preparePlaywrightCredentialSecrets(startUrl);
   if (credentialSecrets?.file) {
     credentialHint =
-      `\n\nIMPORTANT: Saved credentials are available locally for ${credentialSecrets.domain}, but their values are not visible to you.\n` +
-      `When a login form appears, use Playwright MCP's browser_type or browser_fill_form with these exact secret names as the text/value:\n` +
-      `- Username/email: ${PLAYWRIGHT_LOGIN_USERNAME_SECRET}\n` +
-      `- Password: ${PLAYWRIGHT_LOGIN_PASSWORD_SECRET}\n` +
-      `Playwright MCP will replace those names locally with the real saved credentials. Do not ask for, print, inspect, or reveal the actual password.\n`;
+      `\n\nIMPORTANT: Saved credentials can be auto-filled locally for ${credentialSecrets.domain} and related same-site login frames/subdomains, but their values are not visible to you.\n` +
+      `Do not rely on the browser profile password manager, type placeholder secret names, or ask for the password. If login moves to an unrelated host, stop and report the mismatch.\n`;
   }
 
   const startUrlInstruction = shouldContinueSession
@@ -587,7 +733,7 @@ export async function runBrowserTaskViaPlaywright(opts) {
     `- If the page seems "stuck" after a click (snapshot doesn't change), check browser_tabs — you may be on the wrong tab.\n` +
     `- NEVER repeat the same action more than 2 times when URL/title/snapshot are unchanged.\n` +
     `- If the page stays blank/about:blank or no progress is possible, STOP and return a blocked summary instead of looping.\n` +
-    `- If you encounter a login page, fill credentials step by step using the local secret names above when they are provided.\n` +
+    `- If you encounter a login page and local credential autofill is available, wait up to 8 seconds for autofill before continuing.\n` +
     `- When done, provide a clear text summary of what you found/accomplished.\n` +
     `- Always include a final status line in plain text: status=completed|partial|blocked plus what remains.`;
 
@@ -622,6 +768,9 @@ export async function runBrowserTaskViaPlaywright(opts) {
     profile: profileSlug,
     headless,
     continueSession: shouldContinueSession ? `${continueSessionId.slice(0, 8)}...` : null,
+    authMethod: cliToken ? "cli_token" : apiKey ? "api_key" : "local",
+    hasCliToken: !!cliToken,
+    hasApiKey: !!apiKey,
   });
 
   if (abortSignal?.aborted) {
@@ -645,14 +794,14 @@ export async function runBrowserTaskViaPlaywright(opts) {
     ...(userInitPage ? { GROOVY_PLAYWRIGHT_USER_INIT_PAGE: userInitPage } : {}),
     ...(credentialSecrets?.file
       ? {
-          PLAYWRIGHT_MCP_SECRETS_FILE: credentialSecrets.file,
-          PLAYWRIGHT_MCP_SECRETS: credentialSecrets.file,
+          [GROOVY_PLAYWRIGHT_AUTOFILL_SECRETS_FILE]: credentialSecrets.file,
+          GROOVY_PLAYWRIGHT_CREDENTIAL_DOMAIN: credentialSecrets.domain || "",
         }
       : {}),
   };
 
   try {
-    const spawnResult = await runHeadlessClaude({
+    const commonClaudeOptions = {
       prompt: fullPrompt,
       cwd: resolveClaudeCwd(opts),
       timeoutMs,
@@ -660,8 +809,6 @@ export async function runBrowserTaskViaPlaywright(opts) {
       model: cliModel,
       allowedTools: PLAYWRIGHT_ALLOWED_TOOLS,
       sessionId: shouldContinueSession ? continueSessionId : undefined,
-      apiKey: cliToken ? undefined : apiKey,
-      cliToken: cliToken || undefined,
       env: spawnEnv,
       abortSignal,
       onStreamEvent: (event) => {
@@ -672,7 +819,30 @@ export async function runBrowserTaskViaPlaywright(opts) {
           if (progress) emitProgress(progress);
         }
       },
+    };
+
+    let authFallbackUsed = false;
+    let spawnResult = await runHeadlessClaude({
+      ...commonClaudeOptions,
+      apiKey: cliToken ? undefined : apiKey,
+      cliToken: cliToken || undefined,
     });
+
+    if (
+      (cliToken || apiKey) &&
+      !abortSignal?.aborted &&
+      isInvalidClaudeAuthSpawnResult(spawnResult)
+    ) {
+      authFallbackUsed = true;
+      console.warn(
+        "[browser-task-playwright] provided Claude auth was rejected; retrying with local Claude CLI auth",
+        { authMethod: cliToken ? "cli_token" : "api_key" }
+      );
+      spawnResult = await runHeadlessClaude({
+        ...commonClaudeOptions,
+        localAuth: true,
+      });
+    }
 
     let resultText = "";
     let sessionId = "";
@@ -682,12 +852,14 @@ export async function runBrowserTaskViaPlaywright(opts) {
     let outputTokens = null;
     let totalTokens = null;
     let modelFromResult = "";
+    let resultIsError = false;
 
     const streamEvents = Array.isArray(spawnResult.streamEvents) ? spawnResult.streamEvents : [];
     for (const ev of streamEvents) {
       if (ev.type === "result") {
         resultText = typeof ev.result === "string" ? ev.result : JSON.stringify(ev.result);
         sessionId = ev.session_id || "";
+        resultIsError = ev.is_error === true;
         if (typeof ev.total_cost_usd === "number") totalCostUsd = ev.total_cost_usd;
         if (ev.usage && typeof ev.usage === "object") usageObj = ev.usage;
         if (typeof ev.model === "string" && ev.model.trim()) modelFromResult = ev.model.trim();
@@ -734,6 +906,8 @@ export async function runBrowserTaskViaPlaywright(opts) {
       sessionId: sessionId ? sessionId.slice(0, 8) + "..." : null,
       timedOut,
       aborted,
+      authFallbackUsed,
+      isError: resultIsError,
     });
 
     if (timedOut || aborted) {
@@ -753,6 +927,45 @@ export async function runBrowserTaskViaPlaywright(opts) {
           killedStaleChrome,
           timedOut,
           aborted,
+          authFallbackUsed,
+        },
+      };
+    }
+
+    const authErrorText = `${stderr}\n${text}`;
+    if (exitCode !== null && exitCode !== 0 && isClaudeInvalidAuthText(authErrorText)) {
+      return {
+        ok: false,
+        error: text || stderr.slice(0, 500) || "claude_auth_failed",
+        text,
+        sessionId,
+        partial: text.length > 0,
+        meta: {
+          exitCode,
+          signal: spawnResult.signal || null,
+          playwright: true,
+          profile: profileSlug,
+          killedStaleChrome,
+          authFallbackUsed,
+        },
+      };
+    }
+
+    if (resultIsError) {
+      return {
+        ok: false,
+        error: text || stderr.slice(0, 500) || "claude_run_error",
+        text,
+        sessionId,
+        partial: text.length > 0,
+        meta: {
+          exitCode,
+          signal: spawnResult.signal || null,
+          playwright: true,
+          profile: profileSlug,
+          killedStaleChrome,
+          authFallbackUsed,
+          isError: true,
         },
       };
     }
@@ -774,7 +987,7 @@ export async function runBrowserTaskViaPlaywright(opts) {
       output_tokens: typeof outputTokens === "number" ? outputTokens : undefined,
       total_tokens: typeof totalTokens === "number" ? totalTokens : undefined,
       usage: usageObj || undefined,
-      meta: { exitCode, playwright: true, profile: profileSlug, killedStaleChrome },
+      meta: { exitCode, playwright: true, profile: profileSlug, killedStaleChrome, authFallbackUsed },
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err || "browser_task_failed");

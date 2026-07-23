@@ -91,6 +91,92 @@ export async function listPidsByCommandFragment(commandFragment, options = {}) {
   }
 }
 
+export function summarizeProcessTreeMemory(records, rootPid) {
+  const targetPid = Number(rootPid);
+  if (!Number.isFinite(targetPid) || targetPid <= 0 || !Array.isArray(records)) return null;
+
+  const normalized = records
+    .map((record) => ({
+      pid: Number(record?.pid),
+      parentPid: Number(record?.parentPid),
+      rssBytes: Math.max(0, Number(record?.rssBytes) || 0),
+    }))
+    .filter((record) => Number.isFinite(record.pid) && record.pid > 0);
+  if (!normalized.some((record) => record.pid === targetPid)) return null;
+
+  const childrenByParent = new Map();
+  for (const record of normalized) {
+    const children = childrenByParent.get(record.parentPid) || [];
+    children.push(record.pid);
+    childrenByParent.set(record.parentPid, children);
+  }
+  const recordByPid = new Map(normalized.map((record) => [record.pid, record]));
+  const pending = [targetPid];
+  const visited = new Set();
+  let totalRssBytes = 0;
+  let maxRssBytes = 0;
+
+  while (pending.length > 0) {
+    const pid = pending.pop();
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    const record = recordByPid.get(pid);
+    if (record) {
+      totalRssBytes += record.rssBytes;
+      maxRssBytes = Math.max(maxRssBytes, record.rssBytes);
+    }
+    for (const childPid of childrenByParent.get(pid) || []) pending.push(childPid);
+  }
+
+  return {
+    rootPid: targetPid,
+    processCount: visited.size,
+    totalRssBytes,
+    maxRssBytes,
+  };
+}
+
+export async function getProcessTreeMemory(rootPid) {
+  const targetPid = Number(rootPid);
+  if (!Number.isFinite(targetPid) || targetPid <= 0) return null;
+
+  try {
+    if (isWindows) {
+      const script =
+        "Get-CimInstance Win32_Process | ForEach-Object { " +
+        "Write-Output (\"{0}|{1}|{2}\" -f $_.ProcessId,$_.ParentProcessId,$_.WorkingSetSize) }";
+      const { stdout } = await execFileAsync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        { windowsHide: true, timeout: 7000, maxBuffer: 5 * 1024 * 1024 }
+      );
+      const records = String(stdout || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim().split("|").map(Number))
+        .filter((parts) => parts.length === 3 && parts.every(Number.isFinite))
+        .map(([pid, parentPid, rssBytes]) => ({ pid, parentPid, rssBytes }));
+      return summarizeProcessTreeMemory(records, targetPid);
+    }
+
+    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=,ppid=,rss="], {
+      timeout: 7000,
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    const records = String(stdout || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim().split(/\s+/).map(Number))
+      .filter((parts) => parts.length === 3 && parts.every(Number.isFinite))
+      .map(([pid, parentPid, rssKb]) => ({
+        pid,
+        parentPid,
+        rssBytes: rssKb * 1024,
+      }));
+    return summarizeProcessTreeMemory(records, targetPid);
+  } catch {
+    return null;
+  }
+}
+
 export async function killProcessTree(pid, options = {}) {
   const targetPid = Number(pid);
   if (!Number.isFinite(targetPid) || targetPid <= 0) return false;

@@ -8,9 +8,16 @@ import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
 import { execPortableCommand } from "./platform/shell/index.mjs";
 import {
+  getProcessTreeMemory,
   killProcessesByCommandFragment,
   removeSingletonLocks,
 } from "./platform/process/index.mjs";
+import {
+  getWhatsAppRecycleCheckIntervalMs,
+  getWhatsAppRecycleDecision,
+  getWhatsAppRecycleRetryCooldownMs,
+  shouldCheckWhatsAppRecycle,
+} from "./platform/whatsapp/recycle.mjs";
 import { runHeadlessClaude } from "./platform/claude/runHeadless.mjs";
 
 import {
@@ -63,6 +70,21 @@ import {
 import { sqliteExec, sqliteQuery, sqliteListDbs } from "./sqlitedb.mjs";
 import { sqliteProjectList, sqliteProjectGetOrCreate, sqliteProjectUpdate } from "./sqliteProjects.mjs";
 
+let activeWhatsAppBridgeGeneration = 0;
+const whatsappBridgeGenerationCleanups = new Map();
+
+function deactivateOlderWhatsAppBridgeGenerations(currentGeneration) {
+  for (const [generation, cleanup] of whatsappBridgeGenerationCleanups.entries()) {
+    if (generation >= currentGeneration) continue;
+    whatsappBridgeGenerationCleanups.delete(generation);
+    try {
+      cleanup?.("superseded");
+    } catch {
+      // ignore stale bridge cleanup failures
+    }
+  }
+}
+
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -90,6 +112,41 @@ function formatErrorWithCause(err) {
     return causeText && causeText !== err.message ? `${err.message} | cause: ${causeText}` : err.message;
   }
   return String(err || "unknown_error");
+}
+
+function isTimeoutLikeNetworkErrorText(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("headers timeout") ||
+    text.includes("body timeout") ||
+    text.includes("und_err_headers_timeout") ||
+    text.includes("und_err_body_timeout") ||
+    text.includes("request timeout") ||
+    text.includes("request timed out")
+  );
+}
+
+function classifyWhatsAppApiNetworkError(err, timeoutMs) {
+  const errText = formatErrorWithCause(err) || "fetch failed";
+  const cause =
+    err && typeof err === "object" && "cause" in err && err.cause != null
+      ? err.cause
+      : null;
+  const causeCode =
+    cause && typeof cause === "object" && "code" in cause ? String(cause.code || "") : "";
+  const causeName =
+    cause && typeof cause === "object" && "name" in cause ? String(cause.name || "") : "";
+  const timedOut =
+    (err instanceof Error && err.name === "AbortError") ||
+    isTimeoutLikeNetworkErrorText(errText) ||
+    isTimeoutLikeNetworkErrorText(causeCode) ||
+    isTimeoutLikeNetworkErrorText(causeName);
+  return {
+    error: timedOut ? `request_timeout_${timeoutMs}ms` : errText,
+    rawError: errText,
+    timedOut,
+  };
 }
 
 function isPrivateIpAddress(ip) {
@@ -714,6 +771,18 @@ function extractCommand(msg, prefix) {
   return withoutPrefix.replace(/\s+/g, " ").trim();
 }
 
+function hasLeadingCommand(msg, prefix) {
+  const t = normalizeText(msg).toLowerCase();
+  const lowerPrefix = String(prefix || "").trim().toLowerCase();
+  if (!t || !lowerPrefix) return false;
+  if (t === lowerPrefix || t.startsWith(`${lowerPrefix} `)) return true;
+  if (lowerPrefix.startsWith("@")) {
+    const withoutAt = lowerPrefix.slice(1);
+    return t === withoutAt || t.startsWith(`${withoutAt} `);
+  }
+  return false;
+}
+
 function resolveGroupName(opts) {
   return (
     opts.groupName ||
@@ -730,6 +799,44 @@ function resolveAppUrl(opts) {
     process.env.NEXT_PUBLIC_APP_URL ||
     "";
   return raw.trim().replace(/\/+$/, "");
+}
+
+function parseEnvSwitch(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  if (["1", "true", "yes", "on", "enabled"].includes(raw)) return true;
+  if (["0", "false", "no", "off", "disabled"].includes(raw)) return false;
+  return null;
+}
+
+function hasProcessFlag(flag) {
+  return process.argv.includes(flag);
+}
+
+function hasExistingWhatsAppSession(dataPath = getDataPath()) {
+  const sessionPath = path.join(dataPath, "session");
+  try {
+    return fs.existsSync(sessionPath);
+  } catch {
+    return false;
+  }
+}
+
+function resolveWhatsAppHeadless(opts = {}, dataPath = getDataPath()) {
+  if (opts.headless === false || opts.headed === true) return false;
+  if (hasProcessFlag("--whatsapp-headed")) return false;
+  const envValue = parseEnvSwitch(process.env.GROOVY_WHATSAPP_HEADLESS);
+  if (envValue === false) return false;
+  if (envValue === true) return "new";
+  if (!hasExistingWhatsAppSession(dataPath)) return false;
+  return "new";
+}
+
+function resolveWhatsAppBlockImages(opts = {}) {
+  if (opts.blockImages === false) return false;
+  const envValue = parseEnvSwitch(process.env.GROOVY_WHATSAPP_BLOCK_IMAGES);
+  if (envValue === false) return false;
+  return true;
 }
 
 function resolveWhatsAppWebVersion() {
@@ -787,6 +894,37 @@ const WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES = Number.parseInt(
   process.env.WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES || "",
   10
 );
+const WHATSAPP_INBOUND_POLL_INTERVAL_MS = Number.parseInt(
+  process.env.WHATSAPP_INBOUND_POLL_INTERVAL_MS || "",
+  10
+);
+const WHATSAPP_INBOUND_POLL_LIMIT = Number.parseInt(
+  process.env.WHATSAPP_INBOUND_POLL_LIMIT || "",
+  10
+);
+const WHATSAPP_INBOUND_POLL_LOOKBACK_MS = Number.parseInt(
+  process.env.WHATSAPP_INBOUND_POLL_LOOKBACK_MS || "",
+  10
+);
+const WHATSAPP_RECYCLE_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_MS || "",
+  10
+);
+const WHATSAPP_RECYCLE_IDLE_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_IDLE_MS || "",
+  10
+);
+const WHATSAPP_RECYCLE_MAX_AGE_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_MAX_AGE_MS || "",
+  10
+);
+const WHATSAPP_RECYCLE_MEMORY_MB = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_MEMORY_MB || "",
+  10
+);
+
+const WHATSAPP_VIEWPORT_WIDTH = 1280;
+const WHATSAPP_VIEWPORT_HEIGHT = 800;
 
 function resolveWhatsAppApiAttempts() {
   if (Number.isFinite(WHATSAPP_API_MAX_ATTEMPTS) && WHATSAPP_API_MAX_ATTEMPTS >= 1) {
@@ -827,6 +965,64 @@ function resolveWhatsAppApiTimeoutAutoRecoveries() {
     return Math.min(12, Math.trunc(WHATSAPP_API_TIMEOUT_AUTO_RECOVERIES));
   }
   return 3;
+}
+
+function resolveWhatsAppInboundPollIntervalMs() {
+  if (Number.isFinite(WHATSAPP_INBOUND_POLL_INTERVAL_MS)) {
+    if (WHATSAPP_INBOUND_POLL_INTERVAL_MS <= 0) return 0;
+    return Math.max(5000, Math.min(120_000, Math.floor(WHATSAPP_INBOUND_POLL_INTERVAL_MS)));
+  }
+  return 15_000;
+}
+
+function resolveWhatsAppInboundPollLimit() {
+  if (Number.isFinite(WHATSAPP_INBOUND_POLL_LIMIT) && WHATSAPP_INBOUND_POLL_LIMIT > 0) {
+    return Math.max(3, Math.min(30, Math.floor(WHATSAPP_INBOUND_POLL_LIMIT)));
+  }
+  return 10;
+}
+
+function resolveWhatsAppInboundPollLookbackMs() {
+  if (Number.isFinite(WHATSAPP_INBOUND_POLL_LOOKBACK_MS) && WHATSAPP_INBOUND_POLL_LOOKBACK_MS > 0) {
+    return Math.max(30_000, Math.min(15 * 60_000, Math.floor(WHATSAPP_INBOUND_POLL_LOOKBACK_MS)));
+  }
+  return 2 * 60_000;
+}
+
+function resolveWhatsAppRecycleMs() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_MS)) {
+    if (WHATSAPP_RECYCLE_MS <= 0) return 0;
+    return Math.max(60_000, Math.min(24 * 60 * 60_000, Math.floor(WHATSAPP_RECYCLE_MS)));
+  }
+  return 6 * 60 * 60_000;
+}
+
+function resolveWhatsAppRecycleIdleMs() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_IDLE_MS)) {
+    if (WHATSAPP_RECYCLE_IDLE_MS <= 0) return 0;
+    return Math.max(10_000, Math.min(60 * 60_000, Math.floor(WHATSAPP_RECYCLE_IDLE_MS)));
+  }
+  return 5 * 60_000;
+}
+
+function resolveWhatsAppRecycleMaxAgeMs() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_MAX_AGE_MS)) {
+    if (WHATSAPP_RECYCLE_MAX_AGE_MS <= 0) return 0;
+    return Math.max(
+      5 * 60_000,
+      Math.min(24 * 60 * 60_000, Math.floor(WHATSAPP_RECYCLE_MAX_AGE_MS))
+    );
+  }
+  return 8 * 60 * 60_000;
+}
+
+function resolveWhatsAppRecycleMemoryLimitBytes() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_MEMORY_MB)) {
+    if (WHATSAPP_RECYCLE_MEMORY_MB <= 0) return 0;
+    const boundedMb = Math.max(512, Math.min(32 * 1024, WHATSAPP_RECYCLE_MEMORY_MB));
+    return Math.floor(boundedMb * 1024 * 1024);
+  }
+  return 5 * 1024 ** 3;
 }
 
 function buildWhatsAppIngressTraceId(messageLike) {
@@ -894,9 +1090,8 @@ async function callWhatsAppApi({ baseUrl, deviceToken, body, allowRetries = fals
       }
       return { ok: false, status: res.status, error: baseErr };
     } catch (e) {
-      const errText = formatErrorWithCause(e);
-      const timedOut = e instanceof Error && e.name === "AbortError";
-      lastNetworkErr = timedOut ? `request_timeout_${timeoutMs}ms` : errText || "fetch failed";
+      const classified = classifyWhatsAppApiNetworkError(e, timeoutMs);
+      lastNetworkErr = classified.error || "fetch failed";
       if (attempt < maxAttempts) {
         const waitMs = whatsappApiRetryDelayMs(attempt);
         warn(
@@ -905,7 +1100,14 @@ async function callWhatsAppApi({ baseUrl, deviceToken, body, allowRetries = fals
         await sleep(waitMs);
         continue;
       }
-      return { ok: false, status: 0, error: lastNetworkErr, timedOut, timeoutMs };
+      return {
+        ok: false,
+        status: 0,
+        error: lastNetworkErr,
+        rawError: classified.rawError,
+        timedOut: classified.timedOut,
+        timeoutMs,
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -1392,21 +1594,32 @@ async function executeConnectorRpc({
       const prompt = String(p.prompt || "").trim();
       const cwd = typeof p.cwd === "string" && p.cwd.trim() ? p.cwd.trim() : os.homedir();
       const apiKey = typeof p.api_key === "string" ? p.api_key.trim() : "";
+      const cliToken = typeof p.cli_token === "string" ? p.cli_token.trim() : "";
       const allowedTools = typeof p.allowed_tools === "string" ? p.allowed_tools.trim() : "Read,Edit,Bash";
-      const timeoutMs = Number.isFinite(Number(p.timeout_ms)) ? Number(p.timeout_ms) : 5 * 60 * 1000;
+      const timeoutMs = Number.isFinite(Number(p.timeout_ms)) ? Number(p.timeout_ms) : 20 * 60 * 1000;
       const sessionId = typeof p.session_id === "string" ? p.session_id.trim() : "";
 
       if (!prompt) return { ok: false, error: "missing_prompt" };
-      if (!apiKey) return { ok: false, error: "missing_api_key" };
+      if (!apiKey && !cliToken) return { ok: false, error: "missing_api_key_or_cli_token" };
 
       const startedAt = Date.now();
+      const useCliToken = !!cliToken;
       try {
-        log("claude_run starting", { cwd, promptLen: prompt.length, allowedTools, sessionId: sessionId ? sessionId.slice(0, 8) + "..." : null });
+        log("claude_run starting", {
+          cwd,
+          promptLen: prompt.length,
+          allowedTools,
+          sessionId: sessionId ? sessionId.slice(0, 8) + "..." : null,
+          authMethod: useCliToken ? "cli_token" : "api_key",
+          hasCliToken: !!cliToken,
+          hasApiKey: !!apiKey,
+        });
         const spawnResult = await runHeadlessClaude({
           prompt,
           cwd,
           timeoutMs,
-          apiKey,
+          apiKey: useCliToken ? undefined : apiKey,
+          cliToken: useCliToken ? cliToken : undefined,
           allowedTools,
           sessionId: sessionId || undefined,
           onAssistantText: (assistantText) => {
@@ -1808,6 +2021,7 @@ function getWelcomeHash() {
 
 // Track messages we sent to avoid loops
 const recentBotSends = new Map();
+const recentHandledIngressMessages = new Map();
 const twilioFollowupWatchersByThread = new Map(); // threadKey -> watcherToken
 const groovyContinuationsByThread = new Map();
 const codeContinuationsByThread = new Map();
@@ -1874,7 +2088,8 @@ function buildContinuationPauseReply({ commandPrefix, roundBudget, traceId }) {
 }
 
 function isWhatsAppApiTimeoutError(error) {
-  return /^request_timeout_\d+ms$/i.test(String(error || "").trim());
+  const text = String(error || "").trim();
+  return /^request_timeout_\d+ms$/i.test(text) || isTimeoutLikeNetworkErrorText(text);
 }
 
 function buildContinuationTimeoutReply({ commandPrefix, timeoutMs, traceId }) {
@@ -1908,6 +2123,55 @@ function wasRecentlyBotSent(text) {
   const key = sha256Hex(normalizeText(text));
   const ts = recentBotSends.get(key);
   return typeof ts === "number" && Date.now() - ts < 60_000;
+}
+
+function getMessageStableId(messageLike) {
+  const msg = messageLike && typeof messageLike === "object" ? messageLike : {};
+  const serialized =
+    typeof msg.id?._serialized === "string" && msg.id._serialized.trim()
+      ? msg.id._serialized.trim()
+      : "";
+  if (serialized) return serialized;
+  const id = typeof msg.id?.id === "string" && msg.id.id.trim() ? msg.id.id.trim() : "";
+  const remote =
+    typeof msg.id?.remote === "string" && msg.id.remote.trim() ? msg.id.remote.trim() : "";
+  const timestamp = Number(msg.timestamp || 0);
+  if (id && remote) return `${remote}:${id}`;
+  if (id) return id;
+  if (remote && Number.isFinite(timestamp) && timestamp > 0) {
+    return `${remote}:${Math.trunc(timestamp)}:${sha256Hex(normalizeText(msg.body || "")).slice(0, 16)}`;
+  }
+  return "";
+}
+
+function getMessageChatIdHint(messageLike) {
+  const message = messageLike && typeof messageLike === "object" ? messageLike : {};
+  const idRemote =
+    typeof message.id?.remote === "string" ? message.id.remote.trim() : "";
+  if (idRemote) return idRemote;
+  const directionalId = message.fromMe === true ? message.to : message.from;
+  return typeof directionalId === "string" ? directionalId.trim() : "";
+}
+
+function pruneHandledIngressMessages(now = Date.now()) {
+  for (const [id, ts] of recentHandledIngressMessages.entries()) {
+    if (now - Number(ts || 0) > 30 * 60_000) recentHandledIngressMessages.delete(id);
+  }
+}
+
+function wasIngressMessageHandled(messageId) {
+  const id = String(messageId || "").trim();
+  if (!id) return false;
+  pruneHandledIngressMessages();
+  return recentHandledIngressMessages.has(id);
+}
+
+function rememberIngressMessageHandled(messageId) {
+  const id = String(messageId || "").trim();
+  if (!id) return;
+  const now = Date.now();
+  recentHandledIngressMessages.set(id, now);
+  pruneHandledIngressMessages(now);
 }
 
 // Follow-up window for heartbeat prompts:
@@ -2091,6 +2355,7 @@ async function handleCodeMessage({
 
   let traceId = pausedContinuation?.traceId || initialTraceId || null;
   let toolResults = cloneToolResults(pausedContinuation?.toolResults);
+  let deferredCodePrompt = String(pausedContinuation?.deferredCodePrompt || "");
   const promptForRound = pausedContinuation ? "" : userPrompt;
   let timeoutRecoveryCount = 0;
   const saveCodeContinuation = (extra = {}) => {
@@ -2100,6 +2365,7 @@ async function handleCodeMessage({
       terminalId,
       workspaceRootPath,
       toolResults: cloneToolResults(toolResults),
+      deferredCodePrompt,
       ...extra,
     });
   };
@@ -2149,6 +2415,7 @@ async function handleCodeMessage({
   });
   const roundBudget = resolveWhatsAppOrchestratorRoundBudget();
   for (let round = 0; round < roundBudget; round++) {
+    const messageForRound = deferredCodePrompt || (round === 0 ? promptForRound : "");
     const body = {
       provider: "whatsapp_web",
       connectorPlatform:
@@ -2164,16 +2431,20 @@ async function handleCodeMessage({
         terminalId,
         workspaceRootPath,
       },
-      message: round === 0 ? promptForRound : "",
+      message: messageForRound,
       toolResults: toolResults.length ? toolResults : undefined,
       traceId: traceId || undefined,
     };
+    deferredCodePrompt = "";
 
     const res2 = await callWhatsAppApi({ baseUrl, deviceToken, body });
     if (!res2.ok) {
       if (res2.timedOut === true || isWhatsAppApiTimeoutError(res2.error)) {
         const timeoutMs = res2.timeoutMs || resolveWhatsAppApiTimeoutMs();
         const maxTimeoutRecoveries = resolveWhatsAppApiTimeoutAutoRecoveries();
+        if (messageForRound && toolResults.length === 0) {
+          deferredCodePrompt = messageForRound;
+        }
         if (timeoutRecoveryCount < maxTimeoutRecoveries) {
           timeoutRecoveryCount += 1;
           saveCodeContinuation({ timeoutRecoveryCount });
@@ -2181,6 +2452,7 @@ async function handleCodeMessage({
             chatId,
             traceId,
             timeoutMs,
+            rawError: res2.rawError || null,
             timeoutRecoveryCount,
             maxTimeoutRecoveries,
             toolResultCount: toolResults.length,
@@ -2220,6 +2492,9 @@ async function handleCodeMessage({
 
     if (data2.kind === "final") {
       clearContinuation(codeContinuationsByThread, chatId);
+      if (Array.isArray(data2.progressMessages)) {
+        for (const msg of data2.progressMessages) await sendProgress(String(msg));
+      }
       reply =
         String(data2.reply || "").trim() ||
         "I ran into an internal processing error. Please retry your @code message.";
@@ -2241,7 +2516,11 @@ async function handleCodeMessage({
         reply = String(data2.partialText || "").trim() || "(no response - tool execution issue)";
         break;
       }
-      if (data2.statusMessage) await sendProgress(String(data2.statusMessage));
+      if (Array.isArray(data2.progressMessages)) {
+        for (const msg of data2.progressMessages) await sendProgress(String(msg));
+      } else if (data2.statusMessage) {
+        await sendProgress(String(data2.statusMessage));
+      }
       for (const ex of execs) {
         log("code/relay_exec", { traceId, connectorType: ex.connectorType, toolName: ex.toolName });
         await sendProgress(connectorExecuteStatusText(ex));
@@ -2342,6 +2621,35 @@ export async function startWhatsAppBridge(opts = {}) {
     return;
   }
 
+  const bridgeGeneration = ++activeWhatsAppBridgeGeneration;
+  deactivateOlderWhatsAppBridgeGenerations(bridgeGeneration);
+  let bridgeStopped = false;
+  const bridgeTimers = new Set();
+  const isCurrentBridgeGeneration = () =>
+    bridgeGeneration === activeWhatsAppBridgeGeneration && !bridgeStopped;
+  const trackBridgeTimer = (timer) => {
+    if (!timer) return timer;
+    if (bridgeStopped) {
+      clearTimeout(timer);
+      clearInterval(timer);
+      return timer;
+    }
+    bridgeTimers.add(timer);
+    return timer;
+  };
+  const stopBridgeRuntime = (reason = "stopped") => {
+    if (bridgeStopped) return;
+    bridgeStopped = true;
+    for (const timer of bridgeTimers) {
+      clearTimeout(timer);
+      clearInterval(timer);
+    }
+    bridgeTimers.clear();
+    whatsappBridgeGenerationCleanups.delete(bridgeGeneration);
+    log("WhatsApp bridge runtime stopped", { reason, generation: bridgeGeneration });
+  };
+  whatsappBridgeGenerationCleanups.set(bridgeGeneration, stopBridgeRuntime);
+
   const dataPath = getDataPath();
 
   if (resetSession) {
@@ -2355,7 +2663,28 @@ export async function startWhatsAppBridge(opts = {}) {
 
   fs.mkdirSync(dataPath, { recursive: true });
 
-  log("starting WhatsApp Web bridge", { groupName, appUrl, dataPath });
+  const hasExistingSession = hasExistingWhatsAppSession(dataPath);
+  const whatsappHeadless = resolveWhatsAppHeadless(opts, dataPath);
+  const blockImages = resolveWhatsAppBlockImages(opts);
+  const recycleIntervalMs = resolveWhatsAppRecycleMs();
+  const recycleIdleMs = resolveWhatsAppRecycleIdleMs();
+  const recycleMaxAgeMs = resolveWhatsAppRecycleMaxAgeMs();
+  const recycleMemoryLimitBytes = resolveWhatsAppRecycleMemoryLimitBytes();
+  const recycleCheckIntervalMs = getWhatsAppRecycleCheckIntervalMs(recycleIntervalMs);
+
+  log("starting WhatsApp Web bridge", {
+    groupName,
+    appUrl,
+    dataPath,
+    headless: whatsappHeadless,
+    hasExistingSession,
+    blockImages,
+    recycleIntervalMs,
+    recycleIdleMs,
+    recycleMaxAgeMs,
+    recycleMemoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+    recycleCheckIntervalMs,
+  });
   emitHealth("recovering", "starting", "Starting WhatsApp Web bridge");
 
   // Kill any stale browser processes from previous runs (prevents "browser already running" errors)
@@ -2401,17 +2730,33 @@ export async function startWhatsAppBridge(opts = {}) {
     // path while never finishing Store bootstrap on current WhatsApp Web.
     userAgent: false,
     puppeteer: {
-    headless: false,
-    ...(browserExecutable ? { executablePath: browserExecutable } : {}),
-    // 4 min: cold boots after app updates can be significantly slower on some Macs.
-    // A higher timeout avoids false-negative startup failures that require manual restarts.
-    protocolTimeout: 240_000,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--window-position=0,0",
-      "--window-size=1650,1050",
-    ],
+      headless: whatsappHeadless,
+      ...(browserExecutable ? { executablePath: browserExecutable } : {}),
+      // 4 min: cold boots after app updates can be significantly slower on some Macs.
+      // A higher timeout avoids false-negative startup failures that require manual restarts.
+      protocolTimeout: 240_000,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--disable-gpu",
+        "--mute-audio",
+        "--hide-scrollbars",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--use-fake-device-for-media-stream",
+        "--disable-features=MediaFoundationVideoCapture,AudioServiceOutOfProcess",
+        "--disable-blink-features=AutomationControlled",
+        "--js-flags=--max-old-space-size=256",
+        "--window-position=0,0",
+        `--window-size=${WHATSAPP_VIEWPORT_WIDTH},${WHATSAPP_VIEWPORT_HEIGHT}`,
+      ],
+      defaultViewport: {
+        width: WHATSAPP_VIEWPORT_WIDTH,
+        height: WHATSAPP_VIEWPORT_HEIGHT,
+        deviceScaleFactor: 1,
+      },
     },
   };
   const webVersionCachePath = path.join(getDataPath(), ".wwebjs_cache");
@@ -2442,6 +2787,174 @@ export async function startWhatsAppBridge(opts = {}) {
   let qrPending = false;
   let authFailureText = "";
   let disconnectedReason = "";
+  let resourceThrottlingInstalled = false;
+  let resourceThrottlingInstalling = false;
+  let activeBridgeOperations = 0;
+  let lastBridgeActivityAtMs = Date.now();
+  let recycleInFlight = false;
+  let recycleRecoveryPending = false;
+  let lastRecycleAtMs = Date.now();
+  let lastRecycleAttemptAtMs = 0;
+  let lastRecycleCheckAtMs = 0;
+
+  function noteBridgeActivity() {
+    lastBridgeActivityAtMs = Date.now();
+  }
+
+  function beginBridgeActivity({ countsTowardIdle = true } = {}) {
+    activeBridgeOperations += 1;
+    if (countsTowardIdle) noteBridgeActivity();
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      activeBridgeOperations = Math.max(0, activeBridgeOperations - 1);
+      if (countsTowardIdle) noteBridgeActivity();
+    };
+  }
+
+  async function installPostAuthResourceThrottling(reason = "ready") {
+    if (!blockImages || resourceThrottlingInstalled || resourceThrottlingInstalling) return;
+    if (!isCurrentBridgeGeneration()) return;
+    const page = client?.pupPage;
+    if (!page || typeof page.setRequestInterception !== "function") return;
+    resourceThrottlingInstalling = true;
+    try {
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const resourceType =
+          req && typeof req.resourceType === "function" ? String(req.resourceType() || "") : "";
+        if (resourceType === "image" || resourceType === "media") {
+          req.abort().catch(() => {});
+          return;
+        }
+        req.continue().catch(() => {});
+      });
+      resourceThrottlingInstalled = true;
+      log("WhatsApp resource throttling enabled", { reason });
+    } catch (e) {
+      warn("failed to enable WhatsApp resource throttling:", e instanceof Error ? e.message : String(e));
+    } finally {
+      resourceThrottlingInstalling = false;
+    }
+  }
+
+  async function maybeRecycleWhatsAppPage(reason = "interval") {
+    if (recycleIntervalMs <= 0) return;
+    if (!isCurrentBridgeGeneration() || recycleInFlight) return;
+    const now = Date.now();
+    if (
+      !shouldCheckWhatsAppRecycle({
+        nowMs: now,
+        lastCheckAtMs: lastRecycleCheckAtMs,
+        checkIntervalMs: recycleCheckIntervalMs,
+        activeBridgeOperations,
+      })
+    ) {
+      return;
+    }
+    lastRecycleCheckAtMs = now;
+    const browserPid = Number(client?.pupBrowser?.process?.()?.pid || 0);
+    const browserMemory =
+      recycleMemoryLimitBytes > 0 && browserPid > 0
+        ? await getProcessTreeMemory(browserPid)
+        : null;
+    const decision = getWhatsAppRecycleDecision({
+      nowMs: now,
+      lastRecycleAtMs,
+      lastBridgeActivityAtMs,
+      recycleIntervalMs,
+      recycleIdleMs,
+      recycleMaxAgeMs,
+      memoryRssBytes: browserMemory?.totalRssBytes || 0,
+      memoryLimitBytes: recycleMemoryLimitBytes,
+      activeBridgeOperations,
+      ready: readyResolved,
+      qrPending,
+      authFailure: !!authFailureText,
+      disconnected: !!disconnectedReason,
+      recoveryPending: recycleRecoveryPending,
+    });
+    if (!decision.due) return;
+    const retryCooldownMs = getWhatsAppRecycleRetryCooldownMs(
+      decision.reason,
+      recycleIntervalMs
+    );
+    if (lastRecycleAttemptAtMs && now - lastRecycleAttemptAtMs < retryCooldownMs) return;
+
+    const page = client?.pupPage;
+    const pageUnavailable =
+      !page || (typeof page.isClosed === "function" && page.isClosed());
+    if (pageUnavailable && decision.reason !== "recovery_retry") return;
+
+    recycleInFlight = true;
+    lastRecycleAttemptAtMs = now;
+    const endActivity = beginBridgeActivity();
+    try {
+      log("recycling WhatsApp Web browser", {
+        reason,
+        trigger: decision.reason,
+        forced: decision.forced,
+        ageMs: decision.ageMs,
+        idleMs: decision.idleMs,
+        recycleIntervalMs,
+        recycleMaxAgeMs,
+        browserPid: browserMemory?.rootPid || browserPid || null,
+        browserProcessCount: browserMemory?.processCount || null,
+        browserRssMb: browserMemory
+          ? Math.round(browserMemory.totalRssBytes / 1024 / 1024)
+          : null,
+        browserMaxProcessRssMb: browserMemory
+          ? Math.round(browserMemory.maxRssBytes / 1024 / 1024)
+          : null,
+        recycleMemoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+      });
+      storeReadyResolved = false;
+      readyResolved = false;
+      readySignalSeen = false;
+      lastOperationalReadyError = "";
+      lastLoggedOperationalReadyError = "";
+      emitHealth("recovering", "page_recycle", "Restarting WhatsApp Web browser session");
+
+      resourceThrottlingInstalled = false;
+      resourceThrottlingInstalling = false;
+      client._readyEmitted = false;
+      client._authEventListenersInjected = false;
+      await client.destroy();
+      await killStaleBrowserForSession();
+      clearCorruptedSessionCaches();
+      qrPending = false;
+      authFailureText = "";
+      disconnectedReason = "";
+      await client.initialize();
+      lastRecycleAtMs = Date.now();
+      await installPostAuthResourceThrottling("page_recycle");
+      const ready = await waitForOperationalReadyForSend(120_000, "page_recycle", {
+        requireTargetBinding: true,
+      });
+      if (ready?.ok) {
+        recycleRecoveryPending = false;
+        noteBridgeActivity();
+        log("WhatsApp Web browser recycle completed", {
+          trigger: decision.reason,
+          detail: ready.detail || "",
+        });
+      } else {
+        recycleRecoveryPending = true;
+        const err =
+          ready && typeof ready === "object" && typeof ready.error === "string"
+            ? ready.error
+            : "page_recycle_ready_failed";
+        warn("WhatsApp Web browser recycle did not reach ready:", err);
+      }
+    } catch (e) {
+      recycleRecoveryPending = true;
+      warn("WhatsApp Web browser recycle failed:", e instanceof Error ? e.message : String(e));
+    } finally {
+      endActivity();
+      recycleInFlight = false;
+    }
+  }
 
   function buildOperationalReadyDetail(source, detail = "") {
     const base =
@@ -2493,6 +3006,26 @@ export async function startWhatsAppBridge(opts = {}) {
     // Store is reachable, which is the only thing this probe validates.
     if (requireTargetBinding && targetChatId) {
       try {
+        const rawTargetLoaded = await client.pupPage.evaluate(async (chatId) => {
+          if (!window.WWebJS || typeof window.WWebJS.getChat !== "function") return false;
+          return !!(await window.WWebJS.getChat(chatId, { getAsModel: false }));
+        }, targetChatId);
+        if (rawTargetLoaded) {
+          return {
+            ok: true,
+            detail: readySignalSeen
+              ? `chat_id=${targetChatId}; target_bound=1; raw_store=1`
+              : `chat_id=${targetChatId}; raw_store=1`,
+          };
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isDeadStoreError(msg)) {
+          return { ok: false, error: "whatsapp_store_not_ready", detail: msg };
+        }
+      }
+
+      try {
         const directTarget = await client.getChatById(targetChatId);
         if (directTarget) {
           return {
@@ -2507,7 +3040,10 @@ export async function startWhatsAppBridge(opts = {}) {
         if (isDeadStoreError(msg)) {
           return { ok: false, error: "whatsapp_store_not_ready", detail: msg };
         }
-        return { ok: false, error: msg };
+        // WhatsApp's dynamically loaded chat resolver can transiently reject
+        // with a minified value such as "r" even when the cached chat list is
+        // usable. Continue to the list lookup below before declaring the
+        // bridge unhealthy.
       }
     }
 
@@ -2565,20 +3101,30 @@ export async function startWhatsAppBridge(opts = {}) {
 
   async function ensureOperationalReady(
     source = "startup",
-    { requireTargetBinding = false, allowQrPending = false } = {}
+    { requireTargetBinding = false, allowQrPending = false, timeoutMs = 0 } = {}
   ) {
     if (requireTargetBinding && readyResolved) return { ok: true };
     if (!requireTargetBinding && (storeReadyResolved || readyResolved)) return { ok: true };
 
+    const boundedTimeoutMs =
+      Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+        ? Math.max(1, Math.trunc(Number(timeoutMs)))
+        : 0;
+    const deadlineMs = boundedTimeoutMs > 0 ? Date.now() + boundedTimeoutMs : 0;
     let delayMs = 500;
     while (requireTargetBinding ? !readyResolved : !storeReadyResolved && !readyResolved) {
+      if (deadlineMs > 0 && Date.now() >= deadlineMs) {
+        return { ok: false, error: `operational_ready_timeout:${boundedTimeoutMs}ms` };
+      }
       const probe = await probeOperationalReadyOnce({ requireTargetBinding });
       if (probe.ok) {
+        recycleRecoveryPending = false;
         lastOperationalReadyError = "";
         lastLoggedOperationalReadyError = "";
         qrPending = false;
         authFailureText = "";
         disconnectedReason = "";
+        await installPostAuthResourceThrottling(source);
         if (!storeReadyResolved) {
           storeReadyResolved = true;
         }
@@ -2610,8 +3156,14 @@ export async function startWhatsAppBridge(opts = {}) {
           error: lastOperationalReadyError,
         });
       }
+      const sleepMs =
+        deadlineMs > 0 ? Math.min(delayMs, Math.max(0, deadlineMs - Date.now())) : delayMs;
+      if (sleepMs <= 0 && deadlineMs > 0) {
+        return { ok: false, error: `operational_ready_timeout:${boundedTimeoutMs}ms` };
+      }
+
       if (lastOperationalReadyError === "whatsapp_qr_required" && allowQrPending) {
-        await sleep(delayMs);
+        await sleep(sleepMs);
         delayMs = Math.min(5000, Math.round(delayMs * 1.5));
         continue;
       }
@@ -2623,7 +3175,7 @@ export async function startWhatsAppBridge(opts = {}) {
         return { ok: false, error: lastOperationalReadyError };
       }
 
-      await sleep(delayMs);
+      await sleep(sleepMs);
       delayMs = Math.min(5000, Math.round(delayMs * 1.5));
     }
 
@@ -2659,9 +3211,10 @@ export async function startWhatsAppBridge(opts = {}) {
       return { ok: true };
     }
 
+    const boundedTimeoutMs = Math.max(1, Math.trunc(Number(timeoutMs) || 30000));
     const outcome = await Promise.race([
-      ensureOperationalReady(source, { requireTargetBinding }),
-      sleep(timeoutMs).then(() => null),
+      ensureOperationalReady(source, { requireTargetBinding, timeoutMs: boundedTimeoutMs }),
+      sleep(boundedTimeoutMs).then(() => null),
     ]);
 
     if ((requireTargetBinding ? readyResolved : storeReadyResolved || readyResolved) || (outcome && outcome.ok === true)) {
@@ -2983,6 +3536,55 @@ export async function startWhatsAppBridge(opts = {}) {
     }
   }
 
+  function createInboundChatFacade({ chatId, chatName, isGroup }) {
+    return {
+      id: { _serialized: chatId },
+      name: chatName || groupName || chatId,
+      formattedTitle: chatName || groupName || chatId,
+      isGroup: isGroup === true,
+      sendMessage: (content, options) => client.sendMessage(chatId, content, options),
+      sendStateTyping: async () => {},
+      clearState: async () => {},
+    };
+  }
+
+  async function resolveInboundMessageChatSafe(message, chatIdHint) {
+    let serializedError = "";
+    try {
+      const chat = await message.getChat();
+      if (chat) return chat;
+    } catch (error) {
+      serializedError = formatErrorWithCause(error);
+    }
+
+    const fallbackChatId = String(chatIdHint || "").trim();
+    if (!fallbackChatId || (targetChatId && fallbackChatId !== targetChatId)) {
+      if (serializedError) throw new Error(serializedError);
+      return null;
+    }
+
+    const rawChat = await client.pupPage.evaluate(async (chatId) => {
+      if (!window.WWebJS || typeof window.WWebJS.getChat !== "function") return null;
+      const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
+      if (!chat) return null;
+      return {
+        chatId: chat?.id?._serialized || chatId,
+        chatName: chat?.formattedTitle || chat?.name || "",
+        isGroup: !!chat?.groupMetadata || chatId.endsWith("@g.us"),
+      };
+    }, fallbackChatId);
+    if (!rawChat?.chatId) {
+      if (serializedError) throw new Error(serializedError);
+      return null;
+    }
+
+    warn("message chat serialization unavailable; using raw target chat", {
+      chatId: rawChat.chatId,
+      error: serializedError || "chat_model_unavailable",
+    });
+    return createInboundChatFacade(rawChat);
+  }
+
   async function sendTextToGroup(text, options = {}) {
     const msg = truncateForWhatsApp(text);
     if (!msg) return { ok: false, error: "empty_message" };
@@ -2997,140 +3599,145 @@ export async function startWhatsAppBridge(opts = {}) {
         ? options.source
         : "heartbeat";
 
-    const readyCheck = await waitForOperationalReadyForSend(30000, "send_text_group", {
-      requireTargetBinding: true,
-    });
-    if (!readyCheck.ok) return readyCheck;
-
-    const maybeOpenFollowupWindow = (deliveredChatId) => {
-      if (!openFollowupWindow || !deliveredChatId) return;
-      setHeartbeatFollowupWindow(deliveredChatId, {
-        windowSec: followupWindowSec,
-        source: followupSource,
-        promptPreview: msg,
-      });
-      log("heartbeat follow-up window opened", {
-        chatId: deliveredChatId,
-        windowSec: Math.max(30, Math.min(6 * 60 * 60, Math.floor(followupWindowSec))),
-        source: followupSource,
-      });
-    };
-
-    let chat = targetChatId ? await resolveTargetChatSafe() : null;
-    if (!chat && targetChatId) {
-      // Fallback: sometimes the chat model is stale/missing even though the chat id is valid.
-      // Try direct send by chat id before failing the heartbeat.
-      try {
-        rememberBotSend(msg);
-        await client.sendMessage(targetChatId, msg);
-        maybeOpenFollowupWindow(targetChatId);
-        log("heartbeat sent via direct chatId fallback", { chatId: targetChatId });
-        return {
-          ok: true,
-          chatId: targetChatId,
-          followupWindowOpened: openFollowupWindow,
-          fallback: true,
-        };
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e);
-        warn("heartbeat direct chatId fallback failed", {
-          chatId: targetChatId,
-          error: errMsg,
-        });
-        // If the browser frame is dead, no retry will help — tell the connector to restart the bridge.
-        if (isBridgeRestartNeeded(errMsg)) {
-          return { ok: false, error: "bridge_needs_restart", detail: errMsg };
-        }
-      }
-    }
-
-    if (!chat) {
-      // Last attempt: re-scan chats by configured group name and rebind.
-      try {
-        const chats = await client.getChats().catch(() => []);
-        const found = chats.find((c) => chatMatchesConfiguredGroup(c)) || null;
-        if (found) {
-          await bindTargetChat(found, "heartbeat_send_rebind");
-          chat = found;
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    if (!chat && targetChatId) {
-      try {
-        await client.sendMessage(targetChatId, msg);
-        rememberBotSend(msg);
-        maybeOpenFollowupWindow(targetChatId);
-        log("heartbeat sent via direct sendMessage (no Chat object)", { chatId: targetChatId });
-        return {
-          ok: true,
-          chatId: targetChatId,
-          followupWindowOpened: openFollowupWindow,
-          fallback: true,
-        };
-      } catch (directErr) {
-        const directErrMsg = directErr instanceof Error ? directErr.message : String(directErr);
-        if (isBridgeRestartNeeded(directErrMsg)) {
-          return { ok: false, error: "bridge_needs_restart", detail: directErrMsg };
-        }
-        return {
-          ok: false,
-          error: `chat_not_ready (targetChatId=${targetChatId}, ready=${readyResolved ? "1" : "0"}, sendMessage_failed: ${directErrMsg})`,
-        };
-      }
-    }
-
-    if (!chat) {
-      return {
-        ok: false,
-        error: `chat_not_ready (targetChatId=${targetChatId || "none"}, ready=${readyResolved ? "1" : "0"})`,
-      };
-    }
-
+    const endActivity = beginBridgeActivity();
     try {
-      rememberBotSend(msg);
-      await chat.sendMessage(msg);
-      const deliveredChatId =
-        chat?.id?._serialized ? String(chat.id._serialized) : targetChatId || "";
-      maybeOpenFollowupWindow(deliveredChatId);
-      return { ok: true, chatId: deliveredChatId || undefined, followupWindowOpened: openFollowupWindow };
-    } catch (e) {
-      const primaryErr = e instanceof Error ? e.message : String(e);
-      const deliveredChatId =
-        chat?.id?._serialized ? String(chat.id._serialized) : targetChatId || "";
-      if (deliveredChatId) {
+      const readyCheck = await waitForOperationalReadyForSend(30000, "send_text_group", {
+        requireTargetBinding: true,
+      });
+      if (!readyCheck.ok) return readyCheck;
+
+      const maybeOpenFollowupWindow = (deliveredChatId) => {
+        if (!openFollowupWindow || !deliveredChatId) return;
+        setHeartbeatFollowupWindow(deliveredChatId, {
+          windowSec: followupWindowSec,
+          source: followupSource,
+          promptPreview: msg,
+        });
+        log("heartbeat follow-up window opened", {
+          chatId: deliveredChatId,
+          windowSec: Math.max(30, Math.min(6 * 60 * 60, Math.floor(followupWindowSec))),
+          source: followupSource,
+        });
+      };
+
+      let chat = targetChatId ? await resolveTargetChatSafe() : null;
+      if (!chat && targetChatId) {
+        // Fallback: sometimes the chat model is stale/missing even though the chat id is valid.
+        // Try direct send by chat id before failing the heartbeat.
         try {
           rememberBotSend(msg);
-          await client.sendMessage(deliveredChatId, msg);
-          maybeOpenFollowupWindow(deliveredChatId);
-          log("heartbeat sent via sendMessage fallback", {
-            chatId: deliveredChatId,
-            error: primaryErr,
-          });
+          await client.sendMessage(targetChatId, msg);
+          maybeOpenFollowupWindow(targetChatId);
+          log("heartbeat sent via direct chatId fallback", { chatId: targetChatId });
           return {
             ok: true,
-            chatId: deliveredChatId,
+            chatId: targetChatId,
             followupWindowOpened: openFollowupWindow,
             fallback: true,
           };
-        } catch (fallbackErr) {
-          const fallbackMessage =
-            fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-          if (isBridgeRestartNeeded(primaryErr) || isBridgeRestartNeeded(fallbackMessage)) {
-            return { ok: false, error: "bridge_needs_restart", detail: `${primaryErr}; ${fallbackMessage}` };
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          warn("heartbeat direct chatId fallback failed", {
+            chatId: targetChatId,
+            error: errMsg,
+          });
+          // If the browser frame is dead, no retry will help — tell the connector to restart the bridge.
+          if (isBridgeRestartNeeded(errMsg)) {
+            return { ok: false, error: "bridge_needs_restart", detail: errMsg };
+          }
+        }
+      }
+
+      if (!chat) {
+        // Last attempt: re-scan chats by configured group name and rebind.
+        try {
+          const chats = await client.getChats().catch(() => []);
+          const found = chats.find((c) => chatMatchesConfiguredGroup(c)) || null;
+          if (found) {
+            await bindTargetChat(found, "heartbeat_send_rebind");
+            chat = found;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!chat && targetChatId) {
+        try {
+          await client.sendMessage(targetChatId, msg);
+          rememberBotSend(msg);
+          maybeOpenFollowupWindow(targetChatId);
+          log("heartbeat sent via direct sendMessage (no Chat object)", { chatId: targetChatId });
+          return {
+            ok: true,
+            chatId: targetChatId,
+            followupWindowOpened: openFollowupWindow,
+            fallback: true,
+          };
+        } catch (directErr) {
+          const directErrMsg = directErr instanceof Error ? directErr.message : String(directErr);
+          if (isBridgeRestartNeeded(directErrMsg)) {
+            return { ok: false, error: "bridge_needs_restart", detail: directErrMsg };
           }
           return {
             ok: false,
-            error: `chat_send_failed: ${primaryErr}; fallback_failed: ${fallbackMessage}`,
+            error: `chat_not_ready (targetChatId=${targetChatId}, ready=${readyResolved ? "1" : "0"}, sendMessage_failed: ${directErrMsg})`,
           };
         }
       }
-      if (isBridgeRestartNeeded(primaryErr)) {
-        return { ok: false, error: "bridge_needs_restart", detail: primaryErr };
+
+      if (!chat) {
+        return {
+          ok: false,
+          error: `chat_not_ready (targetChatId=${targetChatId || "none"}, ready=${readyResolved ? "1" : "0"})`,
+        };
       }
-      return { ok: false, error: primaryErr };
+
+      try {
+        rememberBotSend(msg);
+        await chat.sendMessage(msg);
+        const deliveredChatId =
+          chat?.id?._serialized ? String(chat.id._serialized) : targetChatId || "";
+        maybeOpenFollowupWindow(deliveredChatId);
+        return { ok: true, chatId: deliveredChatId || undefined, followupWindowOpened: openFollowupWindow };
+      } catch (e) {
+        const primaryErr = e instanceof Error ? e.message : String(e);
+        const deliveredChatId =
+          chat?.id?._serialized ? String(chat.id._serialized) : targetChatId || "";
+        if (deliveredChatId) {
+          try {
+            rememberBotSend(msg);
+            await client.sendMessage(deliveredChatId, msg);
+            maybeOpenFollowupWindow(deliveredChatId);
+            log("heartbeat sent via sendMessage fallback", {
+              chatId: deliveredChatId,
+              error: primaryErr,
+            });
+            return {
+              ok: true,
+              chatId: deliveredChatId,
+              followupWindowOpened: openFollowupWindow,
+              fallback: true,
+            };
+          } catch (fallbackErr) {
+            const fallbackMessage =
+              fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+            if (isBridgeRestartNeeded(primaryErr) || isBridgeRestartNeeded(fallbackMessage)) {
+              return { ok: false, error: "bridge_needs_restart", detail: `${primaryErr}; ${fallbackMessage}` };
+            }
+            return {
+              ok: false,
+              error: `chat_send_failed: ${primaryErr}; fallback_failed: ${fallbackMessage}`,
+            };
+          }
+        }
+        if (isBridgeRestartNeeded(primaryErr)) {
+          return { ok: false, error: "bridge_needs_restart", detail: primaryErr };
+        }
+        return { ok: false, error: primaryErr };
+      }
+    } finally {
+      endActivity();
     }
   }
 
@@ -3170,158 +3777,163 @@ export async function startWhatsAppBridge(opts = {}) {
     const max = Math.max(1, Math.min(20, Number(limit) || 10));
     if (!rawQ) return { ok: false, error: "missing_query" };
 
-    const readyCheck = await waitForOperationalReadyForSend(30000, "resolve_recipient");
-    if (!readyCheck.ok) return readyCheck;
+    const endActivity = beginBridgeActivity();
+    try {
+      const readyCheck = await waitForOperationalReadyForSend(30000, "resolve_recipient");
+      if (!readyCheck.ok) return readyCheck;
 
-    const qNorm = normalizeText(rawQ).toLowerCase();
-    const qTokens = qNorm.split(" ").filter(Boolean);
-    const digits = normalizeDigits(rawQ);
+      const qNorm = normalizeText(rawQ).toLowerCase();
+      const qTokens = qNorm.split(" ").filter(Boolean);
+      const digits = normalizeDigits(rawQ);
 
-    log("resolve_recipient", {
-      query: rawQ.slice(0, 120),
-      qNorm: qNorm.slice(0, 120),
-      hasDigits: digits.length >= 7,
-      limit: max,
-      readyResolved,
-    });
-
-    // Phone path: resolve to a WhatsApp ID even if chat thread isn't loaded yet.
-    if (looksLikePhoneQuery(rawQ) || (digits && digits.length >= 7)) {
-      try {
-        const wid = await client.getNumberId(digits);
-        const serialized =
-          wid && typeof wid === "object"
-            ? String(wid._serialized || wid.id?._serialized || "")
-            : "";
-        if (serialized) {
-          const exact = buildResolvedRecipient({
-            chatId: serialized,
-            name: digits,
-            isGroup: false,
-          });
-          log("resolve_recipient/phone_exact", { chatId: serialized, digitsLen: digits.length });
-          return { ok: true, candidates: [exact], exact };
-        }
-      } catch (e) {
-        warn("resolve_recipient/getNumberId failed:", e instanceof Error ? e.message : String(e));
-      }
-    }
-
-    // Prefer searching chats, but retry once if WA store isn't synced yet.
-    let chats = await client.getChats().catch(() => []);
-    if (!Array.isArray(chats) || chats.length === 0) {
-      await sleep(750);
-      chats = await client.getChats().catch(() => []);
-    }
-    const scored = [];
-    for (const c of chats || []) {
-      const name = getChatDisplayName(c);
-      const nameNorm = name.toLowerCase();
-      const serialized = c?.id?._serialized ? String(c.id._serialized) : "";
-      const idBase = serialized ? serialized.split("@")[0] : "";
-      const idDigits = idBase ? normalizeDigits(idBase) : "";
-
-      const tokenMatch = qTokens.length > 1 && qTokens.every((t) => nameNorm.includes(t));
-      const substringMatch = qNorm && nameNorm.includes(qNorm);
-      const digitsMatch = digits && digits.length >= 7 && idDigits.includes(digits);
-
-      if (!substringMatch && !tokenMatch && !digitsMatch) continue;
-      let score = 1;
-      if (nameNorm === qNorm) score = 100;
-      else if (nameNorm.startsWith(qNorm)) score = 80;
-      else if (substringMatch) score = 60;
-      else if (tokenMatch) score = 50;
-      else if (digitsMatch) score = 40;
-      scored.push({
-        score,
-        ...buildResolvedRecipient({
-          chatId: serialized,
-          name: name || serialized,
-          isGroup: c?.isGroup === true,
-        }),
+      log("resolve_recipient", {
+        query: rawQ.slice(0, 120),
+        qNorm: qNorm.slice(0, 120),
+        hasDigits: digits.length >= 7,
+        limit: max,
+        readyResolved,
       });
-    }
-    scored.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
 
-    const candidates = scored
-      .map((x) =>
-        buildResolvedRecipient({
-          chatId: String(x.chatId || ""),
-          name: String(x.name || ""),
-          isGroup: !!x.isGroup,
-        })
-      )
-      .filter((x) => x.chatId)
-      .slice(0, max);
+      // Phone path: resolve to a WhatsApp ID even if chat thread isn't loaded yet.
+      if (looksLikePhoneQuery(rawQ) || (digits && digits.length >= 7)) {
+        try {
+          const wid = await client.getNumberId(digits);
+          const serialized =
+            wid && typeof wid === "object"
+              ? String(wid._serialized || wid.id?._serialized || "")
+              : "";
+          if (serialized) {
+            const exact = buildResolvedRecipient({
+              chatId: serialized,
+              name: digits,
+              isGroup: false,
+            });
+            log("resolve_recipient/phone_exact", { chatId: serialized, digitsLen: digits.length });
+            return { ok: true, candidates: [exact], exact };
+          }
+        } catch (e) {
+          warn("resolve_recipient/getNumberId failed:", e instanceof Error ? e.message : String(e));
+        }
+      }
 
-    const exact =
-      candidates.length === 1
-        ? candidates[0]
-        : candidates.find((c) => normalizeText(c.name).toLowerCase() === qNorm) || null;
+      // Prefer searching chats, but retry once if WA store isn't synced yet.
+      let chats = await client.getChats().catch(() => []);
+      if (!Array.isArray(chats) || chats.length === 0) {
+        await sleep(750);
+        chats = await client.getChats().catch(() => []);
+      }
+      const scored = [];
+      for (const c of chats || []) {
+        const name = getChatDisplayName(c);
+        const nameNorm = name.toLowerCase();
+        const serialized = c?.id?._serialized ? String(c.id._serialized) : "";
+        const idBase = serialized ? serialized.split("@")[0] : "";
+        const idDigits = idBase ? normalizeDigits(idBase) : "";
 
-    // If no chat match, try contacts list (many DMs don't have Chat.name populated).
-    if (candidates.length === 0) {
-      const contacts = await client.getContacts().catch(() => []);
-      const contactScored = [];
-      for (const ct of contacts || []) {
-        const id = ct?.id?._serialized ? String(ct.id._serialized) : "";
-        if (!id) continue;
-        const ctName = normalizeText(
-          (typeof ct.name === "string" && ct.name) ||
-            (typeof ct.pushname === "string" && ct.pushname) ||
-            (typeof ct.shortName === "string" && ct.shortName) ||
-            (typeof ct.verifiedName === "string" && ct.verifiedName) ||
-            (typeof ct.formattedName === "string" && ct.formattedName) ||
-            ""
-        );
-        const n = (ctName || id).toLowerCase();
-        const tokenMatch = qTokens.length > 1 && qTokens.every((t) => n.includes(t));
-        const substringMatch = qNorm && n.includes(qNorm);
-        const idDigits = normalizeDigits(id.split("@")[0] || "");
+        const tokenMatch = qTokens.length > 1 && qTokens.every((t) => nameNorm.includes(t));
+        const substringMatch = qNorm && nameNorm.includes(qNorm);
         const digitsMatch = digits && digits.length >= 7 && idDigits.includes(digits);
+
         if (!substringMatch && !tokenMatch && !digitsMatch) continue;
         let score = 1;
-        if (n === qNorm) score = 100;
-        else if (n.startsWith(qNorm)) score = 80;
+        if (nameNorm === qNorm) score = 100;
+        else if (nameNorm.startsWith(qNorm)) score = 80;
         else if (substringMatch) score = 60;
         else if (tokenMatch) score = 50;
         else if (digitsMatch) score = 40;
-        contactScored.push({
+        scored.push({
           score,
           ...buildResolvedRecipient({
-            chatId: id,
-            name: ctName || id,
-            isGroup: false,
+            chatId: serialized,
+            name: name || serialized,
+            isGroup: c?.isGroup === true,
           }),
         });
       }
-      contactScored.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
-      const merged = contactScored.slice(0, max).map((x) =>
-        buildResolvedRecipient({
-          chatId: String(x.chatId || ""),
-          name: String(x.name || ""),
-          isGroup: false,
-        })
-      );
-      const exact2 =
-        merged.length === 1 ? merged[0] : merged.find((c) => normalizeText(c.name).toLowerCase() === qNorm) || null;
+      scored.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
+
+      const candidates = scored
+        .map((x) =>
+          buildResolvedRecipient({
+            chatId: String(x.chatId || ""),
+            name: String(x.name || ""),
+            isGroup: !!x.isGroup,
+          })
+        )
+        .filter((x) => x.chatId)
+        .slice(0, max);
+
+      const exact =
+        candidates.length === 1
+          ? candidates[0]
+          : candidates.find((c) => normalizeText(c.name).toLowerCase() === qNorm) || null;
+
+      // If no chat match, try contacts list (many DMs don't have Chat.name populated).
+      if (candidates.length === 0) {
+        const contacts = await client.getContacts().catch(() => []);
+        const contactScored = [];
+        for (const ct of contacts || []) {
+          const id = ct?.id?._serialized ? String(ct.id._serialized) : "";
+          if (!id) continue;
+          const ctName = normalizeText(
+            (typeof ct.name === "string" && ct.name) ||
+              (typeof ct.pushname === "string" && ct.pushname) ||
+              (typeof ct.shortName === "string" && ct.shortName) ||
+              (typeof ct.verifiedName === "string" && ct.verifiedName) ||
+              (typeof ct.formattedName === "string" && ct.formattedName) ||
+              ""
+          );
+          const n = (ctName || id).toLowerCase();
+          const tokenMatch = qTokens.length > 1 && qTokens.every((t) => n.includes(t));
+          const substringMatch = qNorm && n.includes(qNorm);
+          const idDigits = normalizeDigits(id.split("@")[0] || "");
+          const digitsMatch = digits && digits.length >= 7 && idDigits.includes(digits);
+          if (!substringMatch && !tokenMatch && !digitsMatch) continue;
+          let score = 1;
+          if (n === qNorm) score = 100;
+          else if (n.startsWith(qNorm)) score = 80;
+          else if (substringMatch) score = 60;
+          else if (tokenMatch) score = 50;
+          else if (digitsMatch) score = 40;
+          contactScored.push({
+            score,
+            ...buildResolvedRecipient({
+              chatId: id,
+              name: ctName || id,
+              isGroup: false,
+            }),
+          });
+        }
+        contactScored.sort((a, b) => b.score - a.score || String(a.name).localeCompare(String(b.name)));
+        const merged = contactScored.slice(0, max).map((x) =>
+          buildResolvedRecipient({
+            chatId: String(x.chatId || ""),
+            name: String(x.name || ""),
+            isGroup: false,
+          })
+        );
+        const exact2 =
+          merged.length === 1 ? merged[0] : merged.find((c) => normalizeText(c.name).toLowerCase() === qNorm) || null;
+        log("resolve_recipient/result", {
+          query: rawQ.slice(0, 120),
+          chatsCount: Array.isArray(chats) ? chats.length : 0,
+          contactsCount: Array.isArray(contacts) ? contacts.length : 0,
+          candidates: merged.length,
+          exact: exact2?.chatId ? exact2.chatId.slice(0, 16) + "…" : null,
+        });
+        return { ok: true, candidates: merged, exact: exact2 || undefined };
+      }
+
       log("resolve_recipient/result", {
         query: rawQ.slice(0, 120),
         chatsCount: Array.isArray(chats) ? chats.length : 0,
-        contactsCount: Array.isArray(contacts) ? contacts.length : 0,
-        candidates: merged.length,
-        exact: exact2?.chatId ? exact2.chatId.slice(0, 16) + "…" : null,
+        candidates: candidates.length,
+        exact: exact?.chatId ? exact.chatId.slice(0, 16) + "…" : null,
       });
-      return { ok: true, candidates: merged, exact: exact2 || undefined };
+      return { ok: true, candidates, exact: exact || undefined };
+    } finally {
+      endActivity();
     }
-
-    log("resolve_recipient/result", {
-      query: rawQ.slice(0, 120),
-      chatsCount: Array.isArray(chats) ? chats.length : 0,
-      candidates: candidates.length,
-      exact: exact?.chatId ? exact.chatId.slice(0, 16) + "…" : null,
-    });
-    return { ok: true, candidates, exact: exact || undefined };
   }
 
   async function sendTextToChatId({ chatId, text, openFollowupWindow, followupWindowSec, source }) {
@@ -3333,75 +3945,63 @@ export async function startWhatsAppBridge(opts = {}) {
     const followupWindowSeconds = Number.isFinite(Number(followupWindowSec)) ? Number(followupWindowSec) : 7200;
     const followupSource = typeof source === "string" && source.trim() ? source.trim() : "heartbeat";
 
-    const maybeOpenFollowupWindow = () => {
-      if (!shouldOpenFollowupWindow) return;
-      setHeartbeatFollowupWindow(cid, {
-        windowSec: followupWindowSeconds,
-        source: followupSource,
-        promptPreview: msg,
-      });
-      log("heartbeat follow-up window opened", {
-        chatId: cid,
-        windowSec: Math.max(30, Math.min(6 * 60 * 60, Math.floor(followupWindowSeconds))),
-        source: followupSource,
-      });
-    };
-
-    const readyCheck = await waitForOperationalReadyForSend(30000, "send_text_chat_id");
-    if (!readyCheck.ok) return readyCheck;
-
-    let chat = null;
+    const endActivity = beginBridgeActivity();
     try {
-      chat = await client.getChatById(cid);
-    } catch {
-      chat = null;
-    }
-    if (!chat) {
+      const maybeOpenFollowupWindow = () => {
+        if (!shouldOpenFollowupWindow) return;
+        setHeartbeatFollowupWindow(cid, {
+          windowSec: followupWindowSeconds,
+          source: followupSource,
+          promptPreview: msg,
+        });
+        log("heartbeat follow-up window opened", {
+          chatId: cid,
+          windowSec: Math.max(30, Math.min(6 * 60 * 60, Math.floor(followupWindowSeconds))),
+          source: followupSource,
+        });
+      };
+
+      const readyCheck = await waitForOperationalReadyForSend(30000, "send_text_chat_id");
+      if (!readyCheck.ok) return readyCheck;
+
+      let chat = null;
       try {
-        const chats = await client.getChats().catch(() => []);
-        chat = chats.find((c) => c?.id?._serialized === cid) || null;
+        chat = await client.getChatById(cid);
       } catch {
         chat = null;
       }
-    }
-    if (!chat) {
-      // Last resort: whatsapp-web.js can send without an eager Chat model.
-      try {
-        rememberBotSend(msg);
-        await client.sendMessage(cid, msg);
-        maybeOpenFollowupWindow();
-        return {
-          ok: true,
-          chatId: cid,
-          isGroup: cid.endsWith("@g.us"),
-          followupWindowOpened: shouldOpenFollowupWindow,
-        };
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e);
-        if (isBridgeRestartNeeded(errMsg)) {
-          return { ok: false, error: "bridge_needs_restart", detail: errMsg };
+      if (!chat) {
+        try {
+          const chats = await client.getChats().catch(() => []);
+          chat = chats.find((c) => c?.id?._serialized === cid) || null;
+        } catch {
+          chat = null;
         }
-        return { ok: false, error: errMsg };
       }
-    }
+      if (!chat) {
+        // Last resort: whatsapp-web.js can send without an eager Chat model.
+        try {
+          rememberBotSend(msg);
+          await client.sendMessage(cid, msg);
+          maybeOpenFollowupWindow();
+          return {
+            ok: true,
+            chatId: cid,
+            isGroup: cid.endsWith("@g.us"),
+            followupWindowOpened: shouldOpenFollowupWindow,
+          };
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          if (isBridgeRestartNeeded(errMsg)) {
+            return { ok: false, error: "bridge_needs_restart", detail: errMsg };
+          }
+          return { ok: false, error: errMsg };
+        }
+      }
 
-    try {
-      rememberBotSend(msg);
-      await chat.sendMessage(msg);
-      maybeOpenFollowupWindow();
-      return {
-        ok: true,
-        chatId: cid,
-        name: getChatDisplayName(chat) || undefined,
-        isGroup: chat?.isGroup === true,
-        followupWindowOpened: shouldOpenFollowupWindow,
-      };
-    } catch (e) {
-      const primaryErr = e instanceof Error ? e.message : String(e);
-      // Fallback: direct send
       try {
         rememberBotSend(msg);
-        await client.sendMessage(cid, msg);
+        await chat.sendMessage(msg);
         maybeOpenFollowupWindow();
         return {
           ok: true,
@@ -3410,21 +4010,38 @@ export async function startWhatsAppBridge(opts = {}) {
           isGroup: chat?.isGroup === true,
           followupWindowOpened: shouldOpenFollowupWindow,
         };
-      } catch (fallbackErr) {
-        const fallbackMsg =
-          fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-        if (isBridgeRestartNeeded(primaryErr) || isBridgeRestartNeeded(fallbackMsg)) {
+      } catch (e) {
+        const primaryErr = e instanceof Error ? e.message : String(e);
+        // Fallback: direct send
+        try {
+          rememberBotSend(msg);
+          await client.sendMessage(cid, msg);
+          maybeOpenFollowupWindow();
           return {
-            ok: false,
-            error: "bridge_needs_restart",
-            detail: `${primaryErr}; fallback_failed: ${fallbackMsg}`,
+            ok: true,
+            chatId: cid,
+            name: getChatDisplayName(chat) || undefined,
+            isGroup: chat?.isGroup === true,
+            followupWindowOpened: shouldOpenFollowupWindow,
           };
+        } catch (fallbackErr) {
+          const fallbackMsg =
+            fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+          if (isBridgeRestartNeeded(primaryErr) || isBridgeRestartNeeded(fallbackMsg)) {
+            return {
+              ok: false,
+              error: "bridge_needs_restart",
+              detail: `${primaryErr}; fallback_failed: ${fallbackMsg}`,
+            };
+          }
         }
+        if (isBridgeRestartNeeded(primaryErr)) {
+          return { ok: false, error: "bridge_needs_restart", detail: primaryErr };
+        }
+        return { ok: false, error: primaryErr };
       }
-      if (isBridgeRestartNeeded(primaryErr)) {
-        return { ok: false, error: "bridge_needs_restart", detail: primaryErr };
-      }
-      return { ok: false, error: primaryErr };
+    } finally {
+      endActivity();
     }
   }
 
@@ -3526,94 +4143,110 @@ export async function startWhatsAppBridge(opts = {}) {
     }
     if (!mediaUrl && !localFilePath) return { ok: false, error: "missing_url_or_local_path" };
 
-    const readyCheck = await waitForOperationalReadyForSend(30000, "send_media_chat_id");
-    if (!readyCheck.ok) return readyCheck;
-
-    let chat = null;
+    const endActivity = beginBridgeActivity();
     try {
-      chat = await client.getChatById(cid);
-    } catch {
-      chat = null;
-    }
-    if (!chat) {
-      // We'll still try `client.sendMessage` below; it can work without the Chat model.
-      warn("sendMediaToChatId: chat_not_found; attempting direct send", { chatId: cid });
-    }
+      const readyCheck = await waitForOperationalReadyForSend(30000, "send_media_chat_id");
+      if (!readyCheck.ok) return readyCheck;
 
-    let buf = null;
-    let detectedContentType = "";
-    let fallbackName = "file";
-    if (localFilePath) {
-      // Fresh connector-generated files can be created immediately before send.
-      const stats = await waitForLocalMediaFile(localFilePath);
-      if (!stats || !stats.isFile()) return { ok: false, error: "local_file_not_found" };
-      if (stats.size > 15 * 1024 * 1024) return { ok: false, error: "file_too_large" };
-      let canonicalLocalPath = "";
+      let chat = null;
       try {
-        canonicalLocalPath = await fs.promises.realpath(localFilePath);
+        chat = await client.getChatById(cid);
       } catch {
-        canonicalLocalPath = path.resolve(localFilePath);
+        chat = null;
       }
-      const allowedRoots = await resolveAllowedMediaRoots();
-      const inAllowedScope = allowedRoots.some((root) =>
-        isPathWithin(root, canonicalLocalPath)
-      );
-      if (!inAllowedScope) {
-        return { ok: false, error: "local_path_out_of_scope" };
+      if (!chat) {
+        // We'll still try `client.sendMessage` below; it can work without the Chat model.
+        warn("sendMediaToChatId: chat_not_found; attempting direct send", { chatId: cid });
       }
-      try {
-        buf = await fs.promises.readFile(canonicalLocalPath);
-      } catch {
-        return { ok: false, error: "local_file_read_failed" };
-      }
-      fallbackName = path.basename(canonicalLocalPath) || "file";
-      detectedContentType = inferMediaTypeFromFilename(fallbackName);
-    } else {
-      const fetched = await fetchPublicUrlBuffer({ startUrl: mediaUrl });
-      if (!fetched.ok) return { ok: false, error: fetched.error || "download_failed" };
-      detectedContentType = fetched.contentType || "";
-      buf = fetched.buffer;
-      fallbackName = filenameFromUrl(mediaUrl) || "file";
-    }
 
-    const fname = String(filename || "").trim() || fallbackName;
-    const mediaType = detectedContentType || inferMediaTypeFromFilename(fname);
-
-    try {
-      // IMPORTANT: base64 is generated ONLY inside the connector; never returned to the server/model.
-      const base64 = buf.toString("base64");
-      const media = new MessageMedia(mediaType, base64, fname);
-      rememberBotSend(`[media:${fname}]`);
-      try {
-        await client.sendMessage(cid, media, safeCaption ? { caption: safeCaption } : undefined);
-      } catch (e) {
-        if (chat) {
-          await chat.sendMessage(media, safeCaption ? { caption: safeCaption } : undefined);
-        } else {
-          throw e;
+      let buf = null;
+      let detectedContentType = "";
+      let fallbackName = "file";
+      if (localFilePath) {
+        // Fresh connector-generated files can be created immediately before send.
+        const stats = await waitForLocalMediaFile(localFilePath);
+        if (!stats || !stats.isFile()) return { ok: false, error: "local_file_not_found" };
+        if (stats.size > 15 * 1024 * 1024) return { ok: false, error: "file_too_large" };
+        let canonicalLocalPath = "";
+        try {
+          canonicalLocalPath = await fs.promises.realpath(localFilePath);
+        } catch {
+          canonicalLocalPath = path.resolve(localFilePath);
         }
+        const allowedRoots = await resolveAllowedMediaRoots();
+        const inAllowedScope = allowedRoots.some((root) =>
+          isPathWithin(root, canonicalLocalPath)
+        );
+        if (!inAllowedScope) {
+          return { ok: false, error: "local_path_out_of_scope" };
+        }
+        try {
+          buf = await fs.promises.readFile(canonicalLocalPath);
+        } catch {
+          return { ok: false, error: "local_file_read_failed" };
+        }
+        fallbackName = path.basename(canonicalLocalPath) || "file";
+        detectedContentType = inferMediaTypeFromFilename(fallbackName);
+      } else {
+        const fetched = await fetchPublicUrlBuffer({ startUrl: mediaUrl });
+        if (!fetched.ok) return { ok: false, error: fetched.error || "download_failed" };
+        detectedContentType = fetched.contentType || "";
+        buf = fetched.buffer;
+        fallbackName = filenameFromUrl(mediaUrl) || "file";
       }
-      return {
-        ok: true,
-        chatId: cid,
-        name: chat ? getChatDisplayName(chat) || undefined : undefined,
-        filename: fname,
-        mediaType,
-        sizeBytes: buf.length,
-        source: localFilePath ? "local_path" : "url",
-      };
-    } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+
+      const fname = String(filename || "").trim() || fallbackName;
+      const mediaType = detectedContentType || inferMediaTypeFromFilename(fname);
+
+      try {
+        // IMPORTANT: base64 is generated ONLY inside the connector; never returned to the server/model.
+        const base64 = buf.toString("base64");
+        const media = new MessageMedia(mediaType, base64, fname);
+        rememberBotSend(`[media:${fname}]`);
+        try {
+          await client.sendMessage(cid, media, safeCaption ? { caption: safeCaption } : undefined);
+        } catch (e) {
+          if (chat) {
+            await chat.sendMessage(media, safeCaption ? { caption: safeCaption } : undefined);
+          } else {
+            throw e;
+          }
+        }
+        return {
+          ok: true,
+          chatId: cid,
+          name: chat ? getChatDisplayName(chat) || undefined : undefined,
+          filename: fname,
+          mediaType,
+          sizeBytes: buf.length,
+          source: localFilePath ? "local_path" : "url",
+        };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    } finally {
+      endActivity();
     }
   }
 
-  client.on("qr", () => {
+  client.on("qr", (qr) => {
     qrPending = true;
     authFailureText = "";
     disconnectedReason = "";
-    log("QR code received. Please scan with WhatsApp mobile app.");
-    // You could generate QR code in terminal here using qrcode-terminal
-    emitHealth("recovering", "qr_received", "QR scan required for WhatsApp Web");
+    if (whatsappHeadless) {
+      warn(
+        "QR scan required while WhatsApp is running headless. Restart with GROOVY_WHATSAPP_HEADLESS=0 or --whatsapp-headed to scan the QR in a visible browser.",
+        { qrLength: typeof qr === "string" ? qr.length : 0 }
+      );
+      emitHealth(
+        "recovering",
+        "qr_received_headless",
+        "QR scan required; restart headed to scan WhatsApp Web"
+      );
+    } else {
+      log("QR code received. Please scan with WhatsApp mobile app.");
+      emitHealth("recovering", "qr_received", "QR scan required for WhatsApp Web");
+    }
   });
 
   client.on("authenticated", () => {
@@ -3622,6 +4255,7 @@ export async function startWhatsAppBridge(opts = {}) {
     disconnectedReason = "";
     log("authenticated successfully");
     emitHealth("recovering", "authenticated", "WhatsApp session authenticated");
+    installPostAuthResourceThrottling("authenticated").catch(() => {});
     ensureOperationalReady("authenticated", { requireTargetBinding: true }).catch(() => {});
   });
 
@@ -3638,11 +4272,21 @@ export async function startWhatsAppBridge(opts = {}) {
   });
 
   client.on("ready", async () => {
+    await installPostAuthResourceThrottling("ready");
     await markClientReady("ready");
   });
 
-  // Listen for all messages (including from self)
-  client.on("message_create", async (message) => {
+  // Listen for all messages (including from self). The same handler is also used by
+  // a polling fallback because WhatsApp Web occasionally stops emitting events while
+  // the send path still looks healthy.
+  async function handleWhatsAppMessageCreate(message, source = "event") {
+    if (!isCurrentBridgeGeneration()) return;
+    const chatIdHint = getMessageChatIdHint(message);
+    if (targetChatId && chatIdHint && chatIdHint !== targetChatId) return;
+    const endActivity = beginBridgeActivity({
+      countsTowardIdle: false,
+    });
+    let meaningfulActivity = false;
     let shouldNotifyFailure = false;
     let fallbackChatId = "";
     let safeSendReply = null;
@@ -3650,7 +4294,7 @@ export async function startWhatsAppBridge(opts = {}) {
       // Process messages from the target group.
       // If we failed to resolve it at startup (common after fresh QR scan), we can auto-bind
       // when we first see a command in the configured group.
-      const chat = await message.getChat();
+      const chat = await resolveInboundMessageChatSafe(message, chatIdHint);
       if (!chat) return;
 
       const text = normalizeText(message.body);
@@ -3658,8 +4302,16 @@ export async function startWhatsAppBridge(opts = {}) {
       const chatId = chat?.id?._serialized || "";
       if (!chatId) return;
       fallbackChatId = chatId;
+      const ingressMessageId = getMessageStableId(message);
+      if (ingressMessageId && wasIngressMessageHandled(ingressMessageId)) return;
 
-      log("message received:", { fromMe, text: text.slice(0, 80), chatId });
+      log("message received:", {
+        fromMe,
+        text: text.slice(0, 80),
+        chatId,
+        source,
+        messageId: ingressMessageId ? ingressMessageId.slice(0, 48) : null,
+      });
 
       // Ignore our own bot messages (prevents feedback loops), but do NOT ignore all fromMe messages:
       // WhatsApp sets fromMe=true for messages you send from your phone too.
@@ -3699,78 +4351,92 @@ export async function startWhatsAppBridge(opts = {}) {
       }
 
       if (!groovyPayload && !codePayload) return;
+      meaningfulActivity = true;
+      noteBridgeActivity();
+      if (ingressMessageId) rememberIngressMessageHandled(ingressMessageId);
       shouldNotifyFailure = true;
 
       log("command detected:", {
         groovyPayload,
         codePayload,
         implicitHeartbeatFollowup: !!pendingHeartbeatFollowup && !codePayload,
+        source,
       });
 
       // Helper to send reply safely (library-based; never crash the process)
+      let replySendQueue = Promise.resolve();
       async function sendReply(replyText, files) {
-        try {
-          if (typeof replyText === "string" && replyText.trim()) {
-            rememberBotSend(replyText);
-          }
-          const chatId = chat?.id?._serialized;
-          if (!chatId) throw new Error("missing_chat_id");
-
-          // WORKAROUND: whatsapp-web.js can throw `markedUnread` when its internal Store
-          // doesn't have the Chat model loaded yet. Force-resolve the Chat from the client.
-          let resolvedChat = null;
+        const queuedSend = replySendQueue.then(async () => {
           try {
-            resolvedChat = await client.getChatById(chatId);
-          } catch {
-            resolvedChat = null;
-          }
+            if (typeof replyText === "string" && replyText.trim()) {
+              rememberBotSend(replyText);
+            }
+            const chatId = chat?.id?._serialized;
+            if (!chatId) throw new Error("missing_chat_id");
 
-          if (!resolvedChat) {
-            const chats = await client.getChats().catch(() => []);
-            resolvedChat =
-              chats.find((c) => c?.id?._serialized === chatId) ||
-              chats.find((c) => c?.name === chat?.name) ||
-              null;
-          }
-
-          if (!resolvedChat) {
-            // Small delay + one retry (covers immediate post-ready races)
-            await sleep(750);
+            // WORKAROUND: whatsapp-web.js can throw `markedUnread` when its internal Store
+            // doesn't have the Chat model loaded yet. Force-resolve the Chat from the client.
+            let resolvedChat = null;
             try {
               resolvedChat = await client.getChatById(chatId);
             } catch {
               resolvedChat = null;
             }
-          }
 
-          if (!resolvedChat) throw new Error(`chat_not_resolved:${chatId}`);
-
-          // Use chat-level send (avoid message.reply path).
-          if (Array.isArray(files) && files.length > 0 && MessageMedia) {
-            // Send media (one per message). WhatsApp is picky about large payloads; keep it small.
-            for (let i = 0; i < Math.min(files.length, 3); i++) {
-              const f = files[i] || {};
-              const mediaType = String(f.mediaType || "");
-              const base64 = String(f.base64 || "");
-              const filename = f.filename != null ? String(f.filename) : undefined;
-              if (!mediaType || !base64) continue;
-              const media = new MessageMedia(mediaType, base64, filename);
-              const caption = i === 0 ? (replyText || "").trim() : "";
-              const isImage = mediaType.startsWith("image/");
-              await resolvedChat.sendMessage(
-                media,
-                caption
-                  ? { caption, sendMediaAsDocument: !isImage }
-                  : { sendMediaAsDocument: !isImage }
-              );
+            if (!resolvedChat) {
+              const chats = await client.getChats().catch(() => []);
+              resolvedChat =
+                chats.find((c) => c?.id?._serialized === chatId) ||
+                chats.find((c) => c?.name === chat?.name) ||
+                null;
             }
-            return;
-          }
 
-          await resolvedChat.sendMessage(replyText);
-        } catch (e) {
-          warn("failed to send reply:", e instanceof Error ? e.message : String(e));
-        }
+            if (!resolvedChat) {
+              // Small delay + one retry (covers immediate post-ready races)
+              await sleep(750);
+              try {
+                resolvedChat = await client.getChatById(chatId);
+              } catch {
+                resolvedChat = null;
+              }
+            }
+
+            if (!resolvedChat && typeof chat?.sendMessage === "function") {
+              resolvedChat = chat;
+              log("using inbound chat direct-send fallback", { chatId });
+            }
+
+            if (!resolvedChat) throw new Error(`chat_not_resolved:${chatId}`);
+
+            // Use chat-level send (avoid message.reply path).
+            if (Array.isArray(files) && files.length > 0 && MessageMedia) {
+              // Send media (one per message). WhatsApp is picky about large payloads; keep it small.
+              for (let i = 0; i < Math.min(files.length, 3); i++) {
+                const f = files[i] || {};
+                const mediaType = String(f.mediaType || "");
+                const base64 = String(f.base64 || "");
+                const filename = f.filename != null ? String(f.filename) : undefined;
+                if (!mediaType || !base64) continue;
+                const media = new MessageMedia(mediaType, base64, filename);
+                const caption = i === 0 ? (replyText || "").trim() : "";
+                const isImage = mediaType.startsWith("image/");
+                await resolvedChat.sendMessage(
+                  media,
+                  caption
+                    ? { caption, sendMediaAsDocument: !isImage }
+                    : { sendMediaAsDocument: !isImage }
+                );
+              }
+              return;
+            }
+
+            await resolvedChat.sendMessage(replyText);
+          } catch (e) {
+            warn("failed to send reply:", e instanceof Error ? e.message : String(e));
+          }
+        });
+        replySendQueue = queuedSend.catch(() => {});
+        return queuedSend;
       }
       safeSendReply = sendReply;
 
@@ -4009,6 +4675,9 @@ export async function startWhatsAppBridge(opts = {}) {
             if (res.timedOut === true || isWhatsAppApiTimeoutError(res.error)) {
               const timeoutMs = res.timeoutMs || resolveWhatsAppApiTimeoutMs();
               const maxTimeoutRecoveries = resolveWhatsAppApiTimeoutAutoRecoveries();
+              if (messageForRound && toolResults.length === 0) {
+                deferredFollowupText = messageForRound;
+              }
               if (timeoutRecoveryCount < maxTimeoutRecoveries) {
                 timeoutRecoveryCount += 1;
                 saveGroovyContinuation({ timeoutRecoveryCount });
@@ -4016,6 +4685,7 @@ export async function startWhatsAppBridge(opts = {}) {
                   threadKey,
                   traceId,
                   timeoutMs,
+                  rawError: res.rawError || null,
                   timeoutRecoveryCount,
                   maxTimeoutRecoveries,
                   toolResultCount: toolResults.length,
@@ -4054,6 +4724,9 @@ export async function startWhatsAppBridge(opts = {}) {
 
           if (data.kind === "final") {
             clearContinuation(groovyContinuationsByThread, threadKey);
+            if (Array.isArray(data.progressMessages)) {
+              for (const msg of data.progressMessages) await sendProgress(String(msg));
+            }
             const files = Array.isArray(data.files) ? data.files : [];
             const textReply = String(data.reply || "").trim();
             pendingTwilioFollowup =
@@ -4127,7 +4800,11 @@ export async function startWhatsAppBridge(opts = {}) {
               break;
             }
 
-            if (data.statusMessage) await sendProgress(data.statusMessage);
+            if (Array.isArray(data.progressMessages)) {
+              for (const msg of data.progressMessages) await sendProgress(String(msg));
+            } else if (data.statusMessage) {
+              await sendProgress(data.statusMessage);
+            }
             const roundToolResults = [];
             let skipWhatsappTextForBatch = false;
             for (const ex of execs) {
@@ -4158,7 +4835,6 @@ export async function startWhatsAppBridge(opts = {}) {
                 upsertToolResult(toolResultEntry);
                 continue;
               }
-              await sendProgress(connectorExecuteStatusText(ex));
               const rawResult = await executeConnectorRpc({
                 connectorType: ex.connectorType,
                 connectorParams: ex.connectorParams,
@@ -4385,8 +5061,147 @@ export async function startWhatsAppBridge(opts = {}) {
           warn("failed to send error fallback reply:", formatErrorWithCause(sendErr));
         }
       }
+    } finally {
+      if (meaningfulActivity) noteBridgeActivity();
+      endActivity();
     }
+  }
+
+  const inboundPollIntervalMs = resolveWhatsAppInboundPollIntervalMs();
+  const inboundPollLookbackMs = resolveWhatsAppInboundPollLookbackMs();
+  const inboundPollStartedAtMs = Date.now();
+  let inboundPollInFlight = false;
+  let inboundPollLoadedMessagesOnly = false;
+
+  async function pollTargetChatForMissedCommands(reason = "interval") {
+    if (!isCurrentBridgeGeneration() || !targetChatId || inboundPollInFlight) return;
+    inboundPollInFlight = true;
+    const endActivity = beginBridgeActivity({
+      countsTowardIdle: false,
+    });
+    try {
+      const ready = await waitForOperationalReadyForSend(5000, "inbound_command_poll", {
+        requireTargetBinding: true,
+      });
+      if (!ready || ready.ok !== true) return;
+
+      const chat = await resolveTargetChatSafe();
+      if (!chat || typeof chat.fetchMessages !== "function") return;
+
+      const pollLimit = resolveWhatsAppInboundPollLimit();
+      let messages;
+      try {
+        messages = await chat.fetchMessages({
+          // A zero limit reads the messages already loaded in the chat without
+          // invoking WhatsApp Web's version-sensitive history loader.
+          limit: inboundPollLoadedMessagesOnly ? 0 : pollLimit,
+        });
+      } catch (err) {
+        const errorText = formatErrorWithCause(err);
+        if (!errorText.includes("waitForChatLoading")) throw err;
+        inboundPollLoadedMessagesOnly = true;
+        warn(
+          "WhatsApp history loader is unavailable; inbound recovery will use loaded messages"
+        );
+        messages = await chat.fetchMessages({ limit: 0 });
+      }
+      if (!Array.isArray(messages) || messages.length === 0) return;
+
+      if (messages.length > pollLimit) {
+        messages = messages.slice(-pollLimit);
+      }
+
+      const oldestAllowedMs = Math.max(
+        inboundPollStartedAtMs - inboundPollLookbackMs,
+        Date.now() - inboundPollLookbackMs
+      );
+      const sorted = messages
+        .slice()
+        .sort((a, b) => Number(a?.timestamp || 0) - Number(b?.timestamp || 0));
+
+      for (const msg of sorted) {
+        if (!isCurrentBridgeGeneration()) return;
+        const text = normalizeText(msg?.body || "");
+        if (!text) continue;
+
+        const messageId = getMessageStableId(msg);
+        if (messageId && wasIngressMessageHandled(messageId)) continue;
+
+        const timestampRaw = Number(msg?.timestamp || 0);
+        const timestampMs =
+          Number.isFinite(timestampRaw) && timestampRaw > 0 ? timestampRaw * 1000 : Date.now();
+        if (timestampMs < oldestAllowedMs) continue;
+
+        const explicitCommand =
+          hasLeadingCommand(text, "@groovy") || hasLeadingCommand(text, "@code");
+        const followupWindow = explicitCommand ? null : peekHeartbeatFollowupWindow(targetChatId);
+        const isImplicitHeartbeatFollowup =
+          !explicitCommand &&
+          msg?.fromMe === true &&
+          followupWindow &&
+          timestampMs >= Math.max(Number(followupWindow.openedAt || 0) + 1000, inboundPollStartedAtMs);
+        if (!explicitCommand && !isImplicitHeartbeatFollowup) continue;
+
+        log("poll recovered missed WhatsApp inbound message", {
+          reason,
+          chatId: targetChatId,
+          fromMe: msg?.fromMe === true,
+          explicitCommand,
+          implicitHeartbeatFollowup: !!isImplicitHeartbeatFollowup,
+          ageSec: Math.max(0, Math.round((Date.now() - timestampMs) / 1000)),
+          text: text.slice(0, 80),
+        });
+        await handleWhatsAppMessageCreate(msg, "poll");
+      }
+    } catch (e) {
+      const msg = formatErrorWithCause(e);
+      if (!isDeadStoreError(msg)) {
+        warn("WhatsApp inbound poll failed:", msg);
+      }
+    } finally {
+      endActivity();
+      inboundPollInFlight = false;
+      maybeRecycleWhatsAppPage("post_inbound_poll").catch(() => {});
+    }
+  }
+
+  client.on("message_create", (message) => {
+    handleWhatsAppMessageCreate(message, "event").catch((e) => {
+      warn("message handler top-level error:", formatErrorWithCause(e));
+    });
   });
+
+  if (inboundPollIntervalMs > 0) {
+    const pollTimer = trackBridgeTimer(setInterval(() => {
+      pollTargetChatForMissedCommands("interval").catch(() => {});
+    }, inboundPollIntervalMs));
+    if (typeof pollTimer.unref === "function") pollTimer.unref();
+    const initialTimer = trackBridgeTimer(setTimeout(() => {
+      pollTargetChatForMissedCommands("startup").catch(() => {});
+    }, Math.min(5000, inboundPollIntervalMs)));
+    if (typeof initialTimer.unref === "function") initialTimer.unref();
+    log("WhatsApp inbound poll fallback enabled", {
+      intervalMs: inboundPollIntervalMs,
+      lookbackMs: inboundPollLookbackMs,
+      limit: resolveWhatsAppInboundPollLimit(),
+    });
+  }
+
+  if (recycleIntervalMs > 0) {
+    const recycleTimer = trackBridgeTimer(setInterval(() => {
+      maybeRecycleWhatsAppPage("interval").catch(() => {});
+    }, recycleCheckIntervalMs));
+    if (typeof recycleTimer.unref === "function") recycleTimer.unref();
+    log("WhatsApp idle page recycle enabled", {
+      intervalMs: recycleIntervalMs,
+      idleMs: recycleIdleMs,
+      maxAgeMs: recycleMaxAgeMs,
+      memoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+      checkIntervalMs: recycleCheckIntervalMs,
+    });
+  } else {
+    log("WhatsApp idle page recycle disabled");
+  }
 
   client.on("disconnected", (reason) => {
     disconnectedReason = typeof reason === "string" ? reason : JSON.stringify(reason || {});
@@ -4437,11 +5252,14 @@ export async function startWhatsAppBridge(opts = {}) {
   } catch (e) {
     const errText = e instanceof Error ? e.message : String(e);
     emitHealth("degraded", "initialize_failed", errText);
+    stopBridgeRuntime("initialize_failed");
     throw e;
   }
 
   return {
     ok: true,
+    stop: stopBridgeRuntime,
+    generation: bridgeGeneration,
     groupName,
     appUrl,
     // Used by the scheduler in connector.mjs

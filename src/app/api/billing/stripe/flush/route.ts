@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { randomUUID } from "crypto";
 import { resolveWorkspaceTokenBillingPolicy } from "@/lib/billing/policy";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -420,9 +421,15 @@ async function handle(req: Request) {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   return handle(req);
 }
 
 export async function GET(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   return handle(req);
 }

@@ -1,4 +1,5 @@
 import { buildInternalRouteAuthHeaders } from "@/lib/internalRouteAuth";
+import { getRelayUrl } from "@/lib/config/appConfig";
 
 export const RELAY_AIYRA_RUNTIME_SCOPE = "relay_aiyra_runtime";
 
@@ -9,7 +10,7 @@ function trimmed(value: unknown): string {
 function resolveRelayHttpBaseUrl(): string {
   const raw =
     trimmed(process.env.INTERNAL_RELAY_HTTP_URL) ||
-    trimmed(process.env.NEXT_PUBLIC_RELAY_URL);
+    trimmed(getRelayUrl());
   if (!raw) {
     throw new Error("Missing relay URL");
   }

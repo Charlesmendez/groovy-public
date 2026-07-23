@@ -4,6 +4,7 @@ import { AllowBodyScroll } from "@/components/marketing/AllowBodyScroll";
 import { BuyPersonalButton } from "./BuyPersonalButton";
 
 const personal = [
+  "5-day full-product trial — no credit card required",
   "Personal license",
   "1 user",
   "2 activated devices",
@@ -44,10 +45,18 @@ export default function PricingPage() {
         <div className="max-w-3xl">
           <h1 className="text-4xl font-semibold tracking-tight">Groovy licensing</h1>
           <p className="mt-4 text-zinc-400">
-            Public source for trust. Paid license for use. Your own provider keys by default.
+            Start with five days of full product access, with no credit card required. After the
+            trial, choose the license that fits your use. Public source for trust; your own provider keys by default.
             Groovy does not charge a percentage over your token usage unless an authorized
             reseller license explicitly enables customer usage billing.
           </p>
+          <Link
+            href="/dashboard"
+            className="mt-6 inline-flex items-center gap-2 rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
+          >
+            Start free trial
+            <ArrowRight className="h-4 w-4" />
+          </Link>
         </div>
 
         <div className="mt-10 grid gap-4 md:grid-cols-4">
@@ -55,7 +64,7 @@ export default function PricingPage() {
             {
               icon: Code2,
               title: "Source-visible",
-              text: "Inspect the delayed public mirror and get current source snapshots while your license is active.",
+              text: "Inspect each tagged release in the public mirror; a license grants the applicable rights to run it.",
             },
             {
               icon: KeyRound,

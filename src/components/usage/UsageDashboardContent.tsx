@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
+import { AgentUsageBreakdown } from "@/components/usage/AgentUsageBreakdown";
 import {
   Loader2,
   Zap,
@@ -78,14 +79,14 @@ type TeamMember = {
   userId: string;
   label: string;
   email: string | null;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
   isCurrentUser: boolean;
 };
 type TeamMemberBreakdown = {
   userId: string;
   label: string;
   email: string | null;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
   tokens: number;
   input: number;
   output: number;
@@ -534,7 +535,12 @@ export function UsageDashboardContent() {
                   const pct =
                     member.tokens > 0 ? Math.max(2, Math.round((member.tokens / maxTeamTokens) * 100)) : 0;
                   const unmetered = member.unmeteredCalls || 0;
-                  const roleLabel = member.role === "admin" ? "Admin" : "Member";
+                  const roleLabel =
+                    member.role === "admin"
+                      ? "Admin"
+                      : member.role === "guest"
+                        ? "Channel guest"
+                        : "Member";
                   const usageLabel = [
                     member.calls > 0 ? `${member.calls} LLM` : "",
                     unmetered > 0 ? `${unmetered} unmetered` : "",
@@ -792,6 +798,8 @@ export function UsageDashboardContent() {
 
           {/* Breakdowns */}
           <div className="grid grid-cols-1 gap-4">
+            {/* By Agent (harness) */}
+            <AgentUsageBreakdown />
             {/* By Source */}
             <div className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
               <h2 className="text-sm font-medium text-zinc-300 mb-4">Usage by Source</h2>

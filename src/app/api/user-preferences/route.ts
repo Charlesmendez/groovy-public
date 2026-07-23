@@ -6,8 +6,26 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
-// Onboarding steps: welcome -> connector -> whatsapp -> telegram -> api_keys -> chat_agent -> claude_cli -> done
-const VALID_ONBOARDING_STEPS = ["welcome", "connector", "whatsapp", "telegram", "api_keys", "chat_agent", "claude_cli", "done"] as const;
+// Onboarding steps.
+// Classic flow: welcome -> license -> connector -> whatsapp -> telegram -> api_keys -> chat_agent -> claude_cli -> done
+// Harness flow (onboarding_data.flowVersion === "harness_v1"):
+//   welcome -> license -> connector_ready -> brain -> first_agent -> first_task -> channels -> done
+const VALID_ONBOARDING_STEPS = [
+  "welcome",
+  "license",
+  "connector",
+  "whatsapp",
+  "telegram",
+  "api_keys",
+  "chat_agent",
+  "claude_cli",
+  "connector_ready",
+  "brain",
+  "first_agent",
+  "first_task",
+  "channels",
+  "done",
+] as const;
 type OnboardingStep = typeof VALID_ONBOARDING_STEPS[number];
 
 type OnboardingData = {

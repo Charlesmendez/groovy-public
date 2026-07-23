@@ -6,7 +6,11 @@ on:
     paths:
       - "apps/connector/**"
       - "src/lib/connector/**"
-      - "src/components/onboarding/WelcomeOnboarding.tsx"
+      - "src/components/onboarding/**"
+      - "src/components/harness/HarnessDashboard.tsx"
+      - "src/hooks/useConnectorDevice.ts"
+      - "src/hooks/useConnectorExecute.ts"
+      - "src/hooks/useDesktopAutoPair.ts"
       - "src/components/command-center/SettingsModal.tsx"
       - ".github/workflows/connector-regression.yml"
       - ".github/workflows/release-connector.yml"
@@ -15,7 +19,11 @@ on:
     paths:
       - "apps/connector/**"
       - "src/lib/connector/**"
-      - "src/components/onboarding/WelcomeOnboarding.tsx"
+      - "src/components/onboarding/**"
+      - "src/components/harness/HarnessDashboard.tsx"
+      - "src/hooks/useConnectorDevice.ts"
+      - "src/hooks/useConnectorExecute.ts"
+      - "src/hooks/useDesktopAutoPair.ts"
       - "src/components/command-center/SettingsModal.tsx"
       - ".github/workflows/connector-regression.yml"
       - ".github/workflows/release-connector.yml"
@@ -37,7 +45,7 @@ jobs:
         run: npm ci
 
       - name: Lint connector-facing web files
-        run: npm run lint -- src/lib/connector src/components/onboarding/WelcomeOnboarding.tsx src/components/command-center/SettingsModal.tsx
+        run: npm run lint -- src/lib/connector src/components/onboarding src/components/harness/HarnessDashboard.tsx src/hooks/useConnectorDevice.ts src/hooks/useConnectorExecute.ts src/hooks/useDesktopAutoPair.ts src/components/command-center/SettingsModal.tsx
 
   build-macos-headless:
     runs-on: macos-14

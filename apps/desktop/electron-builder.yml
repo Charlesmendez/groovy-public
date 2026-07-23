@@ -1,0 +1,39 @@
+appId: ai.gogroovy.desktop
+productName: Groovy
+directories:
+  output: dist-app
+  buildResources: build
+
+files:
+  - dist/**/*
+  - package.json
+
+# The bundled connector runtime (populated by `npm run bundle-connector`)
+# lands in <App>.app/Contents/Resources/connector/ with layout:
+#   connector.mjs + node_modules/ + node/bin/node
+extraResources:
+  - from: resources/connector
+    to: connector
+  - from: resources/runtime-config.json
+    to: runtime-config.json
+
+mac:
+  icon: build/icon.png
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarization credentials come from env in CI: APPLE_ID,
+  # APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID. For unsigned local builds run
+  # electron-builder with CSC_IDENTITY_AUTO_DISCOVERY=false (skips sign+notarize).
+  notarize: true
+
+publish:
+  provider: generic
+  url: https://www.gogroovy.ai/api/updates/desktop-feed

@@ -20,6 +20,7 @@ import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
 import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
 import { type UsageChargeType } from "@/lib/billing/pricing";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
+import { createDatagranLinkToken, resolveDatagranLinkOrigin } from "@/lib/datagran/linkToken";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import {
   formatPreferenceForPrompt,
@@ -38,6 +39,7 @@ import {
 import { ensureHeartbeatSystemAgentId, resolveOwnedAgentId } from "@/lib/orchestrator/runtimeAgents";
 import { resolveRuntimeScope } from "@/lib/orchestrator/runtimeGraph";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { getProductAccessForUser } from "@/lib/licensing/access";
 
 const GMAIL_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
@@ -163,6 +165,18 @@ type ScheduledJobPromptRow = {
   schedule?: unknown;
   last_run_at?: string | null;
   last_status?: string | null;
+};
+
+type ScheduledJobRunPromptRow = {
+  job_id?: string | null;
+  status?: string | null;
+  exit_code?: number | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  error?: string | null;
+  created_at?: string | null;
 };
 
 type LocalTimeContext = {
@@ -1585,6 +1599,102 @@ function summarizeJobPurposeForPrompt(job: ScheduledJobPromptRow): string {
   return "shell task";
 }
 
+function summarizeScheduledRunForPrompt(
+  run: ScheduledJobRunPromptRow | null | undefined,
+  timezone: string,
+): string {
+  if (!run) return "latest_run=(none)";
+  const status = typeof run.status === "string" && run.status.trim() ? run.status.trim() : "unknown";
+  const exitCode =
+    typeof run.exit_code === "number" && Number.isFinite(run.exit_code) ? String(run.exit_code) : "unknown";
+  const finishedAt =
+    typeof run.finished_at === "string" && run.finished_at.trim()
+      ? run.finished_at.trim()
+      : typeof run.created_at === "string" && run.created_at.trim()
+        ? run.created_at.trim()
+        : "";
+  const finishedLocal = finishedAt ? formatLocalDateTimeForPrompt(finishedAt, timezone) : "unknown";
+  const rawOutput =
+    typeof run.stdout === "string" && run.stdout.trim()
+      ? run.stdout.trim()
+      : typeof run.error === "string" && run.error.trim()
+        ? run.error.trim()
+        : typeof run.stderr === "string" && run.stderr.trim()
+          ? run.stderr.trim()
+          : "";
+  const output = rawOutput ? clipHeartbeatText(rawOutput, 700) : "(no output captured)";
+  return `latest_run_status=${status}; latest_run_exit_code=${exitCode}; latest_run_finished_local=${finishedLocal}; latest_run_output=${output}`;
+}
+
+function scheduledSummaryHasNoTradesToday(summary: string, localDateKey?: string | null): boolean {
+  const noTradePattern =
+    /\b(no|zero)\s+(?:trades?|positions?)\s+(?:closed\s+)?today\b/i;
+  const noRealizedPattern =
+    /\bno\s+realized\s+(?:gain\/loss|gain\s*\/\s*loss|gains?|losses?)\s+(?:transactions?|activity)\s+found\b/i;
+  const noRealizedTransactionsPattern =
+    /\bno\s+(?:realized\s+)?(?:gain\/loss|gain\s*\/\s*loss)\s+transactions?\s+found\b/i;
+  const matchingLines = String(summary || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(
+      (line) =>
+        noTradePattern.test(line) ||
+        noRealizedPattern.test(line) ||
+        noRealizedTransactionsPattern.test(line),
+    );
+  if (!localDateKey) return matchingLines.length > 0;
+  return matchingLines.some((line) => line.includes(localDateKey));
+}
+
+function hasTradingPerformanceClaim(text: string): boolean {
+  const draft = String(text || "");
+  if (!draft.trim()) return false;
+  if (/\b\d+\s+(?:trades?|positions?|winners?|losers?)\b/i.test(draft)) return true;
+  if (/\bnet\s*[+−-]?\s*\$?\d/i.test(draft)) return true;
+  if (/[+−-]\s*\$\s*\d/.test(draft)) return true;
+  if (/\b(?:gain\/loss|gain\s*\/\s*loss|p&l)\b/i.test(draft)) return true;
+  const hasTradingTerm = /\b(?:printed|strike|calls?|puts?|short-term|contracts?|lots?|shares?)\b/i.test(draft);
+  const hasMetric = /\$|\b\d+(?:\.\d+)?\s*%|\b\d+\s*(?:shares?|contracts?|lots?)\b/i.test(draft);
+  return hasTradingTerm && hasMetric;
+}
+
+function scheduledSummaryHasTradingResultToday(summary: string, localDateKey?: string | null): boolean {
+  if (!localDateKey) return false;
+  return String(summary || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .some((line) => {
+      if (!line.includes(localDateKey)) return false;
+      if (!/latest_run_output=/i.test(line)) return false;
+      if (scheduledSummaryHasNoTradesToday(line)) return true;
+      return hasTradingPerformanceClaim(line);
+    });
+}
+
+function heartbeatContradictsNoTradeScheduledOutput(
+  text: string,
+  scheduledTasksSummary: string,
+  localDateKey?: string | null,
+): boolean {
+  if (!scheduledSummaryHasNoTradesToday(scheduledTasksSummary, localDateKey)) return false;
+  const draft = String(text || "");
+  if (!draft.trim()) return false;
+  const draftSaysNoTrades = scheduledSummaryHasNoTradesToday(draft);
+  if (draftSaysNoTrades) return false;
+  return hasTradingPerformanceClaim(draft);
+}
+
+function heartbeatHasUnsupportedTradingClaim(
+  text: string,
+  scheduledTasksSummary: string,
+  localDateKey?: string | null,
+): boolean {
+  const draft = String(text || "");
+  if (!hasTradingPerformanceClaim(draft)) return false;
+  if (scheduledSummaryHasNoTradesToday(draft)) return false;
+  return !scheduledSummaryHasTradingResultToday(scheduledTasksSummary, localDateKey);
+}
+
 async function mapLimit<T, R>(
   items: T[],
   limit: number,
@@ -1919,24 +2029,19 @@ async function generateReauthUrl(
   provider: string,
 ): Promise<string | null> {
   try {
-    const origin = process.env.NEXT_PUBLIC_APP_URL || "https://gogroovy.ai";
+    const origin = resolveDatagranLinkOrigin(null);
     const normalizedProvider = String(provider || "").trim().toLowerCase();
     const scopes = normalizedProvider === "gmail" ? GMAIL_REQUIRED_SCOPES : undefined;
-    const res = await fetch("https://www.datagran.io/api/link/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": datagranApiKey },
-      body: JSON.stringify({
-        endUser: { externalId: `flow_${userId}`, email },
-        origin,
-        provider,
-        ...(Array.isArray(scopes) && scopes.length > 0 ? { scopes } : {}),
-      }),
+    const res = await createDatagranLinkToken({
+      apiKeys: [datagranApiKey, process.env.DATAGRAN_API_KEY],
+      endUserExternalId: `flow_${userId}`,
+      email,
+      origin,
+      provider,
+      scopes,
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const linkToken = data.linkToken || data.link_token;
-    if (!linkToken) return null;
-    return `${origin}/dashboard?reauth=${provider}&linkToken=${linkToken}`;
+    if (!res.ok || !res.linkToken) return null;
+    return `${origin}/dashboard?reauth=${provider}&linkToken=${res.linkToken}`;
   } catch {
     return null;
   }
@@ -2206,7 +2311,11 @@ const HEARTBEAT_OPENAI_MODEL = "gpt-5-mini-2025-08-07";
 const HEARTBEAT_ANTHROPIC_MODEL =
   process.env.HEARTBEAT_ANTHROPIC_MODEL?.trim() || "claude-sonnet-4-5-20250929";
 
-async function resolveApiKey(supabase: SupabaseClient, userId: string): Promise<{
+async function resolveApiKey(
+  supabase: SupabaseClient,
+  userId: string,
+  preferredProvider?: ProviderId
+): Promise<{
   provider: ProviderId;
   modelName: string;
   apiKey: string | null;
@@ -2220,6 +2329,18 @@ async function resolveApiKey(supabase: SupabaseClient, userId: string): Promise<
   const openaiMode = resolved.keyModes.openai || resolved.globalMode;
   const anthropicUserKey = resolved.userKeys.anthropic || null;
   const openaiUserKey = resolved.userKeys.openai || null;
+
+  // A user-selected digest model can pin the provider (e.g. a GPT model must
+  // resolve OpenAI keys even though the default preference is Anthropic).
+  if (preferredProvider === "openai") {
+    if (openaiMode === "user" && openaiUserKey) {
+      return { provider: "openai", modelName: HEARTBEAT_OPENAI_MODEL, apiKey: openaiUserKey, billable: true, chargeType: "external_key_fee" };
+    }
+    if (openaiMode === "groovy" && process.env.OPENAI_API_KEY) {
+      return { provider: "openai", modelName: HEARTBEAT_OPENAI_MODEL, apiKey: null, billable: true, chargeType: "groovy_key" };
+    }
+    // Fall through to the default (Anthropic-first) resolution below.
+  }
 
   // Guardrail: if a Claude CLI headless token was accidentally saved under Anthropic,
   // never use it for chat models in heartbeat runs.
@@ -2372,6 +2493,11 @@ SCHEDULE TIME GROUNDING (STRICT):
 - If schedule_guard contains before_scheduled_time_today=true, NEVER claim the task "ran today", "ran this morning", or "already ran".
 - Only say a task ran "today" when last_run_local shows today's local date.
 - If timing is uncertain, say "latest recorded run was ..." and cite last_run_local instead of inferring.
+SCHEDULED JOB RESULT GROUNDING (STRICT):
+- last_status=success only means the automation completed; it does NOT prove the outcome was positive, interesting, or had data.
+- If CURRENT_SCHEDULED_TASKS includes latest_run_output, treat that as the only current evidence for that scheduled job's result.
+- Never invent scheduled-job outcomes from the job name, purpose, memory, or RECENT_HEARTBEAT_EXAMPLES.
+- For brokerage/trading/positions/P&L/returns claims, use only today's explicit latest_run_output or fresh integration data. If latest_run_output says no trades, no positions closed, or no realized gain/loss transactions, do not mention gains, losses, trades, positions, symbols, returns, winners, or losers except to say there were none.
 Respect local time and weekday context:
 - late_night (midnight–5 AM): __SKIP__. Period. Unless a calendar event is starting in the next 60 minutes, output __SKIP__. Do not send motivational messages, do not recap the day, do not comment on the time.
 - morning: prioritize what's coming soon today.
@@ -2430,6 +2556,7 @@ Step 3: If there is any actionable or meaningful context, send a concise heartbe
 Additional variety rules:
 - Do NOT reuse openings, rhythm, or phrasing from RECENT_HEARTBEAT_EXAMPLES.
 - If your draft overlaps with any example by 5+ consecutive words, rewrite it completely.
+- RECENT_HEARTBEAT_EXAMPLES are for repetition/style avoidance only. They are NOT factual evidence about today.
 - Each heartbeat should still feel useful and specific, not generic filler.`);
 
   if (opts.memoryContext) {
@@ -2519,6 +2646,21 @@ export async function runHeartbeat(args: {
   timezone?: string;
 }): Promise<HeartbeatResult> {
   const { supabase, userId, userEmail, taskConfig, jobId, timezone } = args;
+  const productAccess = await getProductAccessForUser({ userId }).catch(() => null);
+  if (!productAccess?.hasAccess) {
+    return {
+      ok: false,
+      text: "",
+      sessionId: null,
+      agentId: null,
+      sendWhatsApp: false,
+      sendTelegram: false,
+      error:
+        productAccess?.accessStatus === "trial_available"
+          ? "trial_not_started"
+          : "license_required",
+    };
+  }
   const preferredHeartbeatAgentId = await resolveOwnedAgentId(supabase, userId, args.agentId);
   const taskHeartbeatAgentId = await resolveOwnedAgentId(
     supabase,
@@ -2626,10 +2768,20 @@ export async function runHeartbeat(args: {
 
   console.log("[heartbeat] starting", { userId, lookback, maxEmails, maxEvents, maxWebPixels });
 
-  // 1. Resolve API key
-  const keyInfo = await resolveApiKey(supabase, userId);
+  // 1. Resolve API key (a model override pins the provider so e.g. a GPT
+  // digest model resolves OpenAI keys instead of the Anthropic-first default).
+  const overrideProvider: ProviderId | undefined = modelOverride
+    ? modelOverride.toLowerCase().startsWith("gpt") ||
+      modelOverride.toLowerCase().startsWith("o1") ||
+      modelOverride.toLowerCase().startsWith("o3")
+      ? "openai"
+      : "anthropic"
+    : undefined;
+  const keyInfo = await resolveApiKey(supabase, userId, overrideProvider);
+  const modelOverrideUsable = !modelOverride || overrideProvider === keyInfo.provider;
   const selectedModelName =
-    modelOverride || (keyInfo.provider === "anthropic" ? "claude-sonnet-4-6" : keyInfo.modelName);
+    (modelOverrideUsable ? modelOverride : "") ||
+    (keyInfo.provider === "anthropic" ? "claude-sonnet-4-6" : keyInfo.modelName);
   console.log("[heartbeat] resolved API key:", {
     provider: keyInfo.provider,
     modelName: selectedModelName,
@@ -2919,7 +3071,39 @@ Rules:
 
       if (visibleJobs.length > 0) {
         const localNow = formatLocalDateTimeForPrompt(now, tz);
-        const lines = visibleJobs.slice(0, 8).map((row, idx) => {
+        const promptJobs = visibleJobs.slice(0, 8);
+        const latestRunByJobId = new Map<string, ScheduledJobRunPromptRow>();
+        const promptJobIds = promptJobs
+          .map((row) => (typeof row.id === "string" && row.id.trim() ? row.id.trim() : ""))
+          .filter(Boolean);
+        if (promptJobIds.length > 0) {
+          const { data: runRows, errorMessage: runErrMessage, attempts: runAttempts } =
+            await runSupabaseQueryWithRetry<ScheduledJobRunPromptRow[]>(
+              () =>
+                supabase
+                  .from("scheduled_job_runs")
+                  .select("job_id,status,exit_code,started_at,finished_at,stdout,stderr,error,created_at")
+                  .eq("user_id", userId)
+                  .in("job_id", promptJobIds)
+                  .order("created_at", { ascending: false })
+                  .limit(Math.max(8, promptJobIds.length * 3)),
+              { label: "scheduled_job_runs_context" }
+            );
+          if (runErrMessage) {
+            console.warn("[heartbeat] scheduled job runs load failed:", runErrMessage);
+          } else {
+            if (runAttempts > 1) {
+              console.log("[heartbeat] scheduled job runs load recovered after retry", { attempts: runAttempts });
+            }
+            for (const run of (runRows || []) as ScheduledJobRunPromptRow[]) {
+              const jobId = typeof run.job_id === "string" && run.job_id.trim() ? run.job_id.trim() : "";
+              if (!jobId || latestRunByJobId.has(jobId)) continue;
+              latestRunByJobId.set(jobId, run);
+            }
+          }
+        }
+
+        const lines = promptJobs.map((row, idx) => {
           const fallbackName =
             typeof row.id === "string" && row.id ? `Task ${row.id.slice(0, 8)}` : `Task ${idx + 1}`;
           const name = typeof row.name === "string" && row.name.trim() ? row.name.trim() : fallbackName;
@@ -2936,7 +3120,11 @@ Rules:
             lastRunAt === "never" ? "never" : formatLocalDateTimeForPrompt(lastRunAt, tz);
           const scheduleGuard = formatScheduleTimingGuardForPrompt(row.schedule, localCtx);
           const purpose = summarizeJobPurposeForPrompt(row);
-          return `Task ${idx + 1}: ${name} | schedule=${schedule} | schedule_guard=${scheduleGuard} | last_status=${status} | last_run_utc=${lastRunAt} | last_run_local=${lastRunLocal} | purpose=${purpose}`;
+          const runSummary =
+            typeof row.id === "string" && row.id.trim()
+              ? summarizeScheduledRunForPrompt(latestRunByJobId.get(row.id.trim()), tz)
+              : "latest_run=(none)";
+          return `Task ${idx + 1}: ${name} | schedule=${schedule} | schedule_guard=${scheduleGuard} | last_status=${status} | last_run_utc=${lastRunAt} | last_run_local=${lastRunLocal} | ${runSummary} | purpose=${purpose}`;
         });
 
         if (visibleJobs.length > 8) {
@@ -2992,10 +3180,11 @@ Rules:
       const lines = ((recentRows || []) as Array<{ content?: unknown; metadata?: unknown; created_at?: unknown }>)
         .filter((row) => row && typeof row.content === "string" && row.content.trim())
         .filter((row) => {
-          // Avoid contaminating heartbeat examples with normal assistant chats.
-          // Legacy fallback: if we are scoped to a heartbeat session, allow metadata-less rows from that session.
+          // Avoid contaminating heartbeat examples with normal assistant chats or
+          // scheduled-job outputs. Examples are only examples when they were
+          // explicitly persisted as heartbeat messages.
           if (!row.metadata || typeof row.metadata !== "object") {
-            return Boolean(heartbeatAgentId || sessionId);
+            return false;
           }
           const m = row.metadata as Record<string, unknown>;
           const kind = typeof m.kind === "string" ? m.kind.trim() : "";
@@ -4663,6 +4852,23 @@ Regenerate with a FRESH angle and stronger novelty.
     // Prevent accidental "Email cleanup time" copycat openers outside intentional cleanup heartbeats.
     text = text.replace(/^email cleanup time(?:\s*[—:-]\s*|\.\s*)/i, "").trim();
     if (!text) {
+      text = "__SKIP__";
+    }
+  }
+
+  if (!text.startsWith("__SKIP__")) {
+    const todayLocalDateKey = formatDateKeyInTimezone(now, tz);
+    if (
+      heartbeatContradictsNoTradeScheduledOutput(
+        text,
+        scheduledTasksSummary,
+        todayLocalDateKey,
+      )
+    ) {
+      console.warn("[heartbeat] draft contradicted latest scheduled no-trade output; forcing __SKIP__");
+      text = "__SKIP__";
+    } else if (heartbeatHasUnsupportedTradingClaim(text, scheduledTasksSummary, todayLocalDateKey)) {
+      console.warn("[heartbeat] draft made unsupported scheduled trading claim; forcing __SKIP__");
       text = "__SKIP__";
     }
   }

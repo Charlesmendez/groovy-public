@@ -1,3 +1,5 @@
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
+
 type KapsoSendArgs = {
   phoneNumberId: string;
   to: string;
@@ -10,12 +12,7 @@ const KAPSO_PLATFORM_BASE_URL =
   process.env.KAPSO_PLATFORM_BASE_URL || "https://api.kapso.ai/platform/v1";
 
 function getAppBaseUrl() {
-  return (
-    process.env.NEXT_PUBLIC_APP_URL ||
-    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
-    (process.env.PORT ? `http://localhost:${process.env.PORT}` : "") ||
-    ""
-  );
+  return getConfiguredAppUrl() || "";
 }
 
 export async function sendKapsoText({ phoneNumberId, to, body }: KapsoSendArgs) {

@@ -6,6 +6,7 @@ import { extractText as extractPdfText } from "unpdf";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { runOrchestratorRound } from "@/lib/orchestrator/runOrchestratorRound";
+import { getAppUrl } from "@/lib/config/appConfig";
 import { extractWhatsAppSendConfirmation } from "@/lib/whatsapp/pendingSend";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import { normalizeConnectorPlatform, type ConnectorClientPlatform } from "@/lib/connector/platform";
@@ -1829,7 +1830,7 @@ export async function POST(req: Request) {
               ? { cli_token: resolved.claudeCliToken }
               : { api_key: apiKey }),
             allowed_tools: "Read,Edit,Bash,Write",
-            timeout_ms: 5 * 60 * 1000,
+            timeout_ms: 20 * 60 * 1000,
             ...(cliSessionId ? { session_id: cliSessionId } : {}),
           },
           message: "Running Claude Code…",
@@ -2104,6 +2105,25 @@ export async function POST(req: Request) {
     }
   } else if (toolResults.length === 0) {
     return NextResponse.json({ error: "message required" }, { status: 400 });
+  }
+
+  // Agent-task approval commands ("approve <task-id-prefix>") — checked before
+  // inbox commands; the hex-prefix pattern never collides with numeric inbox
+  // aliases.
+  if (hasUserMessage && toolResults.length === 0) {
+    const { executeAgentTaskCommand } = await import("@/lib/orchestrator/agentTasks");
+    const taskCommand = await executeAgentTaskCommand({
+      userId: verified.userId,
+      text: userMessageToPersist,
+      decidedBy: "whatsapp_web",
+    }).catch(() => ({ handled: false as const }));
+    if (taskCommand.handled) {
+      return NextResponse.json({
+        ok: true,
+        kind: "final",
+        text: taskCommand.reply || "Done.",
+      });
+    }
   }
 
   // Conversational inbox actions:
@@ -2587,17 +2607,58 @@ export async function POST(req: Request) {
     webPixelNamesCount: webPixelNames.length,
   });
 
+  const roundProgressMessages: string[] = [];
+  const roundProgressSeen = new Set<string>();
+  let assistantProgressBuffer = "";
+  const pushRoundProgress = (rawText: string) => {
+    const text = String(rawText || "").replace(/\s+/g, " ").trim();
+    if (!text || roundProgressMessages.length >= 5) return;
+    const key = text.toLowerCase();
+    if (roundProgressSeen.has(key)) return;
+    roundProgressSeen.add(key);
+    roundProgressMessages.push(text);
+  };
+  const flushAssistantProgress = () => {
+    const text = assistantProgressBuffer.replace(/\s+/g, " ").trim();
+    assistantProgressBuffer = "";
+    if (!text) return;
+    pushRoundProgress(text.length > 220 ? `${text.slice(0, 217)}...` : text);
+  };
+  const stripRoundProgressPrefix = (rawText: string) => {
+    const original = rawText.trim();
+    let text = original;
+    for (const progress of roundProgressMessages) {
+      const prefix = progress.trim();
+      if (prefix && text.startsWith(prefix)) {
+        text = text.slice(prefix.length).replace(/^[\s:.-]+/, "").trim();
+      }
+    }
+    return text || original;
+  };
+
   const round = await runOrchestratorRound({
     supabase,
     userId: verified.userId,
     userEmail,
     orchestratorAgentId: runtimeScope?.agentId || null,
     orchestratorSessionId: sessionId,
+    sourceProvider: provider,
+    sourceThreadKey: userScopedThreadKey,
     branchCurrentTurnCount: runtimeScope?.branchTurnCount ?? null,
     branchActiveCount: runtimeScope?.activeBranchCount ?? null,
     turnId: incomingTraceId || undefined,
-    appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+    appBaseUrl: getAppUrl(),
     deviceId: verified.deviceId,
+    // Task-runner notifications flow back to this WhatsApp chat, through the
+    // bridge's own device (which may differ from the worker's device).
+    taskNotifyTargets: {
+      whatsapp_web: {
+        threadKey: userScopedThreadKey,
+        chatId: requireString(body.threadKey),
+        deviceId: verified.deviceId,
+      },
+    },
+    taskRequestedChannel: "whatsapp_web",
     connectorPlatform,
     obsidianVaultPath,
     codeMode: false,
@@ -2619,6 +2680,13 @@ export async function POST(req: Request) {
     // User's AI chat agents for delegation
     aiChatAgents,
     webPixelNames,
+    onAssistantTextDelta: (event) => {
+      if (assistantProgressBuffer.length < 1000) assistantProgressBuffer += event.text;
+    },
+    onToolEvent: (event) => {
+      if (event.phase !== "start") return;
+      flushAssistantProgress();
+    },
   });
   const runtimeScopeAfterRound = await resolveRuntimeScope({
     supabase,
@@ -2688,7 +2756,9 @@ export async function POST(req: Request) {
           }
         : null;
     const hasFiles = Array.isArray(files) && files.length > 0;
-    const combinedReplyRaw = [inboxCommandReplyPrefix, typeof round.text === "string" ? round.text : ""]
+    const roundReplyText =
+      typeof round.text === "string" ? stripRoundProgressPrefix(round.text) : "";
+    const combinedReplyRaw = [inboxCommandReplyPrefix, roundReplyText]
       .filter((part) => typeof part === "string" && part.trim().length > 0)
       .join("\n\n");
     const MAX_WHATSAPP_REPLY_CHARS = 3500;
@@ -2752,23 +2822,14 @@ export async function POST(req: Request) {
       traceId: round.traceId,
       reply: replyText,
       files: (round as unknown as { files?: unknown }).files || undefined,
+      ...(roundProgressMessages.length > 0 ? { progressMessages: roundProgressMessages } : {}),
       ...(twilioFollowup ? { twilioFollowup } : {}),
     });
   }
 
   if (round.kind === "needs_connector") {
-    // Generate status message for WhatsApp to show progress
-    const statusMessages = round.connectorExecutes.map((ex) => {
-      if (ex.connectorType.startsWith("obsidian_")) return "Searching Obsidian vault...";
-      if (ex.connectorType.startsWith("browser_")) return "Working in browser...";
-      if (ex.connectorType.startsWith("file_")) return "Accessing files...";
-      if (ex.connectorType === "terminal_step") return "Working in Claude Code...";
-      return `Running ${ex.connectorType}...`;
-    });
-    const connectorMessage =
-      round.connectorExecutes.find((ex) => typeof ex.message === "string" && ex.message.trim())
-        ?.message || "";
-    const statusMessage = connectorMessage.trim() || statusMessages[0] || "Processing...";
+    const progressMessages = roundProgressMessages;
+    const statusMessage = progressMessages[0] || "";
     
     return NextResponse.json({
       ok: true,
@@ -2777,7 +2838,8 @@ export async function POST(req: Request) {
       traceId: round.traceId,
       partialText: round.partialText,
       connectorExecutes: round.connectorExecutes,
-      statusMessage,
+      ...(statusMessage ? { statusMessage } : {}),
+      ...(progressMessages.length > 0 ? { progressMessages } : {}),
     });
   }
 

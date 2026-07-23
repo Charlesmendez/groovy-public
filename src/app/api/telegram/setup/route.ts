@@ -5,16 +5,13 @@ import { getTelegramMe, setTelegramWebhook, deleteTelegramWebhook, setTelegramBo
 import { decryptTelegramBotToken, encryptTelegramBotToken } from "@/lib/telegram/botToken";
 import { randomBytes } from "crypto";
 import { logError, logInfo } from "@/lib/observability/log";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function getAppBaseUrl() {
-  return (
-    process.env.NEXT_PUBLIC_APP_URL ||
-    (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
-    ""
-  );
+  return getConfiguredAppUrl() || "";
 }
 
 export async function GET() {

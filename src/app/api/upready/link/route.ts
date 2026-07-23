@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "crypto";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { findUpreadyUserByEmail } from "@/lib/upready/client";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 type LinkBody = {
   email?: unknown;
@@ -17,7 +18,7 @@ function hashToken(token: string): string {
 }
 
 function safeOrigin(): string {
-  const fromEnv = (process.env.NEXT_PUBLIC_APP_URL || "").trim();
+  const fromEnv = getConfiguredAppUrl() || "";
   return fromEnv.replace(/\/+$/, "");
 }
 

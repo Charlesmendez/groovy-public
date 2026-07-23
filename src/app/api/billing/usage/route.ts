@@ -35,7 +35,7 @@ type ToolRow = {
 
 type WorkspaceMemberRow = {
   user_id: string;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
   created_at: string | null;
 };
 
@@ -43,7 +43,7 @@ type TeamMember = {
   userId: string;
   label: string;
   email: string | null;
-  role: "admin" | "member";
+  role: "admin" | "member" | "guest";
   isCurrentUser: boolean;
 };
 
@@ -386,7 +386,8 @@ export async function GET(req: Request) {
     .map((m) => {
       const userId = String(m.user_id || "");
       const authInfo = authInfoByUserId.get(userId) || null;
-      const role: "admin" | "member" = m.role === "admin" ? "admin" : "member";
+      const role: TeamMember["role"] =
+        m.role === "admin" ? "admin" : m.role === "guest" ? "guest" : "member";
       const isCurrentUser = userId === user.id;
       return {
         userId,
@@ -715,7 +716,7 @@ export async function GET(req: Request) {
       userId: string;
       label: string;
       email: string | null;
-      role: "admin" | "member";
+      role: "admin" | "member" | "guest";
       tokens: number;
       input: number;
       output: number;

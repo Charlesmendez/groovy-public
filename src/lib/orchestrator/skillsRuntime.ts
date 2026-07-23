@@ -67,6 +67,11 @@ function asNullableString(value: unknown): string | null {
   return trimmed || null;
 }
 
+function asPositiveInteger(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
+}
+
 export function sanitizeSkillSlug(input: string): string {
   const normalized = input
     .trim()
@@ -106,6 +111,31 @@ function isValidationStatus(value: unknown): value is SkillValidationStatus {
     value === "requested" ||
     value === "passed" ||
     value === "failed"
+  );
+}
+
+function dbErrorMessage(error: unknown): string {
+  if (!error || typeof error !== "object") return "";
+  const record = error as { message?: unknown; details?: unknown; hint?: unknown };
+  return [record.message, record.details, record.hint]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+}
+
+function isMissingSkillValidationSchemaError(error: unknown): boolean {
+  const message = dbErrorMessage(error);
+  return (
+    /validation_(status|task|token|output_preview|requested_at)|validated_at/i.test(message) &&
+    /(does not exist|could not find|schema cache)/i.test(message)
+  );
+}
+
+function skillValidationSchemaError(error: unknown): Error {
+  const message = dbErrorMessage(error);
+  return new Error(
+    `Skill registry schema is missing validation columns. Apply migration ` +
+      "`20260509010000_orchestrator_runtime_schema_repair.sql` and reload PostgREST, then retry." +
+      (message ? ` Database error: ${message}` : "")
   );
 }
 
@@ -250,6 +280,27 @@ export async function createSkillDraft(args: {
     );
   }
 
+  let createdSkillForDraft = false;
+  let nextVersion = 1;
+  if (skillId) {
+    const { data: latestVersionRow, error: latestVersionErr } = await args.supabase
+      .from("orchestrator_skill_versions")
+      .select("version")
+      .eq("user_id", args.userId)
+      .eq("agent_id", args.agentId)
+      .eq("skill_id", skillId)
+      .order("version", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (latestVersionErr) {
+      throw new Error(latestVersionErr.message || "Failed to load latest skill version.");
+    }
+    const currentVersion = asPositiveInteger(
+      (latestVersionRow as Record<string, unknown> | null)?.version
+    );
+    nextVersion = currentVersion > 0 ? currentVersion + 1 : 1;
+  }
+
   if (!skillId) {
     const { data: createdSkill, error: createErr } = await args.supabase
       .from("orchestrator_skills")
@@ -261,6 +312,7 @@ export async function createSkillDraft(args: {
         description,
         lifecycle: "draft",
         runner: args.runner,
+        latest_version: nextVersion,
       })
       .select("id,lifecycle")
       .single();
@@ -268,17 +320,7 @@ export async function createSkillDraft(args: {
       throw new Error(createErr?.message || "Failed to create skill draft.");
     }
     skillId = String(createdSkill.id);
-  } else {
-    await args.supabase
-      .from("orchestrator_skills")
-      .update({
-        name,
-        description,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", skillId)
-      .eq("user_id", args.userId)
-      .eq("agent_id", args.agentId);
+    createdSkillForDraft = true;
   }
 
   const { data: version, error: versionErr } = await args.supabase
@@ -287,6 +329,8 @@ export async function createSkillDraft(args: {
       user_id: args.userId,
       agent_id: args.agentId,
       skill_id: skillId,
+      version: nextVersion,
+      lifecycle: "draft",
       runner: args.runner,
       source,
       default_state: args.defaultState || {},
@@ -297,7 +341,41 @@ export async function createSkillDraft(args: {
     )
     .single();
   if (versionErr || !version?.id) {
+    if (createdSkillForDraft && skillId) {
+      await args.supabase
+        .from("orchestrator_skills")
+        .delete()
+        .eq("id", skillId)
+        .eq("user_id", args.userId)
+        .eq("agent_id", args.agentId);
+    }
+    if (isMissingSkillValidationSchemaError(versionErr)) {
+      throw skillValidationSchemaError(versionErr);
+    }
     throw new Error(versionErr?.message || "Failed to create skill draft version.");
+  }
+
+  if (existing) {
+    const { error: updateSkillErr } = await args.supabase
+      .from("orchestrator_skills")
+      .update({
+        name,
+        description,
+        latest_version: nextVersion,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", skillId)
+      .eq("user_id", args.userId)
+      .eq("agent_id", args.agentId);
+    if (updateSkillErr) {
+      await args.supabase
+        .from("orchestrator_skill_versions")
+        .delete()
+        .eq("id", version.id)
+        .eq("user_id", args.userId)
+        .eq("agent_id", args.agentId);
+      throw new Error(updateSkillErr.message || "Failed to update skill draft metadata.");
+    }
   }
 
   return {
@@ -339,7 +417,13 @@ export async function resolveSkillDraftVersion(args: {
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  if (error || !versionRow) return null;
+  if (error) {
+    if (isMissingSkillValidationSchemaError(error)) {
+      throw skillValidationSchemaError(error);
+    }
+    return null;
+  }
+  if (!versionRow) return null;
   return mapSkillDraftVersionRow(skill, versionRow as Record<string, unknown>);
 }
 
@@ -351,7 +435,7 @@ export async function requestSkillDraftValidation(args: {
   validationTask: string;
   token: string;
 }) {
-  await args.supabase
+  const { error } = await args.supabase
     .from("orchestrator_skill_versions")
     .update({
       validation_status: "requested",
@@ -365,6 +449,12 @@ export async function requestSkillDraftValidation(args: {
     .eq("id", args.versionId)
     .eq("user_id", args.userId)
     .eq("agent_id", args.agentId);
+  if (error) {
+    if (isMissingSkillValidationSchemaError(error)) {
+      throw skillValidationSchemaError(error);
+    }
+    throw new Error(error.message || "Failed to request skill draft validation.");
+  }
 }
 
 export async function activateSkillDraft(args: {
@@ -386,7 +476,7 @@ export async function activateSkillDraft(args: {
   const preview = String(args.validationOutput || "").trim().slice(0, 4000);
   const nowIso = new Date().toISOString();
   if (!validation.matched || !validation.passed) {
-    await args.supabase
+    const { error: markFailedErr } = await args.supabase
       .from("orchestrator_skill_versions")
       .update({
         validation_status: "failed",
@@ -397,6 +487,14 @@ export async function activateSkillDraft(args: {
       .eq("id", draft.versionId)
       .eq("user_id", args.userId)
       .eq("agent_id", args.agentId);
+    if (markFailedErr) {
+      if (isMissingSkillValidationSchemaError(markFailedErr)) {
+        throw skillValidationSchemaError(markFailedErr);
+      }
+      throw new Error(
+        `Validation failed for "${draft.slug}", and Groovy could not persist the failure: ${markFailedErr.message || "unknown_error"}`
+      );
+    }
     throw new Error(
       validation.matched
         ? `Validation failed for "${draft.slug}": ${validation.reason || "validation_failed"}`
@@ -404,7 +502,7 @@ export async function activateSkillDraft(args: {
     );
   }
 
-  await args.supabase
+  const { error: markPassedErr } = await args.supabase
     .from("orchestrator_skill_versions")
     .update({
       validation_status: "passed",
@@ -415,8 +513,14 @@ export async function activateSkillDraft(args: {
     .eq("id", draft.versionId)
     .eq("user_id", args.userId)
     .eq("agent_id", args.agentId);
+  if (markPassedErr) {
+    if (isMissingSkillValidationSchemaError(markPassedErr)) {
+      throw skillValidationSchemaError(markPassedErr);
+    }
+    throw new Error(markPassedErr.message || `Failed to mark skill "${draft.slug}" as validated.`);
+  }
 
-  await args.supabase
+  const { error: activateErr } = await args.supabase
     .from("orchestrator_skills")
     .update({
       lifecycle: "canary",
@@ -426,6 +530,9 @@ export async function activateSkillDraft(args: {
     .eq("id", draft.skillId)
     .eq("user_id", args.userId)
     .eq("agent_id", args.agentId);
+  if (activateErr) {
+    throw new Error(activateErr.message || `Failed to activate skill "${draft.slug}".`);
+  }
 
   return {
     ...draft,

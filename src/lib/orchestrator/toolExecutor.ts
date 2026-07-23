@@ -18,6 +18,9 @@ import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/bi
 import { usageChargeTypeForKeyMode } from "@/lib/billing/pricing";
 import { getUpreadyReadinessForFlowUser } from "@/lib/upready/client";
 import { buildInternalRouteAuthHeaders } from "@/lib/internalRouteAuth";
+import { getAppUrl } from "@/lib/config/appConfig";
+import { inferScheduledWhatsAppDeliveryIntent } from "@/lib/scheduler/delivery";
+import { inferProviderForModelId } from "@/lib/ai/modelCatalog";
 import { ensureOrchestratorRuntimeAgentId } from "./runtimeAgents";
 import { startParallelBranchRuntime } from "./parallelBranchRuntime";
 import {
@@ -35,7 +38,14 @@ import {
   resolveSkillDraftVersion,
 } from "./skillsRuntime";
 import { executeExtensionRuntimeTool } from "@/lib/extensions/runtime";
+import {
+  toolPolicyDenialReason,
+  toolPolicyParameterDenialReason,
+  type ToolPolicyExecutionContext,
+} from "@/lib/orchestrator/toolPolicy";
+import type { HarnessProfile } from "@/lib/orchestrator/harnessProfiles";
 import type { ExtensionRuntimeTool } from "@/lib/extensions/types";
+import { loadIntegrationAssignments } from "@/lib/integrations/assignments";
 import {
   sendTelegramText,
   sendTelegramPhoto,
@@ -59,7 +69,19 @@ export type AgentActivity = {
 
 export type ToolExecutionContext = {
   userId: string;
+  /** Owner of workspace-scoped integration credentials (distinct from actor). */
+  integrationOwnerUserId?: string;
+  /**
+   * Security boundary for the active harness profile and source surface.
+   * executeTool checks this before resolving extensions or dispatching to any
+   * specialized executor.
+   */
+  toolPolicy?: ToolPolicyExecutionContext;
+  /** Exact resolved profile inherited by nested/parallel orchestrator rounds. */
+  harnessProfile?: HarnessProfile | null;
   traceId?: string;
+  /** Shared turn cancellation signal. Executors must fail closed once aborted. */
+  abortSignal?: AbortSignal;
   connectorPlatform?: ConnectorClientPlatform;
   // Stable id for the user "turn" across multi-round loops (used for billing aggregation)
   turnId?: string;
@@ -163,6 +185,11 @@ export type ToolExecutionContext = {
   branchGoal?: string | null;
   // Orchestrator session ID (so scheduled jobs can be linked back to the session that created them)
   orchestratorSessionId?: string | null;
+  // Notification targets for worker-agent tasks created this turn (assign_task).
+  // Set by channel entrypoints (WhatsApp webhook, Telegram, dashboard).
+  taskNotifyTargets?: import("@/lib/orchestrator/agentTasks").AgentTaskNotifyTargets;
+  // Channel that requested this turn, recorded on created agent tasks.
+  taskRequestedChannel?: string | null;
   // Handshake: active inter-agent communication session
   activeHandshakeId?: string | null;
   handshakePartnerSessionId?: string | null;
@@ -189,6 +216,7 @@ const WRITE_LIKE_TOOLS = new Set<string>([
   "schedule_cancel_next",
   "schedule_delete",
   "remember",
+  "wiki_file_learning",
   "files_write",
   "files_delete",
   "files_move",
@@ -210,6 +238,8 @@ const WRITE_LIKE_TOOLS = new Set<string>([
   "skill_registry_create_draft",
   "skill_registry_validate_draft",
   "skill_registry_activate_draft",
+  "assign_skill_or_doc",
+  "remove_skill_or_doc_assignment",
 ]);
 
 function isWriteLikeTool(toolName: string, context?: ToolExecutionContext): boolean {
@@ -456,6 +486,7 @@ async function executeRuntimeBranchTool(
             localTimezone: context.localTimezone,
             scheduledMode: context.scheduledMode === true,
             traceId: context.traceId,
+            harnessProfile: context.harnessProfile,
           },
           tasks: requestedTasks,
           sharedContext,
@@ -939,6 +970,33 @@ export async function executeTool(
   context: ToolExecutionContext
 ): Promise<ToolResult> {
   const startTime = Date.now();
+  if (context.abortSignal?.aborted) {
+    return {
+      success: false,
+      error: "This run was stopped by a team member.",
+      agent: toolToAgent(toolName) || "unknown",
+      toolName,
+      executionTime: 0,
+    };
+  }
+  const policyDenial =
+    toolPolicyDenialReason(toolName, context.toolPolicy) ||
+    toolPolicyParameterDenialReason(toolName, params, context.toolPolicy);
+  if (policyDenial) {
+    logEvent(context, "tool_policy_blocked", {
+      toolName,
+      profileId: context.toolPolicy?.profileId ?? null,
+      surface: context.toolPolicy?.surface ?? null,
+      provider: context.toolPolicy?.provider ?? null,
+    });
+    return {
+      success: false,
+      error: policyDenial,
+      agent: toolToAgent(toolName) || "unknown",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  }
   const extensionTool = context.extensionToolsByName?.[toolName];
   const agent = extensionTool ? "extension" : toolToAgent(toolName);
   const gate = applyBranchControllerGate(toolName, context);
@@ -988,6 +1046,34 @@ export async function executeTool(
 
   if (toolName === "runtime_branch_parallel") {
     const r = await executeRuntimeBranchTool(toolName, params, context, startTime);
+    logEvent(context, "tool_execute_end", {
+      toolName,
+      agent: r.agent,
+      success: r.success,
+      executionTimeMs: r.executionTime,
+      error: r.error,
+    });
+    return r;
+  }
+
+  // Worker-agent delegation tools (harness core)
+  if (
+    toolName === "list_agents" ||
+    toolName === "list_skills_and_docs" ||
+    toolName === "assign_skill_or_doc" ||
+    toolName === "remove_skill_or_doc_assignment" ||
+    toolName === "assign_task" ||
+    toolName === "consult_agent" ||
+    toolName === "finalize_plan" ||
+    toolName === "check_agent_status" ||
+    toolName === "collect_result" ||
+    toolName === "transfer_context" ||
+    toolName === "usage_report"
+  ) {
+    const { executeAgentDelegationTool } = await import(
+      "@/lib/orchestrator/delegationToolExecutor"
+    );
+    const r = await executeAgentDelegationTool(toolName, params, context, startTime);
     logEvent(context, "tool_execute_end", {
       toolName,
       agent: r.agent,
@@ -1531,44 +1617,6 @@ async function executeScheduleTool(
     return recentOwned?.id ? String(recentOwned.id) : null;
   };
 
-  const inferScheduledTaskRequiresWhatsAppDelivery = (taskMessage: string): boolean => {
-    const normalized = String(taskMessage || "")
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim();
-    if (!normalized) return false;
-    if (
-      normalized.includes("whatsapp") ||
-      normalized.includes("whats app") ||
-      normalized.includes("whatsapp_send_text") ||
-      normalized.includes("whatsapp_send_media") ||
-      normalized.includes("whatsapp_send_default_group") ||
-      normalized.includes("whatsapp_resolve_recipient")
-    ) {
-      return true;
-    }
-    if (
-      normalized.includes("email") ||
-      normalized.includes("gmail") ||
-      normalized.includes("slack") ||
-      normalized.includes("discord") ||
-      normalized.includes("telegram") ||
-      normalized.includes("twilio") ||
-      normalized.includes("sms") ||
-      normalized.includes("phone call") ||
-      normalized.includes(" call ") ||
-      normalized.includes("signal") ||
-      normalized.includes("imessage") ||
-      normalized.includes("microsoft teams") ||
-      normalized.includes("teams")
-    ) {
-      return false;
-    }
-    const hasSendVerb = /\b(send|text|message|deliver|post|notify|share)\b/.test(normalized);
-    const hasChatTarget = /\b(group|chat|team|recipient|thread|channel)\b/.test(normalized);
-    return hasSendVerb && hasChatTarget;
-  };
-
   const normalizeScheduledWhatsAppTargetValue = (raw: unknown): string => {
     if (typeof raw !== "string") return "";
     return raw.replace(/\s+/g, " ").trim().replace(/^['"`]+|['"`]+$/g, "").trim();
@@ -1680,11 +1728,24 @@ async function executeScheduleTool(
         kind === "orchestrator" && typeof params.task === "string" ? params.task.trim() : "";
       const requiresWhatsAppDelivery =
         kind === "orchestrator" && taskMessage
-          ? inferScheduledTaskRequiresWhatsAppDelivery(taskMessage)
+          ? inferScheduledWhatsAppDeliveryIntent(taskMessage)
           : false;
       const scheduledWhatsAppRecipientQuery =
         kind === "orchestrator" && requiresWhatsAppDelivery && taskMessage
           ? extractScheduledWhatsAppRecipientQuery(taskMessage)
+          : "";
+      const scheduledModel =
+        kind === "orchestrator" && typeof params.model === "string"
+          ? params.model.trim()
+          : "";
+      const scheduledProvider = scheduledModel
+        ? params.provider === "anthropic" || params.provider === "openai"
+          ? params.provider
+          : inferProviderForModelId(scheduledModel)
+        : null;
+      const scheduledReasoningEffort =
+        scheduledModel && typeof params.reasoning_effort === "string"
+          ? params.reasoning_effort.trim()
           : "";
 
       if (kind === "shell" && !command) {
@@ -1727,12 +1788,58 @@ async function executeScheduleTool(
         };
       }
 
+      // Optional worker-agent target (Part B): the schedule runs on a specific
+      // worker instead of an orchestrator round. Never for shell jobs.
+      let targetAgentId: string | null = null;
+      const workerRef =
+        kind === "orchestrator" && typeof params.agent === "string" ? params.agent.trim() : "";
+      if (workerRef) {
+        const { resolveWorkerAgentByRef } = await import("@/lib/orchestrator/agentTasks");
+        const resolvedWorker = await resolveWorkerAgentByRef(userId, workerRef);
+        if (!resolvedWorker.ok) {
+          return {
+            success: false,
+            error:
+              resolvedWorker.error === "ambiguous"
+                ? `Multiple worker agents match "${workerRef}": ${(resolvedWorker.candidates || []).join(", ")}. Use the exact name.`
+                : `No worker agent named "${workerRef}". Omit the agent to schedule on the Orchestrator, or use list_agents for the roster.`,
+            agent: "schedule",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        if (!resolvedWorker.agent.deviceId) {
+          return {
+            success: false,
+            error: `Worker agent "${resolvedWorker.agent.name}" has no connected device, so it cannot run scheduled tasks yet.`,
+            agent: "schedule",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        if (scheduledModel && scheduledProvider) {
+          const expectedProvider =
+            resolvedWorker.agent.harness === "codex" ? "openai" : "anthropic";
+          if (scheduledProvider !== expectedProvider) {
+            return {
+              success: false,
+              error: `Model "${scheduledModel}" uses ${scheduledProvider}, but worker "${resolvedWorker.agent.name}" runs ${resolvedWorker.agent.harness === "codex" ? "Codex" : "Claude Code"}. Choose a compatible model or omit model to use the worker default.`,
+              agent: "schedule",
+              toolName,
+              executionTime: Date.now() - startTime,
+            };
+          }
+        }
+        targetAgentId = resolvedWorker.agent.id;
+      }
+
       const { data, error } = await supabase
         .from("scheduled_jobs")
         .insert({
           user_id: userId,
           device_id: deviceId,
           agent_id: resolvedAgentId,
+          target_agent_id: targetAgentId,
           name: name || "Scheduled task",
           kind,
           command: kind === "shell" ? command : null,
@@ -1747,19 +1854,36 @@ async function executeScheduleTool(
                         orchestrator_session_id: explicitSessionId,
                       }
                     : {}),
-                  ...(requiresWhatsAppDelivery
+                  ...(requiresWhatsAppDelivery || scheduledModel
                     ? {
                         options: {
-                          requires_whatsapp_delivery: true,
-                          ...(scheduledWhatsAppRecipientQuery
+                          ...(requiresWhatsAppDelivery
+                            ? { requires_whatsapp_delivery: true }
+                            : {}),
+                          ...(requiresWhatsAppDelivery && scheduledWhatsAppRecipientQuery
                             ? {
                                 whatsapp_recipient_query: scheduledWhatsAppRecipientQuery,
+                              }
+                            : {}),
+                          ...(scheduledModel
+                            ? {
+                                model_name: scheduledModel,
+                                model_provider: scheduledProvider,
+                                ...(scheduledReasoningEffort
+                                  ? { reasoning_effort: scheduledReasoningEffort }
+                                  : {}),
                               }
                             : {}),
                         },
                       }
                     : {}),
                 }
+              : null,
+          // A schedule created from a custom Mind stays bound to that exact
+          // profile. Worker-targeted jobs use the worker's own harness instead.
+          profile_id:
+            kind === "orchestrator" && !targetAgentId
+              ? context.harnessProfile?.id || null
               : null,
           schedule,
         })
@@ -1785,6 +1909,16 @@ async function executeScheduleTool(
             success: false,
             error:
               "Agent runtime migration not applied. Apply migration `20260228020000_agent_runtime_graph_and_branch_controller.sql` and retry scheduling.",
+            agent: "schedule",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        if (/profile_id/i.test(msg)) {
+          return {
+            success: false,
+            error:
+              "Harness profile migration not applied. Apply migration `20260723000000_orchestrator_profiles.sql` and retry scheduling.",
             agent: "schedule",
             toolName,
             executionTime: Date.now() - startTime,
@@ -1986,7 +2120,7 @@ async function executeScheduleTool(
 }
 
 /**
- * Execute memory tools (using Groovy-managed Datagran memory)
+ * Execute semantic memory and structured Wiki tools.
  */
 async function executeMemoryTool(
   toolName: string,
@@ -1996,19 +2130,102 @@ async function executeMemoryTool(
 ): Promise<ToolResult> {
   const { 
     getGroovyMemoryConnection, 
-    storeMemoryNote, 
+    storeDurableLearning,
     queryMemoryDirect 
   } = await import("@/lib/memory/groovyMemory");
+  const {
+    fileLearningToWiki,
+    readWikiKnowledge,
+    searchWikiKnowledge,
+  } = await import("@/lib/memory/wikiMemory");
 
   try {
-    const connectionId =
-      context.datagranConnectionId ||
-      (await getGroovyMemoryConnection(context.userId, undefined, context.supabase));
+    if (
+      toolName === "wiki_search" ||
+      toolName === "wiki_read" ||
+      toolName === "wiki_file_learning"
+    ) {
+      if (!context.supabase) {
+        return {
+          success: false,
+          error: "Wiki is not available in this runtime",
+          agent: "memory",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
 
-    if (!connectionId) {
+      if (toolName === "wiki_search") {
+        const matches = await searchWikiKnowledge(
+          {
+            supabase: context.supabase,
+            userId: context.userId,
+            profileId:
+              context.toolPolicy?.memoryScope === "profile"
+                ? context.toolPolicy.memoryScopeId || undefined
+                : undefined,
+          },
+          String(params.query || ""),
+          typeof params.limit === "number" ? params.limit : 5
+        );
+        return {
+          success: true,
+          result: { matches },
+          agent: "memory",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      if (toolName === "wiki_read") {
+        const file = await readWikiKnowledge(
+          {
+            supabase: context.supabase,
+            userId: context.userId,
+            profileId:
+              context.toolPolicy?.memoryScope === "profile"
+                ? context.toolPolicy.memoryScopeId || undefined
+                : undefined,
+          },
+          String(params.path || "")
+        );
+        return {
+          success: true,
+          result: file,
+          agent: "memory",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      const filed = await fileLearningToWiki({
+        supabase: context.supabase,
+        userId: context.userId,
+        content: String(params.content || ""),
+        label: typeof params.label === "string" ? params.label : undefined,
+        source: "orchestrator wiki tool",
+        target: {
+          category:
+            params.category === "entities" ||
+            params.category === "concepts" ||
+            params.category === "projects"
+              ? params.category
+              : undefined,
+          page: typeof params.page === "string" ? params.page : undefined,
+          title: typeof params.title === "string" ? params.title : undefined,
+        },
+        profileId:
+          context.toolPolicy?.memoryScope === "profile"
+            ? context.toolPolicy.memoryScopeId || undefined
+            : undefined,
+      });
       return {
-        success: false,
-        error: "Memory not available",
+        success: filed.filed || filed.reason === "duplicate",
+        result: filed,
+        error:
+          !filed.filed && filed.reason !== "duplicate"
+            ? filed.reason || "Failed to file Wiki learning"
+            : undefined,
         agent: "memory",
         toolName,
         executionTime: Date.now() - startTime,
@@ -2018,10 +2235,60 @@ async function executeMemoryTool(
     if (toolName === "remember") {
       const content = params.content as string;
       const label = params.label as string | undefined;
-      const stored = await storeMemoryNote(connectionId, content, label);
+      const connectionId =
+        context.datagranConnectionId ||
+        (await getGroovyMemoryConnection(
+          context.userId,
+          undefined,
+          context.supabase,
+          context.toolPolicy?.memoryScope === "profile"
+            ? context.toolPolicy.memoryScopeId || undefined
+            : undefined,
+        ));
+      const stored = await storeDurableLearning(connectionId || "", content, label, {
+        wiki: context.supabase
+          ? {
+              supabase: context.supabase,
+              userId: context.userId,
+              source: "orchestrator remember tool",
+              profileId:
+                context.toolPolicy?.memoryScope === "profile"
+                  ? context.toolPolicy.memoryScopeId || undefined
+                  : undefined,
+              target: {
+                category:
+                  params.wiki_category === "entities" ||
+                  params.wiki_category === "concepts" ||
+                  params.wiki_category === "projects"
+                    ? params.wiki_category
+                    : undefined,
+                page:
+                  typeof params.wiki_page === "string"
+                    ? params.wiki_page
+                    : undefined,
+                title:
+                  typeof params.wiki_title === "string"
+                    ? params.wiki_title
+                    : undefined,
+              },
+            }
+          : undefined,
+      });
       return {
-        success: stored,
-        result: stored ? { remembered: content, label } : { error: "Failed to store" },
+        success: stored.stored,
+        error: stored.stored
+          ? undefined
+          : stored.reason || "Failed to store in Datagran and Wiki",
+        result: stored.stored
+          ? {
+              remembered: content,
+              label,
+              datagranStored: stored.datagranStored,
+              wikiFiled: stored.wikiFiled,
+              wikiPath: stored.wikiPath,
+              wikiReason: stored.wikiReason,
+            }
+          : { error: stored.reason || "Failed to store in Datagran and Wiki" },
         agent: "memory",
         toolName,
         executionTime: Date.now() - startTime,
@@ -2029,7 +2296,57 @@ async function executeMemoryTool(
     }
 
     if (toolName === "recall") {
-      const query = params.query as string;
+      const rawQuery = params.query as string;
+      const profileId =
+        context.toolPolicy?.memoryScope === "profile"
+          ? context.toolPolicy.memoryScopeId || undefined
+          : undefined;
+      const connectionId =
+        context.datagranConnectionId ||
+        (await getGroovyMemoryConnection(
+          context.userId,
+          undefined,
+          context.supabase,
+          profileId,
+        ));
+      if (!connectionId) {
+        if (context.supabase) {
+          const matches = await searchWikiKnowledge(
+            {
+              supabase: context.supabase,
+              userId: context.userId,
+              profileId,
+            },
+            rawQuery,
+            8,
+          );
+          return {
+            success: true,
+            result: {
+              context: matches
+                .map((match) => `[${match.path}]\n${match.content}`)
+                .join("\n\n"),
+              data: null,
+              source: "wiki",
+              matches,
+            },
+            agent: "memory",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        return {
+          success: false,
+          error: "Memory is not configured",
+          agent: "memory",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      const query =
+        context.toolPolicy?.memoryScope === "profile" && context.toolPolicy.memoryScopeId
+          ? `Only use memories tagged [HARNESS_PROFILE:${context.toolPolicy.memoryScopeId}]. ${rawQuery}`
+          : rawQuery;
       const memory = await queryMemoryDirect(connectionId, query);
       return {
         success: true,
@@ -2138,13 +2455,17 @@ async function executeDataToolViaDelegation(
     }
 
     if (toolName === "data_query") {
+      const integrationOwnerUserId =
+        context.integrationOwnerUserId || context.userId;
       const provider = params.provider as string;
       const query = params.query as string;
+      const agentName = typeof params.agentName === "string" ? params.agentName.trim() : "";
       const pixelName = params.pixelName as string | undefined;
 
       logEvent(context, "data_query_delegating", {
         provider,
         query: query?.slice(0, 200),
+        agentName: agentName || undefined,
         pixelName,
       });
 
@@ -2156,7 +2477,7 @@ async function executeDataToolViaDelegation(
         .select(
           "agent_id, provider, connection_id, updated_at, agents!datagran_agent_configs_agent_id_fkey(id, name, type)"
         )
-        .eq("user_id", context.userId)
+        .eq("user_id", integrationOwnerUserId)
         .in("provider", dbProviders)
         .order("updated_at", { ascending: false })
         .limit(10);
@@ -2183,13 +2504,28 @@ async function executeDataToolViaDelegation(
           updatedAt: c.updated_at as string,
         };
       });
-      const agentConfigs = allAgentConfigs.filter((a) => a.connectionId.length > 0);
+      const assignmentState = await loadIntegrationAssignments({
+        supabase,
+        userId: integrationOwnerUserId,
+        availableIntegrationIds: allAgentConfigs.map((agent) => agent.agentId),
+        profileId: context.harnessProfile?.id || null,
+      });
+      const assignedIntegrationIds = new Set(assignmentState.assignments.orchestrator);
+      const agentConfigs = allAgentConfigs.filter(
+        (agent) =>
+          agent.connectionId.length > 0 && assignedIntegrationIds.has(agent.agentId)
+      );
 
       if (agentConfigs.length === 0) {
         const hasConfiguredAgent = allAgentConfigs.length > 0;
+        const hasAssignedAgent = allAgentConfigs.some((agent) =>
+          assignedIntegrationIds.has(agent.agentId)
+        );
         return {
           success: false,
-          error: hasConfiguredAgent
+          error: hasConfiguredAgent && !hasAssignedAgent
+            ? `No ${provider} integration is assigned to the orchestrator. Assign one in Settings → Integrations.`
+            : hasConfiguredAgent
             ? `No active ${provider} connection found. Your agent exists but the connection is missing or invalid. Please reconnect ${provider} in the Data integrations panel.`
             : `No ${provider} agent configured. Please connect ${provider} in the Data integrations panel first.`,
           agent: "data",
@@ -2199,8 +2535,38 @@ async function executeDataToolViaDelegation(
       }
 
       // For web_pixel, select by name if specified
+      const availableAgents = agentConfigs.map((a) => ({
+        id: a.agentId,
+        name: a.agentName,
+        provider: a.provider,
+      }));
+      const normalizeAgentSelector = (value: string) =>
+        value.toLowerCase().replace(/\s+/g, " ").trim();
+
       let selectedAgent = agentConfigs[0];
-      if (provider === "web_pixel" && pixelName) {
+      if (agentName) {
+        const wanted = normalizeAgentSelector(agentName);
+        const match = agentConfigs.find((a) => {
+          const name = normalizeAgentSelector(a.agentName);
+          const id = normalizeAgentSelector(a.agentId);
+          return name === wanted || id === wanted || name.includes(wanted);
+        });
+        if (!match) {
+          return {
+            success: false,
+            error: `No active ${provider} agent matched agentName "${agentName}".`,
+            result: {
+              provider,
+              requestedAgentName: agentName,
+              availableAgents,
+            },
+            agent: "data",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        selectedAgent = match;
+      } else if (provider === "web_pixel" && pixelName) {
         const match = agentConfigs.find(
           (a) => a.agentName.toLowerCase().includes(pixelName.toLowerCase())
         );
@@ -2211,7 +2577,8 @@ async function executeDataToolViaDelegation(
         agentId: selectedAgent.agentId,
         agentName: selectedAgent.agentName,
         provider: selectedAgent.provider,
-        availableAgents: agentConfigs.map((a) => ({ id: a.agentId, name: a.agentName })),
+        availableAgents,
+        agentNameRequested: agentName || undefined,
       });
 
       // Emit agent activity event for UI
@@ -2228,10 +2595,7 @@ async function executeDataToolViaDelegation(
       // Call the Datagran agent via internal API
       const baseUrl =
         context.appBaseUrl ||
-        process.env.NEXT_PUBLIC_APP_URL ||
-        (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
-        (process.env.PORT ? `http://localhost:${process.env.PORT}` : "") ||
-        "http://localhost:3000";
+        getAppUrl();
       const { data: delegatedSession, error: delegatedSessionErr } = await supabase
         .from("chat_sessions")
         .insert({
@@ -2305,15 +2669,33 @@ async function executeDataToolViaDelegation(
         );
       }
       const chatUrl = `${baseUrl}/api/datagran/chat`;
-      const internalAuthHeaders =
-        !context.cookies && !context.deviceToken
-          ? buildInternalRouteAuthHeaders({
-              userId: context.userId,
-              scope: "datagran-chat",
-            })
-          : {};
+      // This is a server-to-server call to our own route. Always include
+      // internal auth so stale browser cookies cannot turn data_query into a
+      // false 401 in long orchestrator runs. A valid device token still wins in
+      // the target route when present.
+      const internalAuthHeaders = buildInternalRouteAuthHeaders({
+        userId: context.userId,
+        scope: "datagran-chat",
+      });
       const abortController = new AbortController();
       const abortTimeout = setTimeout(() => abortController.abort(), DATA_QUERY_TIMEOUT_MS);
+      const abortFromTurn = () =>
+        abortController.abort(
+          context.abortSignal?.reason instanceof Error
+            ? context.abortSignal.reason
+            : new Error("orchestrator_run_aborted"),
+        );
+      if (context.abortSignal?.aborted) {
+        abortFromTurn();
+      } else {
+        context.abortSignal?.addEventListener("abort", abortFromTurn, {
+          once: true,
+        });
+      }
+      const clearAbortGuards = () => {
+        clearTimeout(abortTimeout);
+        context.abortSignal?.removeEventListener("abort", abortFromTurn);
+      };
       let response: Response;
       try {
         response = await fetch(chatUrl, {
@@ -2340,9 +2722,11 @@ async function executeDataToolViaDelegation(
         // Keep context cookies current to avoid refresh_token_already_used on later calls.
         refreshContextCookiesFromResponse(context, response);
       } catch (err) {
-        clearTimeout(abortTimeout);
+        clearAbortGuards();
         const isAborted = abortController.signal.aborted;
-        const msg = isAborted
+        const msg = context.abortSignal?.aborted
+          ? "data_query was stopped by a team member"
+          : isAborted
           ? `data_query timed out after ${DATA_QUERY_TIMEOUT_MS / 1000}s`
           : err instanceof Error ? err.message : String(err);
         const cause =
@@ -2377,7 +2761,7 @@ async function executeDataToolViaDelegation(
       }
 
       if (!response.ok) {
-        clearTimeout(abortTimeout);
+        clearAbortGuards();
         const errText = await response.text().catch(() => "Unknown error");
         const normalizedErr = errText.toLowerCase();
         const providerSupportsReauth = supportsDataProviderReauth(
@@ -2712,7 +3096,7 @@ async function executeDataToolViaDelegation(
           }
         }
       } catch (streamErr) {
-        clearTimeout(abortTimeout);
+        clearAbortGuards();
         if (abortController.signal.aborted && runPolicySignal?.dataQueryRetryable === false) {
           const reason = runPolicySignal.reason || "upstream_non_retryable_errors";
           const message =
@@ -2815,7 +3199,7 @@ async function executeDataToolViaDelegation(
       }
 
       // SSE stream finished — clear the abort timeout.
-      clearTimeout(abortTimeout);
+      clearAbortGuards();
 
       // Handle re-authorization needed
       if (needsReauthEvent) {
@@ -2928,6 +3312,23 @@ async function executeDataToolViaDelegation(
           // Keep files URL-based. Do NOT inline base64 here; it can blow model context windows.
           files: files.length > 0 ? files : undefined,
           fromAgent: selectedAgent.agentName,
+          queriedAgent: {
+            agentId: selectedAgent.agentId,
+            agentName: selectedAgent.agentName,
+            provider: selectedAgent.provider,
+          },
+          availableAgents,
+          coverage:
+            agentConfigs.length > 1 && !agentName
+              ? {
+                  queriedCount: 1,
+                  totalActiveConnections: agentConfigs.length,
+                  warning: `Only queried ${selectedAgent.agentName}. Query each active ${provider} agent by agentName before claiming all accounts were checked.`,
+                }
+              : {
+                  queriedCount: 1,
+                  totalActiveConnections: agentConfigs.length,
+                },
         },
         agent: "data",
         toolName,
@@ -2941,13 +3342,15 @@ async function executeDataToolViaDelegation(
     }
 
     if (toolName === "data_check_connection") {
+      const integrationOwnerUserId =
+        context.integrationOwnerUserId || context.userId;
       const provider = params.provider as string;
       const dbProviders = mapToolProviderToDbProviders(provider);
 
       const { data: rows, error } = await supabase
         .from("datagran_agent_configs")
         .select("agent_id, provider, connection_id, agents!datagran_agent_configs_agent_id_fkey(name)")
-        .eq("user_id", context.userId)
+        .eq("user_id", integrationOwnerUserId)
         .in("provider", dbProviders)
         .limit(10);
 
@@ -2962,18 +3365,29 @@ async function executeDataToolViaDelegation(
       }
 
       const normalizedAgents = (rows || []).map((r: Record<string, unknown>) => ({
+        agentId: r.agent_id,
         name: ((r.agents as Record<string, unknown>)?.name as string) || "Data Agent",
         provider: r.provider,
         hasConnection:
           typeof r.connection_id === "string" && r.connection_id.trim().length > 0,
       }));
-      const connectedAgents = normalizedAgents.filter((a) => a.hasConnection);
+      const assignmentState = await loadIntegrationAssignments({
+        supabase,
+        userId: integrationOwnerUserId,
+        availableIntegrationIds: normalizedAgents.map((agent) => String(agent.agentId || "")),
+        profileId: context.harnessProfile?.id || null,
+      });
+      const assignedIntegrationIds = new Set(assignmentState.assignments.orchestrator);
+      const scopedAgents = normalizedAgents.filter((agent) =>
+        assignedIntegrationIds.has(String(agent.agentId || ""))
+      );
+      const connectedAgents = scopedAgents.filter((a) => a.hasConnection);
       const connected = connectedAgents.length > 0;
 
       logEvent(context, "data_check_connection_result", {
         provider,
         connected,
-        agents: normalizedAgents,
+        agents: scopedAgents,
       });
 
       return {
@@ -2982,7 +3396,7 @@ async function executeDataToolViaDelegation(
           connected,
           // NOTE: This reflects connector/account config presence, not a full provider API health probe.
           checkType: "configured_connection_id",
-          agents: normalizedAgents,
+          agents: scopedAgents,
           configuredAgentCount: normalizedAgents.length,
           activeConnectionCount: connectedAgents.length,
         },
@@ -3210,17 +3624,11 @@ async function executeFilesAgentRequest(
     // Call the Files agent API
     const baseUrl =
       context.appBaseUrl ||
-      process.env.NEXT_PUBLIC_APP_URL ||
-      (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "") ||
-      (process.env.PORT ? `http://localhost:${process.env.PORT}` : "") ||
-      "http://localhost:3000";
-    const internalAuthHeaders =
-      !context.cookies && !context.deviceToken
-        ? buildInternalRouteAuthHeaders({
-            userId: context.userId,
-            scope: "files-agent",
-          })
-        : {};
+      getAppUrl();
+    const internalAuthHeaders = buildInternalRouteAuthHeaders({
+      userId: context.userId,
+      scope: "files-agent",
+    });
     const res = await fetch(`${baseUrl}/api/files-agent`, {
       method: "POST",
       headers: {
@@ -4135,22 +4543,14 @@ async function executeConnectorTool(
 /**
  * Generate a friendly message describing what the connector action will do
  */
-function getConnectorActionMessage(toolName: string, params: Record<string, unknown>): string {
-  if (toolName === "code_terminal_step") {
-    const input = String(params.input || "").trim();
-    const preview = input.length > 80 ? `${input.slice(0, 80)}...` : input;
-    return preview ? `Claude Code: ${preview}` : "Claude Code: (no input)";
+function getConnectorActionMessage(
+  toolName: string,
+  params: Record<string, unknown>
+): string | undefined {
+  if (toolName === "code_terminal_step" || toolName === "code_cli_run") {
+    return undefined;
   }
-  if (toolName === "code_cli_run") {
-    const prompt = String(params.prompt || "").trim();
-    const preview = prompt.length > 80 ? `${prompt.slice(0, 80)}...` : prompt;
-    return preview ? `Running Claude Code: ${preview}` : "Running Claude Code...";
-  }
-  if (toolName === "terminal_exec") {
-    const cmd = String(params.command || "").trim();
-    const preview = cmd.length > 100 ? `${cmd.slice(0, 100)}...` : cmd;
-    return preview ? `Running: ${preview}` : "Running: (no command)";
-  }
+  if (toolName === "terminal_exec") return undefined;
   if (toolName === "browser_navigate") {
     return `Navigating to ${params.url}...`;
   }
@@ -4250,9 +4650,9 @@ async function executeConnectorToolWithRelay(
       if (connectorMsg.type === "claude_run") {
         const requested = Number(connectorMsg.params.timeout_ms);
         if (Number.isFinite(requested) && requested > 0) {
-          return Math.min(Math.max(30_000, requested + 10_000), 20 * 60 * 1000);
+          return Math.min(Math.max(30_000, requested + 10_000), 22 * 60 * 1000);
         }
-        return 15 * 60 * 1000;
+        return 22 * 60 * 1000;
       }
       if (connectorMsg.type === "site_dev_start") {
         return 210_000;
@@ -4474,8 +4874,10 @@ async function executeAiAgentDelegate(
         model,
         system: systemPrompt,
         messages: modelMessages,
+        abortSignal: context.abortSignal,
       });
     } catch (err) {
+      if (context.abortSignal?.aborted) throw err;
       if (!usingGroovyKey && isInvalidApiKeyError(err) && hasGroovyProviderKey(provider)) {
         console.warn("[toolExecutor] ai_agent_delegate user key invalid; retrying with Groovy key", {
           provider,
@@ -4489,6 +4891,7 @@ async function executeAiAgentDelegate(
           model: fallbackModel,
           system: systemPrompt,
           messages: modelMessages,
+          abortSignal: context.abortSignal,
         });
       } else {
         throw err;
@@ -4633,12 +5036,10 @@ async function executeSiteServerTool(
     const url = `${context.appBaseUrl}/api/sites/${endpoint}`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      ...(!context.cookies && !context.deviceToken
-        ? buildInternalRouteAuthHeaders({
-            userId: context.userId,
-            scope: `sites-${endpoint}`,
-          })
-        : {}),
+      ...buildInternalRouteAuthHeaders({
+        userId: context.userId,
+        scope: `sites-${endpoint}`,
+      }),
     };
     if (context.cookies) headers.cookie = context.cookies;
     if (context.deviceToken) headers["x-device-token"] = context.deviceToken;

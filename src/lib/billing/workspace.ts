@@ -66,3 +66,47 @@ export async function getOrCreateWorkspaceIdForUser(args: {
   return wsId;
 }
 
+/**
+ * Resolve the account that owns workspace-scoped credentials and integration
+ * records. The caller remains the billing/audit actor; this id is only the
+ * shared capability namespace.
+ */
+export async function getWorkspaceCapabilityOwnerUserId(args: {
+  workspaceId: string;
+  supabaseAdmin?: SupabaseClient;
+}): Promise<string | null> {
+  const admin = args.supabaseAdmin || createSupabaseAdminClient();
+  const { data, error } = await admin
+    .from("workspaces")
+    .select("billing_admin_user_id")
+    .eq("id", args.workspaceId)
+    .maybeSingle();
+  if (error) {
+    console.warn("[workspace] capability owner lookup failed:", error.message);
+    return null;
+  }
+  return typeof data?.billing_admin_user_id === "string" &&
+    data.billing_admin_user_id
+    ? data.billing_admin_user_id
+    : null;
+}
+
+export async function isChannelGuestUser(args: {
+  userId: string;
+  supabaseAdmin?: SupabaseClient;
+}): Promise<boolean> {
+  const admin = args.supabaseAdmin || createSupabaseAdminClient();
+  const { data, error } = await admin
+    .from("workspace_members")
+    .select("role")
+    .eq("user_id", args.userId)
+    .eq("role", "guest")
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    // Fail closed for entry points that cannot otherwise constrain a guest to
+    // an explicitly granted channel.
+    throw new Error(error.message);
+  }
+  return data?.role === "guest";
+}

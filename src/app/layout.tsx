@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Outfit, Orbitron, JetBrains_Mono } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
+import { getAppUrl, getBrandName } from "@/lib/config/appConfig";
 
 const outfit = Outfit({
   subsets: ["latin"],
@@ -22,31 +23,31 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 const siteUrl = (() => {
-  const fallback = "https://gogroovy.ai";
   try {
-    return new URL(process.env.NEXT_PUBLIC_APP_URL || fallback);
+    return new URL(getAppUrl());
   } catch {
-    return new URL(fallback);
+    return new URL("http://localhost:3000");
   }
 })();
+const brandName = getBrandName();
 
 export const metadata: Metadata = {
   metadataBase: siteUrl,
-  title: "GROOVY | Command Center",
+  title: `${brandName.toUpperCase()} | Command Center`,
   description: "AI Agent Command Center - Get into your groove",
   alternates: {
     canonical: "/",
   },
   openGraph: {
     type: "website",
-    title: "GROOVY | Command Center",
+    title: `${brandName.toUpperCase()} | Command Center`,
     description: "AI Agent Command Center - Get into your groove",
     url: "/",
-    siteName: "Groovy",
+    siteName: brandName,
   },
   twitter: {
     card: "summary_large_image",
-    title: "GROOVY | Command Center",
+    title: `${brandName.toUpperCase()} | Command Center`,
     description: "AI Agent Command Center - Get into your groove",
   },
   icons: {
@@ -56,7 +57,7 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Groovy",
+    title: brandName,
   },
 };
 

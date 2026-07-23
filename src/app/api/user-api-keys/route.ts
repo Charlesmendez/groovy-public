@@ -7,6 +7,10 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { encryptLlmApiKey, hashLlmApiKey } from "@/lib/crypto/llmKey";
+import {
+  isServerKeyEligibleProvider,
+  serverProviderKeysAllowed,
+} from "@/lib/keys/providerKeyPolicy";
 
 type Provider =
   | "anthropic"
@@ -78,6 +82,36 @@ export async function POST(req: Request) {
   const mode: LlmKeyMode | null =
     modeRaw === "groovy" || modeRaw === "user" ? modeRaw : null;
   const keyModes = body.keyModes && typeof body.keyModes === "object" ? body.keyModes : null;
+  const allowServerProviderKeys = serverProviderKeysAllowed();
+
+  if (!allowServerProviderKeys && mode === "groovy") {
+    return NextResponse.json(
+      {
+        error:
+          "Hosted Groovy requires your own provider keys. Server provider keys are only available when a self-hosted deployment explicitly enables them.",
+        code: "server_provider_keys_disabled",
+      },
+      { status: 403 }
+    );
+  }
+
+  if (
+    !allowServerProviderKeys &&
+    keyModes &&
+    Object.entries(keyModes).some(
+      ([provider, selectedMode]) =>
+        selectedMode === "groovy" && isServerKeyEligibleProvider(provider)
+    )
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          "Hosted Groovy requires your own provider keys. Choose Own key for model providers.",
+        code: "server_provider_keys_disabled",
+      },
+      { status: 403 }
+    );
+  }
 
   if (!keys && !mode && !keyModes) {
     return NextResponse.json(
@@ -162,7 +196,8 @@ export async function POST(req: Request) {
     const cleanModes: KeyModes = {};
     for (const [p, m] of Object.entries(keyModes)) {
       if (VALID_PROVIDERS.includes(p as Provider) && (m === "groovy" || m === "user")) {
-        cleanModes[p as Provider] = m;
+        cleanModes[p as Provider] =
+          !allowServerProviderKeys && isServerKeyEligibleProvider(p) ? "user" : m;
       }
     }
     persistedKeyModes = cleanModes;
@@ -268,9 +303,16 @@ export async function GET(req: Request) {
     .maybeSingle();
 
   const onboardingData = (prefs?.onboarding_data as Record<string, unknown>) || {};
-  const savedKeyModes = (onboardingData.apiKeyModes as KeyModes) || {};
+  const allowServerProviderKeys = serverProviderKeysAllowed();
+  const rawSavedKeyModes = (onboardingData.apiKeyModes as KeyModes) || {};
+  const savedKeyModes: KeyModes = { ...rawSavedKeyModes };
+  if (!allowServerProviderKeys) {
+    for (const provider of VALID_PROVIDERS) {
+      if (isServerKeyEligibleProvider(provider)) savedKeyModes[provider] = "user";
+    }
+  }
 
-  const hasAnyProviderModes = Object.keys(savedKeyModes).length > 0;
+  const hasAnyProviderModes = Object.keys(rawSavedKeyModes).length > 0;
   const savedModeRaw = onboardingData.apiKeyMode as string | undefined;
   const hasSavedMode = savedModeRaw === "groovy" || savedModeRaw === "user";
 
@@ -283,7 +325,7 @@ export async function GET(req: Request) {
   const m = cookie.match(
     new RegExp(`(?:^|;\\s*)${LLM_KEY_MODE_COOKIE}=(groovy|user)(?:;|$)`)
   );
-  if (m?.[1] === "groovy" || m?.[1] === "user") {
+  if (allowServerProviderKeys && (m?.[1] === "groovy" || m?.[1] === "user")) {
     mode = m[1] as LlmKeyMode;
   } else {
     // If we have per-provider modes saved, derive a global mode for backwards-compat:
@@ -295,7 +337,15 @@ export async function GET(req: Request) {
     }
   }
 
-  return NextResponse.json({ keys: status, mode, modeExplicitlySet, keyModes: savedKeyModes });
+  if (!allowServerProviderKeys) mode = "user";
+
+  return NextResponse.json({
+    keys: status,
+    mode,
+    modeExplicitlySet,
+    keyModes: savedKeyModes,
+    serverProviderKeysAllowed: allowServerProviderKeys,
+  });
 }
 
 export async function DELETE(req: Request) {

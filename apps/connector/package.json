@@ -1,6 +1,6 @@
 {
   "name": "groovy-connector",
-  "version": "0.22.84",
+  "version": "0.24.15",
   "private": true,
   "type": "module",
   "scripts": {

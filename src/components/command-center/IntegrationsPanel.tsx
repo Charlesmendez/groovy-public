@@ -16,17 +16,14 @@ import {
   Wifi,
   Shield,
   RefreshCw,
-  ExternalLink,
   Eye,
   EyeOff,
-  Trash2,
   Settings,
   Zap,
   Package,
   ArrowLeft,
   Clock,
   BarChart3,
-  FileText,
 } from "lucide-react";
 
 type Extension = {
@@ -1273,7 +1270,11 @@ export default function IntegrationsPanel({
           {/* Content */}
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {viewState.view === "list" && (
-              extensions.length === 0 ? (
+              loading ? (
+                <div className="flex items-center justify-center py-16">
+                  <RefreshCw className="h-5 w-5 animate-spin text-zinc-500" />
+                </div>
+              ) : extensions.length === 0 ? (
                 <EmptyState
                   onAction={() => setViewState({ view: "create" })}
                   actionLabel="Create Integration"

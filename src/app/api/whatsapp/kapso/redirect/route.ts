@@ -1,8 +1,15 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export async function GET(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Kapso redirects are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const { searchParams } = new URL(req.url);

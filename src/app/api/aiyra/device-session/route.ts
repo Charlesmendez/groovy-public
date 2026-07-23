@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
+import { getProductAccessForUser } from "@/lib/licensing/access";
+import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -113,7 +115,7 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 }
 
 function resolveManagedMaterialQueryOrigin(_req: Request): string | null {
-  const envOrigin = normalizeOrigin(process.env.NEXT_PUBLIC_APP_URL || "");
+  const envOrigin = normalizeOrigin(getConfiguredAppUrl() || "");
   if (envOrigin) return envOrigin;
   return null;
 }
@@ -546,6 +548,25 @@ export async function POST(req: Request) {
     if (!verified?.userId || !verified?.deviceId) {
       logAiyraEvent("aiyra.device_session.unauthorized", {});
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const productAccess = await getProductAccessForUser({ userId: verified.userId }).catch(
+      () => null
+    );
+    if (!productAccess?.hasAccess) {
+      return NextResponse.json(
+        {
+          error:
+            productAccess?.accessStatus === "trial_available"
+              ? "Start your free 5-day trial from the Groovy dashboard."
+              : "Your Groovy trial has ended. Purchase a license to use Aiyra voice.",
+          code:
+            productAccess?.accessStatus === "trial_available"
+              ? "trial_not_started"
+              : "license_required",
+        },
+        { status: 402 }
+      );
     }
 
     const body = (await req.json().catch(() => ({}))) as DeviceSessionBody;

@@ -33,7 +33,12 @@ export default function InviteAcceptPage() {
         }
         if (!res.ok) throw new Error(json?.error || "Failed to accept invite");
         setStatus("done");
-        setTimeout(() => router.push("/dashboard?joined=1"), 1000);
+        const destination =
+          typeof json?.destination === "string" &&
+          json.destination.startsWith("/")
+            ? json.destination
+            : "/dashboard";
+        setTimeout(() => router.push(`${destination}?joined=1`), 1000);
       } catch (e) {
         setStatus("error");
         setError(e instanceof Error ? e.message : "Failed to accept invite");

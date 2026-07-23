@@ -11,6 +11,7 @@ import {
   handlePersonalInvoicePaid,
   handlePersonalSubscriptionChanged,
 } from "@/lib/licensing/stripePersonal";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,6 +44,9 @@ async function handleEvent(event: Stripe.Event) {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const signature = (req.headers.get("stripe-signature") || "").trim();
   const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
   if (!webhookSecret) {

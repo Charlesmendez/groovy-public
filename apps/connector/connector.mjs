@@ -6,7 +6,7 @@ import dns from "dns";
 import net from "net";
 import fs from "fs";
 import { promises as fsp } from "fs";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { execFile, execFileSync, spawn } from "child_process";
 import { promisify } from "util";
 import { createRequire } from "module";
@@ -108,6 +108,7 @@ try {
 const KEYCHAIN_SERVICE = "groovy-connector";
 const LEGACY_KEYCHAIN_SERVICE = "flow-connector";
 const KEYCHAIN_ACCOUNT = "device-token-default";
+let cachedDeviceToken = null;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const LAUNCH_AGENT_LABEL = "ai.gogroovy.connector";
@@ -129,6 +130,76 @@ function isPidAlive(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function makeTimeoutError(label, timeoutMs) {
+  const err = new Error(`${label || "request"}_timeout:${Math.max(0, Math.trunc(Number(timeoutMs) || 0))}ms`);
+  err.name = "TimeoutError";
+  err.retryable = true;
+  return err;
+}
+
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 60_000, label = "request") {
+  const controller = new AbortController();
+  const inputSignal =
+    options?.signal && typeof options.signal === "object" ? options.signal : null;
+  const timeoutMsSafe = Math.max(1000, Math.trunc(Number(timeoutMs) || 60_000));
+  const abortFromInput = () => {
+    if (controller.signal.aborted) return;
+    const reason =
+      inputSignal && "reason" in inputSignal && inputSignal.reason
+        ? inputSignal.reason
+        : makeTimeoutError(label, timeoutMsSafe);
+    controller.abort(reason);
+  };
+  if (inputSignal?.aborted) {
+    abortFromInput();
+  } else if (inputSignal && typeof inputSignal.addEventListener === "function") {
+    inputSignal.addEventListener("abort", abortFromInput, { once: true });
+  }
+
+  let timeoutError = null;
+  const timeout = setTimeout(() => {
+    timeoutError = makeTimeoutError(label, timeoutMsSafe);
+    controller.abort(timeoutError);
+  }, timeoutMsSafe);
+  if (typeof timeout.unref === "function") timeout.unref();
+
+  const fetchOptions = { ...(options || {}) };
+  delete fetchOptions.signal;
+  let rejectTimeout = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    rejectTimeout = setTimeout(() => {
+      reject(timeoutError || makeTimeoutError(label, timeoutMsSafe));
+    }, timeoutMsSafe + 250);
+    if (typeof rejectTimeout.unref === "function") rejectTimeout.unref();
+  });
+  const fetchPromise = (async () => {
+    const resp = await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+    const text = await resp.text();
+    return { resp, text };
+  })();
+  fetchPromise.catch(() => {});
+
+  try {
+    return await Promise.race([fetchPromise, timeoutPromise]);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      const reason = controller.signal.reason;
+      if (reason instanceof Error) throw reason;
+      throw makeTimeoutError(label, timeoutMsSafe);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    if (rejectTimeout) clearTimeout(rejectTimeout);
+    if (inputSignal && typeof inputSignal.removeEventListener === "function") {
+      inputSignal.removeEventListener("abort", abortFromInput);
+    }
   }
 }
 
@@ -1238,13 +1309,11 @@ function isAutoUpdateDisabledByConfig() {
   if (process.env.GROOVY_NO_AUTO_UPDATE === "1") {
     return { disabled: true, source: "GROOVY_NO_AUTO_UPDATE=1" };
   }
-  if (process.env.GROOVY_CONNECTOR_ENABLE_PUBLIC_AUTO_UPDATE !== "1") {
-    return {
-      disabled: true,
-      source: "licensed_account_downloads_required",
-    };
-  }
   return { disabled: false, source: "" };
+}
+
+function isPublicGitHubAutoUpdateEnabled() {
+  return process.env.GROOVY_CONNECTOR_ENABLE_PUBLIC_AUTO_UPDATE === "1";
 }
 
 function isAppleSiliconHardware() {
@@ -1319,6 +1388,15 @@ function isConnectorBusyForUpdate() {
   return terminals.size > 0 || pendingBrowserTaskRuns.size > 0 || pendingClaudeRuns.size > 0 || inFlightJobs.size > 0;
 }
 
+function getConnectorBusySummary() {
+  return {
+    terminals: terminals.size,
+    browserTasks: pendingBrowserTaskRuns.size,
+    claudeRuns: pendingClaudeRuns.size,
+    scheduledJobs: inFlightJobs.size,
+  };
+}
+
 function toPowerShellSingleQuoted(value) {
   return `'${String(value || "").replace(/'/g, "''")}'`;
 }
@@ -1363,7 +1441,87 @@ async function downloadUrlToFile(url, destinationPath, timeoutMs = AUTO_UPDATE_D
   }
 }
 
-async function fetchLatestConnectorRelease(platform) {
+function normalizeAppBaseUrl(value) {
+  const raw = normalizeCliString(value);
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+function getConnectorUpdateAppUrl() {
+  return (
+    normalizeAppBaseUrl(activeUpdateAppUrl) ||
+    normalizeAppBaseUrl(activeAppUrl) ||
+    normalizeAppBaseUrl(process.env.GROOVY_APP_URL)
+  );
+}
+
+async function fetchLatestConnectorReleaseFromApp(platform, currentVersion) {
+  const platformName = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : "";
+  if (!platformName) {
+    throw new Error("app_update_platform_not_supported");
+  }
+  const appUrl = getConnectorUpdateAppUrl();
+  if (!appUrl) throw new Error("missing_app_update_url");
+  if (!activeDeviceToken) throw new Error("missing_device_token");
+
+  const res = await fetch(`${appUrl}/api/updates/check`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "groovy-connector-updater",
+      "x-device-token": String(activeDeviceToken),
+    },
+    body: JSON.stringify({
+      platform: platformName,
+      currentVersion,
+      channel: "stable",
+    }),
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    const detail =
+      json && typeof json === "object" && typeof json.error === "string"
+        ? json.error
+        : `status_${res.status}`;
+    throw new Error(`app_update_check_failed_${detail}`);
+  }
+  const latest = json && typeof json === "object" ? json.latest : null;
+  const latestVersion = String(latest?.version || "").trim();
+  if (!latestVersion) {
+    const reason =
+      json && typeof json === "object" && typeof json.reason === "string"
+        ? json.reason
+        : "no_download";
+    throw new Error(`app_update_${reason}`);
+  }
+  const updateAvailable = json?.updateAvailable === true;
+  const fileUrl = String(latest?.file_url || "").trim();
+  const cmp = compareSemver(latestVersion, currentVersion);
+  if (updateAvailable && !fileUrl) {
+    throw new Error("app_update_missing_file_url");
+  }
+
+  return {
+    version: latestVersion,
+    tagName: `v${latestVersion}`,
+    assetName:
+      platform === "darwin"
+        ? "Groovy-Connector-macOS.dmg"
+        : "Groovy-Connector-windows.exe",
+    assetUrl: fileUrl,
+    assetType: platform === "darwin" ? "dmg" : "exe",
+    source: "app",
+    upToDate: cmp <= 0 || !updateAvailable,
+  };
+}
+
+async function fetchLatestConnectorReleaseFromGitHub(platform) {
   const expectedAssetName =
     platform === "darwin" ? "Groovy-Connector-macOS.zip" : "Groovy-Connector-windows.zip";
 
@@ -1415,7 +1573,87 @@ async function fetchLatestConnectorRelease(platform) {
     tagName: tagName || `v${version}`,
     assetName: expectedAssetName,
     assetUrl,
+    assetType: "zip",
+    source: "github",
   };
+}
+
+async function fetchLatestConnectorRelease(platform, currentVersion) {
+  let appUpdateError = null;
+  try {
+    return await fetchLatestConnectorReleaseFromApp(platform, currentVersion);
+  } catch (e) {
+    appUpdateError = e;
+    if (!isPublicGitHubAutoUpdateEnabled()) {
+      throw e;
+    }
+  }
+
+  try {
+    return await fetchLatestConnectorReleaseFromGitHub(platform);
+  } catch (e) {
+    if (appUpdateError) {
+      warn("app connector update check failed before GitHub fallback also failed", {
+        appError: appUpdateError instanceof Error ? appUpdateError.message : String(appUpdateError),
+        githubError: e instanceof Error ? e.message : String(e),
+      });
+    }
+    throw e;
+  }
+}
+
+function connectorReleaseAssetType(release) {
+  const explicit = String(release?.assetType || "").toLowerCase();
+  if (explicit === "dmg" || explicit === "zip" || explicit === "exe") return explicit;
+  const name = String(release?.assetName || release?.assetUrl || "").toLowerCase();
+  if (name.includes(".dmg")) return "dmg";
+  if (name.includes(".exe")) return "exe";
+  return "zip";
+}
+
+async function findMacAppBundleInDirectory(dir, preferredName) {
+  const preferredPath = path.join(dir, preferredName);
+  if (fs.existsSync(preferredPath)) return preferredPath;
+  const entries = await fsp.readdir(dir, { withFileTypes: true });
+  const appEntry = entries.find((entry) => entry.isDirectory() && entry.name.endsWith(".app"));
+  return appEntry ? path.join(dir, appEntry.name) : "";
+}
+
+async function stageMacAppFromDmg(dmgPath, extractDir, preferredName, updateRoot) {
+  const mountDir = path.join(updateRoot, "mount");
+  await fsp.mkdir(mountDir, { recursive: true });
+  let mounted = false;
+  try {
+    await execFileAsync(
+      "/usr/bin/hdiutil",
+      ["attach", dmgPath, "-nobrowse", "-readonly", "-mountpoint", mountDir],
+      {
+        timeout: AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS,
+        maxBuffer: 5 * 1024 * 1024,
+      }
+    );
+    mounted = true;
+    const mountedAppPath = await findMacAppBundleInDirectory(mountDir, preferredName);
+    if (!mountedAppPath) throw new Error("mac_update_missing_dmg_app_bundle");
+
+    const stagedAppPath = path.join(extractDir, path.basename(mountedAppPath));
+    await execFileAsync("/usr/bin/ditto", [mountedAppPath, stagedAppPath], {
+      timeout: AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS,
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    return stagedAppPath;
+  } finally {
+    if (mounted) {
+      try {
+        await execFileAsync("/usr/bin/hdiutil", ["detach", mountDir, "-quiet"], {
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        });
+      } catch (e) {
+        warn("mac update: failed to detach staged DMG", e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
 }
 
 async function applyLocalMacConnectorUpdate(context, release) {
@@ -1423,18 +1661,30 @@ async function applyLocalMacConnectorUpdate(context, release) {
     os.tmpdir(),
     `groovy-connector-update-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   );
-  const zipPath = path.join(updateRoot, release.assetName);
+  const assetName = release.assetName || "Groovy-Connector-macOS.dmg";
+  const assetPath = path.join(updateRoot, assetName);
   const extractDir = path.join(updateRoot, "extract");
   const helperPath = path.join(updateRoot, "apply-update.sh");
 
   await fsp.mkdir(extractDir, { recursive: true });
-  await downloadUrlToFile(release.assetUrl, zipPath, AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS);
-  await execFileAsync("/usr/bin/ditto", ["-x", "-k", zipPath, extractDir], {
-    timeout: AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS,
-    maxBuffer: 5 * 1024 * 1024,
-  });
+  await downloadUrlToFile(release.assetUrl, assetPath, AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS);
 
-  const extractedAppPath = path.join(extractDir, path.basename(context.appPath));
+  const assetType = connectorReleaseAssetType(release);
+  let extractedAppPath = "";
+  if (assetType === "dmg") {
+    extractedAppPath = await stageMacAppFromDmg(
+      assetPath,
+      extractDir,
+      path.basename(context.appPath),
+      updateRoot
+    );
+  } else {
+    await execFileAsync("/usr/bin/ditto", ["-x", "-k", assetPath, extractDir], {
+      timeout: AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS,
+      maxBuffer: 5 * 1024 * 1024,
+    });
+    extractedAppPath = path.join(extractDir, path.basename(context.appPath));
+  }
   if (!fs.existsSync(extractedAppPath)) {
     throw new Error("mac_update_missing_extracted_app_bundle");
   }
@@ -1517,16 +1767,77 @@ async function applyLocalWindowsConnectorUpdate(context, release) {
     os.tmpdir(),
     `groovy-connector-update-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   );
-  const zipPath = path.join(updateRoot, release.assetName);
+  const assetName = release.assetName || "Groovy-Connector-windows.exe";
+  const assetPath = path.join(updateRoot, assetName);
   const helperPath = path.join(updateRoot, "apply-update.ps1");
 
   await fsp.mkdir(updateRoot, { recursive: true });
-  await downloadUrlToFile(release.assetUrl, zipPath, AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS);
+  await downloadUrlToFile(release.assetUrl, assetPath, AUTO_UPDATE_DOWNLOAD_TIMEOUT_MS);
+
+  const assetType = connectorReleaseAssetType(release);
+  if (assetType === "exe") {
+    const helperScript = `
+$ErrorActionPreference = 'Stop'
+$oldPid = ${Number(process.pid) || 0}
+$installerPath = ${toPowerShellSingleQuoted(assetPath)}
+$stagingDir = ${toPowerShellSingleQuoted(updateRoot)}
+$installDir = ${toPowerShellSingleQuoted(context.installDir)}
+$launcherPath = ${toPowerShellSingleQuoted(context.launcherPath)}
+$launched = $false
+
+try {
+  for ($i = 0; $i -lt 400; $i++) {
+    try {
+      Get-Process -Id $oldPid -ErrorAction Stop | Out-Null
+      Start-Sleep -Milliseconds 200
+    } catch {
+      break
+    }
+  }
+
+  if (!(Test-Path $installerPath)) {
+    throw "installer_missing"
+  }
+
+  $process = Start-Process -FilePath $installerPath -ArgumentList @('/Q') -Wait -PassThru
+  if ($process.ExitCode -ne 0) {
+    throw "installer_failed_$($process.ExitCode)"
+  }
+  $launched = $true
+} catch {
+  if (Test-Path $launcherPath) {
+    Start-Process -FilePath $launcherPath -WorkingDirectory $installDir -WindowStyle Hidden
+    $launched = $true
+  }
+} finally {
+  Start-Sleep -Milliseconds 500
+  Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if (-not $launched) {
+  exit 1
+}
+`;
+
+    await fsp.writeFile(helperPath, helperScript.trim(), "utf8");
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath],
+      {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        cwd: process.cwd(),
+      }
+    );
+    child.unref();
+    return { ok: true };
+  }
 
   const helperScript = `
 $ErrorActionPreference = 'Stop'
 $oldPid = ${Number(process.pid) || 0}
-$zipPath = ${toPowerShellSingleQuoted(zipPath)}
+$zipPath = ${toPowerShellSingleQuoted(assetPath)}
 $stagingDir = ${toPowerShellSingleQuoted(updateRoot)}
 $installDir = ${toPowerShellSingleQuoted(context.installDir)}
 $launcherPath = ${toPowerShellSingleQuoted(context.launcherPath)}
@@ -1617,9 +1928,9 @@ async function maybeApplyLocalConnectorUpdate({ force = false } = {}) {
   }
 
   const currentVersion = getConnectorVersion();
-  const latest = await fetchLatestConnectorRelease(context.platform);
+  const latest = await fetchLatestConnectorRelease(context.platform, currentVersion);
   const cmp = compareSemver(latest.version, currentVersion);
-  if (cmp <= 0) {
+  if (latest.upToDate === true || cmp <= 0) {
     return {
       ok: true,
       updated: false,
@@ -1695,6 +2006,7 @@ function abortPendingClaudeRun(entry) {
 }
 let activeDeviceToken = null; // device token for API calls (set during auth)
 let activeAppUrl = null; // app URL for scheduler API calls (set during main init)
+let activeUpdateAppUrl = null; // app URL for licensed connector update checks
 const WHATSAPP_RECENT_RESOLVE_GUARD_WINDOW_MS = 60_000;
 const WHATSAPP_RECENT_RESOLVE_MAX_EVENTS = 30;
 const recentWhatsAppResolveEventsByScope = new Map(); // scopeKey -> [{ atMs, exactChatId, query, source }]
@@ -1794,8 +2106,6 @@ function resolveWhatsAppRuntimeConfig(cfg = {}) {
     appUrl:
       normalizeCliString(argValue("--app-url")) ||
       normalizeCliString(process.env.GROOVY_APP_URL) ||
-      normalizeCliString(process.env.FLOW_APP_URL) ||
-      normalizeCliString(process.env.NEXT_PUBLIC_APP_URL) ||
       normalizeCliString(cfg?.whatsapp_app_url) ||
       "",
   };
@@ -1891,6 +2201,7 @@ async function pickWhatsAppSendChatId({
   scopeKey,
   preferRecentResolve = true,
   requireRecipientQueryForRecentResolve = true,
+  requestedChatIdIsAuthoritative = false,
 }) {
   let chatId = normalizeChatId(requestedChatId);
   const query = String(recipientQuery || "").trim();
@@ -1898,7 +2209,12 @@ async function pickWhatsAppSendChatId({
   let correctedFrom = "";
 
   // Strongest guard: re-resolve by recipient query when available (dashboard confirm sends include this).
-  if (query && whatsappBridge && typeof whatsappBridge.resolveRecipient === "function") {
+  if (
+    query &&
+    !requestedChatIdIsAuthoritative &&
+    whatsappBridge &&
+    typeof whatsappBridge.resolveRecipient === "function"
+  ) {
     try {
       const resolved = await whatsappBridge.resolveRecipient({ query, limit: 10 });
       rememberWhatsAppResolve(resolved, {
@@ -2174,10 +2490,15 @@ let scheduleSyncPending = false;
 let scheduleSyncPendingStartedAtMs = 0;
 let lastScheduleSyncAtMs = 0;
 let pendingScheduleTickForWhatsAppHealthy = false;
+let deferredConnectorRestartTimer = null;
+let deferredConnectorRestartReason = "";
+let deferredConnectorRestartRequestedAtMs = 0;
 
 const SCHEDULE_RETRY_BASE_MS = 30_000;
 const SCHEDULE_RETRY_MAX_MS = 15 * 60 * 1000;
 const SCHEDULE_RETRY_MAX_ATTEMPTS = 8;
+const CONNECTOR_RESTART_DEFER_POLL_MS = 5_000;
+const CONNECTOR_RESTART_DEFER_MAX_MS = 15 * 60 * 1000;
 
 // Global connector operation queue:
 // - high priority: interactive orchestrator/chat tool RPCs (relay -> connector)
@@ -2528,6 +2849,56 @@ function extractScheduledWhatsAppFallbackTarget(taskObj) {
   };
 }
 
+function scheduledJobWantsWhatsAppDelivery(job) {
+  const task =
+    job && typeof job.task === "object" && job.task && !Array.isArray(job.task)
+      ? job.task
+      : null;
+  if (!task) return false;
+  const delivery =
+    task.delivery && typeof task.delivery === "object" && !Array.isArray(task.delivery)
+      ? task.delivery
+      : null;
+  if (delivery && typeof delivery.whatsapp === "boolean") {
+    return delivery.whatsapp;
+  }
+  if (task.type === "heartbeat_v1") {
+    return true;
+  }
+  const options =
+    task.options && typeof task.options === "object" && !Array.isArray(task.options)
+      ? task.options
+      : null;
+  if (options && typeof options.requires_whatsapp_delivery === "boolean") {
+    return options.requires_whatsapp_delivery;
+  }
+  const fallbackTarget = extractScheduledWhatsAppFallbackTarget(task);
+  if (fallbackTarget.chatId || fallbackTarget.recipientQuery) {
+    return true;
+  }
+  const normalized = String(task.message || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  return (
+    normalized.includes("whatsapp") ||
+    normalized.includes("whats app") ||
+    normalized.includes("whatsapp_send_default_group") ||
+    normalized.includes("whatsapp_send_text")
+  );
+}
+
+function isWhatsAppBridgeReadyForScheduledDelivery() {
+  return !!(
+    schedulerWhatsAppRuntimeConfig.enabled &&
+    schedulerWhatsAppRuntimeConfig.groupName &&
+    schedulerWhatsAppRuntimeConfig.appUrl &&
+    whatsappBridge &&
+    typeof whatsappBridge.sendText === "function" &&
+    whatsappHealthState?.status === "healthy"
+  );
+}
+
 function toLocalDateAtTime(baseDate, hour, minute) {
   const d = new Date(baseDate);
   d.setHours(Number(hour) || 0, Number(minute) || 0, 0, 0);
@@ -2540,6 +2911,16 @@ function getDayOfWeekLocal(d) {
   } catch {
     return null;
   }
+}
+
+function isSameLocalCalendarDate(a, b) {
+  const first = new Date(a);
+  const second = new Date(b);
+  return (
+    first.getFullYear() === second.getFullYear() &&
+    first.getMonth() === second.getMonth() &&
+    first.getDate() === second.getDate()
+  );
 }
 
 function isDueNow(job, now = new Date()) {
@@ -2562,6 +2943,7 @@ function isDueNow(job, now = new Date()) {
     const minute = Number(schedule.minute);
     const candidate = toLocalDateAtTime(now, hour, minute);
     if (now.getTime() < candidate.getTime()) return { due: false };
+    if (lastRun && isSameLocalCalendarDate(lastRun, candidate)) return { due: false };
     if (lastRun && lastRun.getTime() >= candidate.getTime()) return { due: false };
     return { due: true, dueAt: candidate };
   }
@@ -2577,6 +2959,7 @@ function isDueNow(job, now = new Date()) {
     candidateBase.setDate(candidateBase.getDate() - diff);
     const candidate = toLocalDateAtTime(candidateBase, hour, minute);
     if (now.getTime() < candidate.getTime()) return { due: false };
+    if (lastRun && isSameLocalCalendarDate(lastRun, candidate)) return { due: false };
     if (lastRun && lastRun.getTime() >= candidate.getTime()) return { due: false };
     return { due: true, dueAt: candidate };
   }
@@ -2687,6 +3070,25 @@ function isRetryableWhatsAppStartupErrorMessage(message) {
   );
 }
 
+function isLateReadyWhatsAppStartupErrorMessage(message) {
+  const lower = String(message || "").trim().toLowerCase();
+  if (!lower) return false;
+  return (
+    lower.includes("whatsapp_ready_timeout_after_start") ||
+    lower.includes("operational_ready_timeout") ||
+    lower.includes("whatsapp_store_not_ready") ||
+    lower.includes("chat_not_ready")
+  );
+}
+
+function hasLateReadyWhatsAppBridgeCandidate() {
+  return !!(whatsappBridge && typeof whatsappBridge.sendText === "function");
+}
+
+function shouldKeepWhatsAppBridgeForLateReady(message) {
+  return isLateReadyWhatsAppStartupErrorMessage(message) && hasLateReadyWhatsAppBridgeCandidate();
+}
+
 function shouldRetryWhatsAppStartupWithoutPin(message) {
   const lower = String(message || "").trim().toLowerCase();
   if (!lower) return false;
@@ -2702,6 +3104,7 @@ function shouldRetryWhatsAppStartupWithoutPin(message) {
 function shouldHardResetWhatsAppSessionOnStartupRetry(message) {
   const lower = String(message || "").trim().toLowerCase();
   if (!lower) return false;
+  if (isDetachedWhatsAppErrorMessage(message)) return false;
   // Do NOT hard-reset the WhatsApp session for generic startup flake / Store
   // races. That wipes LocalAuth, forces a QR re-link, and can create a logout
   // loop when the real problem is just whatsapp-web.js becoming usable slowly.
@@ -3126,6 +3529,23 @@ function noteWhatsAppDegraded(source, reason, detail = "") {
   }
 }
 
+function getHealthyWhatsAppBridgeReadySignal(bridge) {
+  if (!bridge || typeof bridge.getThreadKey !== "function") return null;
+  let threadKey = "";
+  try {
+    threadKey = String(bridge.getThreadKey() || "").trim();
+  } catch {
+    threadKey = "";
+  }
+  if (!threadKey) return null;
+  if (whatsappHealthState?.status !== "healthy") return null;
+  return {
+    threadKey,
+    reason: whatsappHealthState.reason || null,
+    detail: whatsappHealthState.detail || null,
+  };
+}
+
 async function waitForWhatsAppBridgeReadyOrThrow(bridge, timeoutMs = WHATSAPP_BRIDGE_READY_TIMEOUT_MS) {
   if (!bridge || typeof bridge.waitUntilReady !== "function") {
     throw new Error("whatsapp_bridge_missing_waitUntilReady");
@@ -3151,11 +3571,41 @@ async function waitForWhatsAppBridgeReadyOrThrow(bridge, timeoutMs = WHATSAPP_BR
       throw outcome.error;
     }
     if (outcome && typeof outcome === "object" && outcome.kind === "timeout") {
+      const readySignal = getHealthyWhatsAppBridgeReadySignal(bridge);
+      if (readySignal) {
+        log("WhatsApp bridge ready waiter timed out after healthy bridge signal; keeping bridge active", {
+          threadKey: readySignal.threadKey,
+          reason: readySignal.reason,
+          detail: readySignal.detail,
+        });
+        return;
+      }
       throw outcome.error;
     }
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
   }
+}
+
+function scheduleWhatsAppLateReadyProbe(source, detail = "") {
+  const bridge = whatsappBridge;
+  if (!bridge || typeof bridge.waitUntilReady !== "function") return;
+  const timer = setTimeout(async () => {
+    if (whatsappBridge !== bridge) return;
+    if (isWhatsAppBridgeReadyForScheduledDelivery()) return;
+    try {
+      await waitForWhatsAppBridgeReadyOrThrow(bridge, 30_000);
+      noteWhatsAppHealthy(
+        source || "whatsapp_bridge_late_ready",
+        detail || "WhatsApp bridge became ready after startup timeout"
+      );
+    } catch (err) {
+      if (whatsappBridge !== bridge) return;
+      const msg = err instanceof Error ? err.message : String(err || "whatsapp_late_ready_failed");
+      noteWhatsAppDegraded("whatsapp_bridge_late_ready_failed", msg, msg);
+    }
+  }, 60_000);
+  if (typeof timer.unref === "function") timer.unref();
 }
 
 function observeWhatsAppSendResult(result, source) {
@@ -3586,12 +4036,15 @@ async function scanSkillsRepo(localPath, commitSha) {
         exactFilename: "SKILL.md",
         targets: normalizeSkillTargets(data.targets || data.target, ["all"]),
         checksum: await checksumFiles(skillFiles, skillDir),
+        contentSnapshot: content.slice(0, 200000),
+        contentSnapshotTruncated: content.length > 200000,
         commitSha,
         metadata: {
           standard: "agent-skills",
           directory: dir,
           fileCount: skillFiles.length,
-          storesBody: false,
+          storesBody: true,
+          bodyStorage: "bounded_server_snapshot",
         },
         riskFlags: Array.from(riskFlags),
       });
@@ -3606,11 +4059,14 @@ async function scanSkillsRepo(localPath, commitSha) {
         exactFilename: filename,
         targets: normalizeSkillTargets(data.targets || data.target, inferInstructionTargets(rel, filename)),
         checksum: sha256Text(content),
+        contentSnapshot: content.slice(0, 200000),
+        contentSnapshotTruncated: content.length > 200000,
         commitSha,
         metadata: {
           exactFilename: filename,
           preservesFilename: true,
-          storesBody: false,
+          storesBody: true,
+          bodyStorage: "bounded_server_snapshot",
         },
         riskFlags: scanRiskFlagsFromText(content),
       });
@@ -3676,6 +4132,102 @@ async function skillsRepoSync(params) {
   };
 }
 
+async function skillsRepoPush(params) {
+  const ensured = await ensureSkillsRepoLocal(params);
+  if (!ensured.ok) return ensured;
+
+  const status = await runGit(["status", "--short", "--", "skills", "instructions"], {
+    cwd: ensured.localPath,
+    timeoutMs: 30_000,
+  });
+  if (!status.ok) {
+    return { ...status, ok: false, localPath: ensured.localPath, error: status.error || "git_status_failed" };
+  }
+  const gitStatus = status.stdout || "";
+  if (!gitStatus.trim()) {
+    const artifacts = await scanSkillsRepo(ensured.localPath, ensured.commitSha);
+    return {
+      ok: true,
+      localPath: ensured.localPath,
+      commitSha: ensured.commitSha,
+      ref: ensured.ref,
+      gitStatus,
+      unchanged: true,
+      pushed: false,
+      artifacts,
+      diagnostics: {
+        artifactCount: artifacts.length,
+      },
+    };
+  }
+
+  const changedTopLevelPaths = Array.from(
+    new Set(
+      gitStatus
+        .split(/\r?\n/)
+        .map((line) => line.slice(3).trim().split(" -> ").pop() || "")
+        .map((changedPath) => changedPath.split(/[\\/]/)[0])
+        .filter((topLevel) => topLevel === "skills" || topLevel === "instructions")
+    )
+  );
+  if (changedTopLevelPaths.length === 0) {
+    return { ok: false, localPath: ensured.localPath, error: "no_supported_repo_changes", gitStatus };
+  }
+
+  const add = await runGit(["add", "-A", "--", ...changedTopLevelPaths], {
+    cwd: ensured.localPath,
+    timeoutMs: 30_000,
+  });
+  if (!add.ok) {
+    return { ...add, ok: false, localPath: ensured.localPath, error: add.error || "git_add_failed" };
+  }
+
+  const rawCommitMessage = String(params.commit_message || params.commitMessage || "").trim();
+  const commitMessage = (rawCommitMessage || "Sync Groovy skills repo")
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  const commit = await runGit(["commit", "-m", commitMessage], {
+    cwd: ensured.localPath,
+    timeoutMs: 60_000,
+  });
+  if (!commit.ok) {
+    return { ...commit, ok: false, localPath: ensured.localPath, error: commit.error || "git_commit_failed" };
+  }
+
+  const push = await runGit(["push", "-u", "origin", ensured.ref || "main"], {
+    cwd: ensured.localPath,
+    timeoutMs: 2 * 60 * 1000,
+  });
+  if (!push.ok) {
+    return {
+      ...push,
+      ok: false,
+      localPath: ensured.localPath,
+      error: push.error || "git_push_failed",
+      diagnostics: {
+        command: `git push -u origin ${ensured.ref || "main"}`,
+      },
+    };
+  }
+
+  const rev = await runGit(["rev-parse", "HEAD"], { cwd: ensured.localPath, timeoutMs: 30_000 });
+  const commitSha = rev.ok ? String(rev.stdout || "").trim() : ensured.commitSha;
+  const artifacts = await scanSkillsRepo(ensured.localPath, commitSha);
+  return {
+    ok: true,
+    localPath: ensured.localPath,
+    commitSha,
+    ref: ensured.ref,
+    gitStatus,
+    pushed: true,
+    commitMessage,
+    artifacts,
+    diagnostics: {
+      artifactCount: artifacts.length,
+    },
+  };
+}
+
 async function skillsArtifactCreate(params) {
   const ensured = await ensureSkillsRepoLocal(params);
   if (!ensured.ok) return ensured;
@@ -3690,29 +4242,104 @@ async function skillsArtifactCreate(params) {
   }
   const fullPath = safeJoinUnder(ensured.localPath, relativePath);
   await fsp.mkdir(path.dirname(fullPath), { recursive: true });
-  if (fs.existsSync(fullPath)) {
-    return { ok: false, error: "artifact_already_exists", relativePath };
+  const overwrite =
+    params.overwrite === true ||
+    params.overwrite === "true" ||
+    params.mode === "upsert" ||
+    params.mode === "overwrite";
+  if (fs.existsSync(fullPath) && !overwrite) {
+    const collision = {
+      localPath: ensured.localPath,
+      relativePath,
+      fullPath,
+      artifactType,
+      overwrite,
+      ref: ensured.ref,
+    };
+    warn("skills_artifact_create collision", collision);
+    return {
+      ok: false,
+      error: "artifact_already_exists",
+      localPath: ensured.localPath,
+      relativePath,
+      artifactType,
+      diagnostics: collision,
+    };
   }
   await fsp.writeFile(fullPath, String(params.content || ""), "utf8");
   const status = await runGit(["status", "--short", "--", relativePath], {
     cwd: ensured.localPath,
     timeoutMs: 30_000,
   });
-  const artifacts = await scanSkillsRepo(ensured.localPath, ensured.commitSha);
+  if (!status.ok) {
+    return { ...status, ok: false, localPath: ensured.localPath, relativePath, error: status.error || "git_status_failed" };
+  }
+  const gitStatus = status.stdout || "";
+  if (!gitStatus.trim()) {
+    const artifacts = await scanSkillsRepo(ensured.localPath, ensured.commitSha);
+    return {
+      ok: true,
+      localPath: ensured.localPath,
+      commitSha: ensured.commitSha,
+      relativePath,
+      exactFilename: path.basename(relativePath),
+      gitStatus,
+      unchanged: true,
+      pushed: false,
+      artifacts: artifacts.filter((artifact) => artifact.relativePath === relativePath),
+    };
+  }
+
+  const add = await runGit(["add", "--", relativePath], {
+    cwd: ensured.localPath,
+    timeoutMs: 30_000,
+  });
+  if (!add.ok) {
+    return { ...add, ok: false, localPath: ensured.localPath, relativePath, error: add.error || "git_add_failed" };
+  }
+
+  const rawCommitMessage = String(params.commit_message || params.commitMessage || "").trim();
+  const commitMessage = (rawCommitMessage || `Sync Groovy ${artifactType === "skill" ? "skill" : "instruction"}`)
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  const commit = await runGit(["commit", "-m", commitMessage], {
+    cwd: ensured.localPath,
+    timeoutMs: 60_000,
+  });
+  if (!commit.ok) {
+    return { ...commit, ok: false, localPath: ensured.localPath, relativePath, error: commit.error || "git_commit_failed" };
+  }
+
+  const push = await runGit(["push", "-u", "origin", ensured.ref || "main"], {
+    cwd: ensured.localPath,
+    timeoutMs: 2 * 60 * 1000,
+  });
+  if (!push.ok) {
+    return {
+      ...push,
+      ok: false,
+      localPath: ensured.localPath,
+      relativePath,
+      error: push.error || "git_push_failed",
+      diagnostics: {
+        command: `git push -u origin ${ensured.ref || "main"}`,
+      },
+    };
+  }
+
+  const rev = await runGit(["rev-parse", "HEAD"], { cwd: ensured.localPath, timeoutMs: 30_000 });
+  const commitSha = rev.ok ? String(rev.stdout || "").trim() : ensured.commitSha;
+  const artifacts = await scanSkillsRepo(ensured.localPath, commitSha);
   return {
     ok: true,
     localPath: ensured.localPath,
-    commitSha: ensured.commitSha,
+    commitSha,
     relativePath,
     exactFilename: path.basename(relativePath),
-    gitStatus: status.stdout || "",
+    gitStatus,
+    pushed: true,
+    commitMessage,
     artifacts: artifacts.filter((artifact) => artifact.relativePath === relativePath),
-    nextSteps: [
-      `cd ${ensured.localPath}`,
-      `git add ${relativePath}`,
-      'git commit -m "Add agent skill guidance"',
-      `git push -u origin ${ensured.ref || "main"}`,
-    ],
   };
 }
 
@@ -3792,11 +4419,68 @@ async function skillsArtifactMaterialize(params) {
   };
 }
 
+async function skillsAssignedContextRead(params) {
+  const materializedRoot = path.resolve(path.join(skillsManagerRoot(), "materialized"));
+  const materializedRootReal = await fsp.realpath(materializedRoot).catch(() => materializedRoot);
+  const requestedPaths = Array.isArray(params.paths) ? params.paths.slice(0, 20) : [];
+  const items = [];
+  let totalBytes = 0;
+  const maxItemBytes = 32 * 1024;
+  const maxTotalBytes = 120 * 1024;
+
+  for (const rawPath of requestedPaths) {
+    const requested = path.resolve(String(rawPath || ""));
+    if (!requested.startsWith(`${materializedRoot}${path.sep}`)) {
+      items.push({ path: requested, ok: false, error: "path_not_materialized" });
+      continue;
+    }
+    let target = requested;
+    try {
+      const stat = await fsp.stat(target);
+      if (stat.isDirectory()) target = path.join(target, "SKILL.md");
+      const targetResolved = path.resolve(target);
+      if (!targetResolved.startsWith(`${materializedRoot}${path.sep}`)) {
+        items.push({ path: requested, ok: false, error: "path_not_materialized" });
+        continue;
+      }
+      const targetReal = await fsp.realpath(targetResolved);
+      if (!targetReal.startsWith(`${materializedRootReal}${path.sep}`)) {
+        items.push({ path: requested, ok: false, error: "symlink_outside_materialized_root" });
+        continue;
+      }
+      const content = await fsp.readFile(targetReal, "utf8");
+      const remaining = Math.max(0, maxTotalBytes - totalBytes);
+      if (remaining === 0) {
+        items.push({ path: requested, ok: false, error: "context_limit_reached" });
+        continue;
+      }
+      const bounded = Buffer.from(content, "utf8").subarray(0, Math.min(maxItemBytes, remaining));
+      totalBytes += bounded.length;
+      items.push({
+        path: requested,
+        sourcePath: targetReal,
+        ok: true,
+        content: bounded.toString("utf8"),
+        truncated: bounded.length < Buffer.byteLength(content, "utf8"),
+      });
+    } catch (error) {
+      items.push({
+        path: requested,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error || "context_read_failed"),
+      });
+    }
+  }
+  return { ok: true, items, totalBytes };
+}
+
 async function executeSkillsConnectorRpc(type, params) {
   if (type === "skills_repo_check") return await skillsRepoCheck(params);
   if (type === "skills_repo_sync" || type === "skills_catalog_scan") return await skillsRepoSync(params);
+  if (type === "skills_repo_push") return await skillsRepoPush(params);
   if (type === "skills_artifact_create") return await skillsArtifactCreate(params);
   if (type === "skills_artifact_materialize") return await skillsArtifactMaterialize(params);
+  if (type === "skills_assigned_context_read") return await skillsAssignedContextRead(params);
   return { ok: false, error: `unsupported_skills_rpc:${type}` };
 }
 
@@ -3806,6 +4490,14 @@ async function runScheduledJob(job) {
   if (!jobId) return;
   if (inFlightJobs.has(jobId)) return;
   inFlightJobs.add(jobId);
+  try {
+    return await runScheduledJobImpl(job, jobId);
+  } finally {
+    inFlightJobs.delete(jobId);
+  }
+}
+
+async function runScheduledJobImpl(job, jobId) {
   const whatsappResolveScopeKey = `scheduler:${jobId}`;
 
   const startedAt = new Date();
@@ -3835,6 +4527,13 @@ async function runScheduledJob(job) {
   let retryWhenWhatsAppHealthy = false;
   const priorRetryState =
     kind === "orchestrator" ? scheduleRetryState.get(jobId) || null : null;
+  const scheduledRunId =
+    priorRetryState &&
+    typeof priorRetryState === "object" &&
+    typeof priorRetryState.scheduledRunId === "string" &&
+    priorRetryState.scheduledRunId
+      ? priorRetryState.scheduledRunId
+      : randomUUID();
   const priorSentWhatsAppMeta =
     priorRetryState &&
     typeof priorRetryState === "object" &&
@@ -3852,6 +4551,8 @@ async function runScheduledJob(job) {
         }
       : null;
   const connectorErrors = [];
+  let browserTaskFailure = "";
+  let browserTaskSucceeded = false;
   let didSendWhatsApp =
     !!priorSentWhatsAppMeta ||
     !!(
@@ -3878,6 +4579,14 @@ async function runScheduledJob(job) {
     typeof priorRetryState.expectedWhatsAppRecipientQuery === "string"
       ? priorRetryState.expectedWhatsAppRecipientQuery
       : "";
+  const deliveredWhatsAppTexts = [];
+  const rememberDeliveredWhatsAppText = (params) => {
+    if (!params || typeof params !== "object") return;
+    const raw = typeof params.text === "string" ? params.text.trim() : "";
+    if (!raw) return;
+    const text = raw.length > 12_000 ? `${raw.slice(0, 12_000).trimEnd()}...` : raw;
+    if (!deliveredWhatsAppTexts.includes(text)) deliveredWhatsAppTexts.push(text);
+  };
   const taskObj =
     job && typeof job.task === "object" && job.task ? job.task : null;
   const configuredScheduledWhatsAppTarget =
@@ -4037,6 +4746,141 @@ async function runScheduledJob(job) {
     }
     return null;
   };
+  const buildHeartbeatFailureNotice = () => {
+    const raw = String(errorText || stderr || stdout || "unknown_error")
+      .replace(/\s+/g, " ")
+      .trim();
+    const detail = raw.length > 260 ? `${raw.slice(0, 260)}...` : raw;
+    const retryText = retryableFailure
+      ? "I queued an automatic retry."
+      : "I will try again on the next scheduled run.";
+    return `Heartbeat could not run: ${detail || "unknown_error"}. ${retryText}`;
+  };
+
+  const scheduledWhatsAppRecoveryOnHealth = (healthEvent) => {
+    const status =
+      healthEvent && typeof healthEvent === "object" && typeof healthEvent.status === "string"
+        ? healthEvent.status
+        : "";
+    const reason =
+      healthEvent && typeof healthEvent === "object" && typeof healthEvent.reason === "string"
+        ? healthEvent.reason
+        : "";
+    const detail =
+      healthEvent && typeof healthEvent === "object" && typeof healthEvent.detail === "string"
+        ? healthEvent.detail
+        : "";
+    if (status === "healthy") {
+      noteWhatsAppHealthy(
+        "scheduler_whatsapp_bridge_ready",
+        detail || reason || "WhatsApp bridge ready for scheduled delivery"
+      );
+      return;
+    }
+    if (status === "recovering") {
+      noteWhatsAppRecovering(
+        "scheduler_whatsapp_bridge_recovering",
+        detail || reason || "WhatsApp bridge recovering for scheduled delivery"
+      );
+      return;
+    }
+    if (status === "disabled") {
+      applyWhatsAppHealthPatch({
+        status: "disabled",
+        reason: "scheduler_whatsapp_bridge_disabled",
+        detail: detail || reason || "WhatsApp bridge disabled during scheduled delivery",
+        consecutive_failures: 0,
+        recent_failures: 0,
+        auto_restart_pending: false,
+        auto_restart_count: whatsappAutoRestartCount,
+      });
+      return;
+    }
+    noteWhatsAppDegraded(
+      "scheduler_whatsapp_bridge_unhealthy",
+      reason || "whatsapp_unhealthy",
+      detail || "WhatsApp bridge reported an unhealthy state during scheduled delivery"
+    );
+  };
+
+  const recoverScheduledWhatsAppBridge = async (
+    reason = "scheduler_whatsapp_bridge_missing",
+    { resetSession = false, disableWebVersionPin = false } = {}
+  ) => {
+    const unavailable = getScheduledWhatsAppUnavailableResult();
+    if (unavailable) return unavailable;
+    const baseOpts = whatsappBridgeOpts && typeof whatsappBridgeOpts === "object"
+      ? whatsappBridgeOpts
+      : {
+          deviceToken: activeDeviceToken || "",
+          groupName: schedulerWhatsAppRuntimeConfig.groupName,
+          appUrl: schedulerWhatsAppRuntimeConfig.appUrl,
+        };
+    const bridgeOpts = {
+      ...baseOpts,
+      deviceToken: baseOpts.deviceToken || activeDeviceToken || "",
+      groupName: baseOpts.groupName || schedulerWhatsAppRuntimeConfig.groupName,
+      appUrl: baseOpts.appUrl || schedulerWhatsAppRuntimeConfig.appUrl,
+      ...(disableWebVersionPin ? { disableWebVersionPin: true } : {}),
+      ...(resetSession ? { resetSession: true } : {}),
+      onHealth: scheduledWhatsAppRecoveryOnHealth,
+    };
+    if (!bridgeOpts.deviceToken) {
+      return { ok: false, error: "missing_device_token" };
+    }
+    if (!bridgeOpts.groupName || !bridgeOpts.appUrl) {
+      return { ok: false, error: "missing_whatsapp_config" };
+    }
+    try {
+      noteWhatsAppRecovering(
+        "scheduler_whatsapp_bridge_starting",
+        resetSession
+          ? "Starting WhatsApp bridge for scheduled delivery with session reset"
+          : "Starting WhatsApp bridge for scheduled delivery"
+      );
+      log("runScheduledJob: starting WhatsApp bridge for scheduled delivery", {
+        jobId,
+        reason,
+        resetSession,
+        disableWebVersionPin,
+      });
+      const bridge = await startWhatsAppBridge(bridgeOpts);
+      if (!bridge || typeof bridge !== "object" || bridge.ok !== true) {
+        return { ok: false, error: "whatsapp_bridge_start_non_ok" };
+      }
+      whatsappBridge = bridge;
+      whatsappBridgeOpts = {
+        ...baseOpts,
+        deviceToken: bridgeOpts.deviceToken,
+        groupName: bridgeOpts.groupName,
+        appUrl: bridgeOpts.appUrl,
+      };
+      await waitForWhatsAppBridgeReadyOrThrow(bridge);
+      noteWhatsAppHealthy(
+        "scheduler_whatsapp_bridge_ready",
+        "WhatsApp bridge ready for scheduled delivery"
+      );
+      return { ok: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg !== "whatsapp_qr_required") {
+        whatsappBridge = null;
+      }
+      if (msg === "whatsapp_qr_required") {
+        noteWhatsAppRecovering(
+          "scheduler_whatsapp_qr_required",
+          "WhatsApp session reset requires QR re-link"
+        );
+        return {
+          ok: false,
+          error: "whatsapp_qr_required",
+          detail: "WhatsApp session reset requires QR re-link",
+        };
+      }
+      noteWhatsAppDegraded("scheduler_whatsapp_bridge_start_failed", msg, msg);
+      return { ok: false, error: msg || "whatsapp_bridge_start_failed" };
+    }
+  };
 
   async function execTerminalOnce({ command, cwd: cwdIn, timeoutMs, maxOutputChars, extraEnv }) {
     const safeCwd = typeof cwdIn === "string" && cwdIn.trim() ? cwdIn.trim() : os.homedir();
@@ -4090,7 +4934,20 @@ async function runScheduledJob(job) {
     const unavailableResult = getScheduledWhatsAppUnavailableResult();
     if (unavailableResult) return unavailableResult;
     if (!whatsappBridge || typeof whatsappBridge.sendText !== "function") {
-      return { ok: false, error: "whatsapp_not_running" };
+      const recovered = await recoverScheduledWhatsAppBridge("scheduler_whatsapp_not_running");
+      if (!recovered || recovered.ok !== true) {
+        return {
+          ok: false,
+          error:
+            recovered && typeof recovered.error === "string"
+              ? recovered.error
+              : "whatsapp_not_running",
+          detail:
+            recovered && typeof recovered.detail === "string"
+              ? recovered.detail
+              : "WhatsApp bridge was not running for scheduled delivery",
+        };
+      }
     }
     const text = String(p.text || "").trim();
     if (!text) return { ok: false, error: "empty_message" };
@@ -4545,6 +5402,17 @@ async function runScheduledJob(job) {
         return await runWhatsAppBridgeOp("scheduler_whatsapp_resolve_recipient", async () => {
           const unavailableResult = getScheduledWhatsAppUnavailableResult();
           if (unavailableResult) return unavailableResult;
+          if (expectedWhatsAppChatId) {
+            return {
+              ok: true,
+              candidates: [],
+              exact: {
+                chatId: expectedWhatsAppChatId,
+                name: expectedWhatsAppRecipientQuery || String(p.query || ""),
+              },
+              source: "scheduled_exact_chat_id",
+            };
+          }
           if (!whatsappBridge || typeof whatsappBridge.resolveRecipient !== "function") {
             return { ok: false, error: "whatsapp_not_running" };
           }
@@ -4581,6 +5449,7 @@ async function runScheduledJob(job) {
             scopeKey: whatsappResolveScopeKey,
             preferRecentResolve: p.guard_recent_resolve !== false,
             requireRecipientQueryForRecentResolve: false,
+            requestedChatIdIsAuthoritative: !!String(p.chat_id || "").trim(),
           });
           let result = await whatsappBridge.sendTextToChatId({
             chatId: target.chatId,
@@ -4619,6 +5488,7 @@ async function runScheduledJob(job) {
             scopeKey: whatsappResolveScopeKey,
             preferRecentResolve: p.guard_recent_resolve !== false,
             requireRecipientQueryForRecentResolve: false,
+            requestedChatIdIsAuthoritative: !!String(p.chat_id || "").trim(),
           });
           let result = await whatsappBridge.sendMediaToChatId({
             chatId: target.chatId,
@@ -4686,8 +5556,6 @@ async function runScheduledJob(job) {
       const appUrl =
         activeAppUrl ||
         process.env.GROOVY_APP_URL ||
-        process.env.FLOW_APP_URL ||
-        process.env.NEXT_PUBLIC_APP_URL ||
         "";
       if (!appUrl) {
         throw new Error("GROOVY_APP_URL not set (required for orchestrator scheduled jobs). Pass --app-url or set GROOVY_APP_URL.");
@@ -4805,6 +5673,9 @@ async function runScheduledJob(job) {
           return false;
         }
         return [
+          /\b(?:task|job|work|extraction|browser(?:\s+extraction)?\s+task)\s+(?:is|has been|was)\s+queued\b/i,
+          /\bqueued\s+(?:with|on|for)\s+(?:an?\s+)?(?:agent|worker|claude|codex|browser)\b/i,
+          /\b(?:i(?:'|’)ll|i will|the agent will)\s+(?:complete|continue|finish|run|process)\b/i,
           /\b(now let me|let me now|let me check|i'?ll check|i will check|i'?ll retry|let me retry)\b/i,
           /\b(proceed with|proceed to|try a fresh approach|fresh query|simple query to reset)\b/i,
           /\b(session|connection).{0,80}\b(stuck|stale|error|keeps occurring|dead)\b/i,
@@ -4827,7 +5698,7 @@ async function runScheduledJob(job) {
             () =>
               executeConnectorType("whatsapp_send_text", {
                 chat_id: expectedWhatsAppChatId || undefined,
-                ...(expectedWhatsAppRecipientQuery
+                ...(!expectedWhatsAppChatId && expectedWhatsAppRecipientQuery
                   ? { recipient_query: expectedWhatsAppRecipientQuery }
                   : {}),
                 text: textToSend,
@@ -4842,11 +5713,7 @@ async function runScheduledJob(job) {
       for (let i = 0; i < MAX_ROUNDS; i++) {
         log("runScheduledJob: calling /api/scheduler/run", { jobId, round: i + 1, traceId, toolResultsCount: toolResults?.length || 0 });
         const schedulerRequestTimeoutMs = 14 * 60 * 1000;
-        const schedulerRequestSignal =
-          typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-            ? AbortSignal.timeout(schedulerRequestTimeoutMs)
-            : undefined;
-        const resp = await fetch(`${baseUrl}/api/scheduler/run`, {
+        const { resp, text: raw } = await fetchTextWithTimeout(`${baseUrl}/api/scheduler/run`, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -4854,6 +5721,7 @@ async function runScheduledJob(job) {
           },
           body: JSON.stringify({
             jobId,
+            runId: scheduledRunId,
             traceId: traceId || undefined,
             toolResults: toolResults || undefined,
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -4865,9 +5733,7 @@ async function runScheduledJob(job) {
                   ? "macos"
                   : "unknown",
           }),
-          signal: schedulerRequestSignal,
-        });
-        const raw = await resp.text().catch(() => "");
+        }, schedulerRequestTimeoutMs, "scheduler_run");
         let json = {};
         let parseFailed = false;
         if (raw && raw.trim()) {
@@ -5093,6 +5959,20 @@ async function runScheduledJob(job) {
             err.retryable = true;
             throw err;
           }
+          log("runScheduledJob: connector batch", {
+            jobId,
+            round: i + 1,
+            traceId,
+            executes: execs.map((ex) => ({
+              toolCallId: String(ex?.toolCallId || ""),
+              toolName: String(ex?.toolName || ""),
+              connectorType: String(ex?.connectorType || ""),
+              paramKeys:
+                ex?.connectorParams && typeof ex.connectorParams === "object"
+                  ? Object.keys(ex.connectorParams).sort()
+                  : [],
+            })),
+          });
           const skipWhatsappTextChatIds = new Set();
           for (const ex of execs) {
             const toolCallId = String(ex?.toolCallId || "");
@@ -5125,6 +6005,14 @@ async function runScheduledJob(job) {
             let r;
             let heartbeatSendHash = "";
             let heartbeatSendDeduped = false;
+            log("runScheduledJob: connector execute start", {
+              jobId,
+              round: i + 1,
+              traceId,
+              toolCallId,
+              toolName,
+              connectorType,
+            });
             if (shouldSkipRetryDuplicateWhatsAppSend(connectorType, connectorParams)) {
               r = {
                 ok: true,
@@ -5193,10 +6081,33 @@ async function runScheduledJob(job) {
                 () => executeConnectorType(connectorType, connectorParams)
               );
             }
+            const connectorOk = !!(r && typeof r === "object" && r.ok === true);
             const connectorErr =
-              r && typeof r === "object" && r.ok !== true && typeof r.error === "string"
+              r && typeof r === "object" && !connectorOk && typeof r.error === "string"
                 ? r.error
                 : "";
+            log("runScheduledJob: connector execute complete", {
+              jobId,
+              round: i + 1,
+              traceId,
+              toolCallId,
+              toolName,
+              connectorType,
+              ok: connectorOk,
+              error: connectorErr || undefined,
+              textLen:
+                r && typeof r === "object" && typeof r.text === "string"
+                  ? r.text.length
+                  : 0,
+            });
+            if (connectorType === "browser_task_run") {
+              if (connectorOk) {
+                browserTaskSucceeded = true;
+                browserTaskFailure = "";
+              } else if (!browserTaskSucceeded) {
+                browserTaskFailure = connectorErr || "browser_task_run_failed";
+              }
+            }
             if (connectorErr) {
               connectorErrors.push(connectorErr);
               noteNonRetryableScheduledWhatsAppFailure(connectorErr);
@@ -5494,6 +6405,12 @@ async function runScheduledJob(job) {
               if (ok) {
                 didSendWhatsApp = true;
                 sentWhatsAppMeta = { chatId, name };
+                if (
+                  connectorType === "whatsapp_send_text" ||
+                  connectorType === "whatsapp_send_default_group"
+                ) {
+                  rememberDeliveredWhatsAppText(connectorParams);
+                }
                 rememberScheduledWhatsAppTarget({
                   chatId,
                   recipientQuery: expectedWhatsAppRecipientQuery || name || "",
@@ -5574,6 +6491,21 @@ async function runScheduledJob(job) {
       if (!stdout && lastJson) {
         stdout = JSON.stringify(lastJson);
       }
+      if (browserTaskFailure && !browserTaskSucceeded) {
+        status = "error";
+        exitCode = 1;
+        errorText = browserTaskFailure;
+        if (isRetryableScheduleError(browserTaskFailure)) {
+          retryableFailure = true;
+          retryReason = browserTaskFailure;
+        }
+        warn("runScheduledJob: required browser task failed", {
+          jobId,
+          traceId,
+          error: browserTaskFailure,
+          didSendWhatsApp,
+        });
+      }
     } else {
       const { stdout: out, stderr: err } = await execPortableCommand(String(job.command || ""), {
         cwd,
@@ -5629,6 +6561,21 @@ async function runScheduledJob(job) {
   const finishedAt = new Date();
   const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
 
+  if (kind === "orchestrator" && deliveredWhatsAppTexts.length > 0) {
+    const deliveredOutput = deliveredWhatsAppTexts
+      .map((text, idx) => `Delivered WhatsApp message ${idx + 1}:\n${text}`)
+      .join("\n\n");
+    const stdoutLooksLikeDeliveryAck =
+      !stdout.trim() ||
+      /^Sent scheduled WhatsApp message to\b/i.test(stdout.trim()) ||
+      /^Heartbeat delivered\.$/i.test(stdout.trim());
+    if (stdoutLooksLikeDeliveryAck) {
+      stdout = deliveredOutput;
+    } else if (!deliveredWhatsAppTexts.some((text) => stdout.includes(text))) {
+      stdout = `${stdout.trim()}\n\n${deliveredOutput}`;
+    }
+  }
+
   // Truncate logs to keep relay payload sane
   const MAX_LOG = 40_000;
   if (stdout.length > MAX_LOG) stdout = stdout.slice(-MAX_LOG);
@@ -5660,6 +6607,7 @@ async function runScheduledJob(job) {
         retryWaitingForWhatsAppHealthy = waitForWhatsAppHealthy;
         scheduleRetryState.set(jobId, {
           attempt: nextAttempt,
+          scheduledRunId,
           nextAttemptAtMs: nextAtMs,
           lastError: String(errorText || retryReason || ""),
           waitForWhatsAppHealthy,
@@ -5702,6 +6650,82 @@ async function runScheduledJob(job) {
     scheduleRetryState.delete(jobId);
   }
 
+  if (
+    isHeartbeatJob &&
+    heartbeatWhatsAppEnabled &&
+    status !== "success" &&
+    status !== "skipped" &&
+    !didSendWhatsApp &&
+    whatsappBridge &&
+    typeof whatsappBridge.sendText === "function"
+  ) {
+    try {
+      const noticeText = buildHeartbeatFailureNotice();
+      const dedupe = await checkHeartbeatMessageDedupe({
+        jobId,
+        text: noticeText,
+        windowMs: heartbeatDedupeWindowMs,
+      });
+      if (dedupe.deduped) {
+        log("runScheduledJob: heartbeat failure notice deduped", {
+          jobId,
+          windowMs: heartbeatDedupeWindowMs,
+          ageMs: dedupe.ageMs,
+          hash: dedupe.hash.slice(0, 12),
+        });
+      } else {
+        const noticeResult = await runConnectorOpWithPriority(
+          "low",
+          `scheduler:${jobId}:heartbeat_failure_notice`,
+          () =>
+            sendScheduledDefaultGroupMessage(
+              {
+                text: noticeText,
+                followup_source: "heartbeat_failure_notice",
+              },
+              { observe: true }
+            )
+        );
+        if (noticeResult && typeof noticeResult === "object" && noticeResult.ok === true) {
+          const chatId =
+            typeof noticeResult.chatId === "string" ? noticeResult.chatId : "";
+          const name = typeof noticeResult.name === "string" ? noticeResult.name : "";
+          didSendWhatsApp = true;
+          sentWhatsAppMeta = { chatId, name };
+          if (chatId) expectedWhatsAppChatId = chatId;
+          if (name) expectedWhatsAppRecipientQuery = name;
+          await markHeartbeatMessageSent({
+            jobId,
+            hash: dedupe.hash,
+            chatId,
+            traceId: null,
+            toolCallId: "heartbeat_failure_notice",
+          });
+          log("runScheduledJob: heartbeat failure notice sent", {
+            jobId,
+            chatId: chatId || undefined,
+            name: name || undefined,
+          });
+        } else {
+          warn("runScheduledJob: heartbeat failure notice send failed", {
+            jobId,
+            error:
+              noticeResult &&
+              typeof noticeResult === "object" &&
+              typeof noticeResult.error === "string"
+                ? noticeResult.error
+                : "heartbeat_failure_notice_send_failed",
+          });
+        }
+      }
+    } catch (noticeErr) {
+      warn(
+        "runScheduledJob: heartbeat failure notice threw",
+        noticeErr instanceof Error ? noticeErr.message : String(noticeErr)
+      );
+    }
+  }
+
   // If WhatsApp bridge is running, post a short scheduled-job status back to the Groovy group.
   // Keep this to ONE LINE (visibility without spamming the group).
   try {
@@ -5711,7 +6735,13 @@ async function runScheduledJob(job) {
     // Skip status alerts for heartbeat jobs (they have their own delivery logic).
     const taskObj = job?.task;
     const isHeartbeat = taskObj && typeof taskObj === "object" && taskObj.type === "heartbeat_v1";
-    if (shouldPost && kind === "orchestrator" && whatsappBridge?.sendText && !isHeartbeat) {
+    if (
+      shouldPost &&
+      kind === "orchestrator" &&
+      whatsappBridge?.sendText &&
+      !isHeartbeat &&
+      !didSendWhatsApp
+    ) {
       const jobName = String(job?.name || "Scheduled task");
       const headline = status === "success" ? "✅" : status === "skipped" ? "⏭️" : "❌";
       const suffix =
@@ -5798,7 +6828,6 @@ async function runScheduledJob(job) {
       : {}),
   });
 
-  inFlightJobs.delete(jobId);
 }
 
 async function tickSchedules() {
@@ -5825,7 +6854,7 @@ async function tickSchedules() {
       if (
         waitForWhatsAppHealthy &&
         !whatsappUnavailableWhileWaitingForHealthy &&
-        whatsappHealthState.status !== "healthy"
+        !isWhatsAppBridgeReadyForScheduledDelivery()
       ) {
         continue;
       }
@@ -5848,6 +6877,31 @@ async function tickSchedules() {
 
     const dueInfo = isDueNow(job, now);
     if (!dueInfo?.due) continue;
+
+    if (
+      scheduledJobWantsWhatsAppDelivery(job) &&
+      schedulerWhatsAppRuntimeConfig.enabled &&
+      schedulerWhatsAppRuntimeConfig.groupName &&
+      schedulerWhatsAppRuntimeConfig.appUrl &&
+      !isWhatsAppBridgeReadyForScheduledDelivery()
+    ) {
+      scheduleRetryState.set(jobId, {
+        attempt: 0,
+        nextAttemptAtMs: now.getTime(),
+        lastError: "waiting_for_whatsapp_ready_before_run",
+        waitForWhatsAppHealthy: true,
+        expectedWhatsAppSend: true,
+      });
+      log("scheduler: deferring due job until whatsapp bridge is ready", {
+        jobId,
+        name: String(job?.name || ""),
+        kind: String(job?.kind || "shell"),
+        dueAt: dueInfo?.dueAt ? new Date(dueInfo.dueAt).toISOString() : null,
+        whatsappStatus: whatsappHealthState.status || null,
+        hasBridge: !!(whatsappBridge && typeof whatsappBridge.sendText === "function"),
+      });
+      continue;
+    }
 
     log("scheduler: job due", {
       jobId,
@@ -6281,6 +7335,26 @@ function detectClaudeCliInstalled() {
   return hasCommandInPath("claude");
 }
 
+function detectCodexCliInstalled() {
+  const candidates = uniqueStrings([
+    process.env.GROOVY_CODEX_BIN,
+    process.env.CODEX_BIN,
+    process.platform === "win32" && process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, "Programs", "codex", "codex.exe")
+      : null,
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    "/usr/bin/codex",
+    path.join(os.homedir(), ".local", "bin", "codex"),
+    path.join(os.homedir(), "bin", "codex"),
+  ]);
+
+  for (const candidate of candidates) {
+    if (isExecutable(candidate)) return true;
+  }
+  return hasCommandInPath("codex");
+}
+
 function getPtyShellArgs(shellPath) {
   if (process.platform === "win32") {
     const base = path.basename(String(shellPath || "")).toLowerCase();
@@ -6369,7 +7443,9 @@ function mergeExtraEnv(baseEnv, extraEnv) {
 async function saveDeviceTokenSecure(deviceToken) {
   try {
     if (keytar && deviceToken) {
-      await keytar.setPassword(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, String(deviceToken));
+      const token = String(deviceToken);
+      await keytar.setPassword(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token);
+      cachedDeviceToken = token;
       log("stored device_token in keychain");
       return true;
     }
@@ -6384,6 +7460,7 @@ async function saveDeviceTokenSecure(deviceToken) {
 
 async function clearDeviceTokenSecure() {
   let cleared = false;
+  cachedDeviceToken = null;
   try {
     if (keytar) {
       const removedCurrent = await keytar.deletePassword(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
@@ -6402,12 +7479,16 @@ async function clearDeviceTokenSecure() {
 }
 
 async function readDeviceTokenSecure() {
+  if (cachedDeviceToken) return cachedDeviceToken;
   try {
     if (keytar) {
       const v =
         (await keytar.getPassword(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)) ||
         (await keytar.getPassword(LEGACY_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT));
-      if (v) return v;
+      if (v) {
+        cachedDeviceToken = v;
+        return v;
+      }
     }
   } catch {
     // ignore
@@ -6468,6 +7549,11 @@ ${programArgsXml}
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GROOVY_CONNECTOR_SUPERVISED</key>
+    <string>1</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>${os.homedir()}/.groovy/connector.log</string>
   <key>StandardErrorPath</key>
@@ -6477,6 +7563,84 @@ ${programArgsXml}
 </dict>
 </plist>
 `;
+}
+
+function isRunningUnderGroovyLaunchAgent() {
+  return process.platform === "darwin" && process.env.XPC_SERVICE_NAME === LAUNCH_AGENT_LABEL;
+}
+
+async function isLaunchAgentLoaded() {
+  if (process.platform !== "darwin") return false;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null) {
+    try {
+      await execFileAsync("launchctl", ["print", `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+      return true;
+    } catch {
+      // Fall through to legacy check.
+    }
+  }
+  try {
+    await execFileAsync("launchctl", ["list", LAUNCH_AGENT_LABEL]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function bootoutLaunchAgent() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid !== null) {
+    try {
+      await execFileAsync("launchctl", ["bootout", `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+      return;
+    } catch {
+      // Fall back to the plist form below.
+    }
+  }
+  try {
+    await execFileAsync("launchctl", ["unload", LAUNCH_AGENT_PATH]);
+  } catch {
+    // ignore if not loaded
+  }
+}
+
+async function loadLaunchAgent({ forceReload = false } = {}) {
+  if (process.platform !== "darwin") return false;
+  if (!forceReload && (await isLaunchAgentLoaded())) {
+    log("LaunchAgent already loaded", { label: LAUNCH_AGENT_LABEL });
+    return true;
+  }
+
+  if (forceReload) {
+    await bootoutLaunchAgent();
+  }
+
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  try {
+    if (uid !== null) {
+      await execFileAsync("launchctl", ["bootstrap", `gui/${uid}`, LAUNCH_AGENT_PATH]);
+    } else {
+      await execFileAsync("launchctl", ["load", "-w", LAUNCH_AGENT_PATH]);
+    }
+    log("loaded LaunchAgent - connector will now start automatically on login");
+    return true;
+  } catch (bootstrapErr) {
+    const bootstrapMessage =
+      bootstrapErr instanceof Error ? bootstrapErr.message : String(bootstrapErr || "");
+    if (/already (?:bootstrapped|loaded)|service is already loaded/i.test(bootstrapMessage)) {
+      log("LaunchAgent already loaded", { label: LAUNCH_AGENT_LABEL });
+      return true;
+    }
+    try {
+      await execFileAsync("launchctl", ["load", "-w", LAUNCH_AGENT_PATH]);
+      log("loaded LaunchAgent - connector will now start automatically on login");
+      return true;
+    } catch (loadErr) {
+      const loadMessage = loadErr instanceof Error ? loadErr.message : String(loadErr || "");
+      throw new Error(loadMessage || bootstrapMessage || "launchctl_load_failed");
+    }
+  }
 }
 
 async function installLaunchAgent(relayUrl, extraArgs = {}) {
@@ -6494,22 +7658,15 @@ async function installLaunchAgent(relayUrl, extraArgs = {}) {
     } catch {
       // ignore
     }
-    if (prev !== plist) {
+    const changed = prev !== plist;
+    if (changed) {
       await fsp.writeFile(LAUNCH_AGENT_PATH, plist, "utf8");
       log(prev ? "updated LaunchAgent at" : "installed LaunchAgent at", LAUNCH_AGENT_PATH);
     } else {
       log("LaunchAgent already up to date at", LAUNCH_AGENT_PATH);
-      return true;
     }
 
-    // Load the agent
-    try {
-      await execFileAsync("launchctl", ["unload", LAUNCH_AGENT_PATH]);
-    } catch {
-      // ignore if not loaded
-    }
-    await execFileAsync("launchctl", ["load", LAUNCH_AGENT_PATH]);
-    log("loaded LaunchAgent - connector will now start automatically on login");
+    await loadLaunchAgent({ forceReload: changed && !isRunningUnderGroovyLaunchAgent() });
 
     return true;
   } catch (err) {
@@ -6611,7 +7768,12 @@ async function main() {
     argValue("--relay") ||
     cfg.relay_url ||
     process.env.GROOVY_RELAY_URL ||
-    "wss://groovy-relay.fly.dev";
+    "";
+  if (!relayUrl) {
+    throw new Error(
+      "GROOVY_RELAY_URL is required. Set it in the environment, connector config, or pass --relay."
+    );
+  }
   let pairingCode = argValue("--pair");
   const deviceName = argValue("--device-name") || cfg.device_name || os.hostname();
   const noAutoStartFlag = hasFlag("--no-autostart");
@@ -6828,6 +7990,13 @@ async function main() {
     resolvedDeviceName: aiyraResolvedDeviceName,
     micSelectionFallbackReason: aiyraMicSelectionFallbackReason,
   } = resolveAiyraRuntimeConfig();
+  const connectorAppUrl =
+    normalizeAppBaseUrl(argValue("--app-url")) ||
+    normalizeAppBaseUrl(process.env.GROOVY_APP_URL) ||
+    normalizeAppBaseUrl(whatsappAppUrl) ||
+    normalizeAppBaseUrl(aiyraAppUrl) ||
+    normalizeAppBaseUrl(cfg.whatsapp_app_url) ||
+    normalizeAppBaseUrl(cfg.aiyra_app_url);
   const applyResolvedAiyraRuntimeConfig = (nextAiyraConfig) => {
     aiyraVoiceEnabled = nextAiyraConfig.enabled;
     aiyraAppUrl = nextAiyraConfig.appUrl;
@@ -6901,8 +8070,10 @@ async function main() {
     noteAiyraVoiceDisabled("aiyra_voice_disabled", "Aiyra voice runtime disabled in connector config");
   }
 
-  // Set module-level app URL for scheduler API calls
+  // Set module-level app URLs. Scheduler keeps its historical WhatsApp/app URL behavior;
+  // update checks can fall back to the production app when no local app URL is configured.
   if (whatsappAppUrl) activeAppUrl = whatsappAppUrl;
+  if (connectorAppUrl) activeUpdateAppUrl = connectorAppUrl;
 
   // WhatsApp @code mode (Claude Code via local PTY):
   // Prefer explicit CLI arg, then env, then persisted config, then a repo-heuristic from process.cwd().
@@ -7072,11 +8243,75 @@ async function main() {
     }, 250);
   }
 
-  function requestProcessRestart(reason = "manual_restart") {
+  function clearDeferredConnectorRestart() {
+    if (deferredConnectorRestartTimer) {
+      clearTimeout(deferredConnectorRestartTimer);
+      deferredConnectorRestartTimer = null;
+    }
+    deferredConnectorRestartReason = "";
+    deferredConnectorRestartRequestedAtMs = 0;
+  }
+
+  function requestProcessRestart(reason = "manual_restart", opts = {}) {
     if (connectorRestartRequested) {
       log("connector restart already in progress", { reason });
       return false;
     }
+    const force = opts && typeof opts === "object" && opts.force === true;
+    if (!force && isConnectorBusyForUpdate()) {
+      const nowMs = Date.now();
+      if (!deferredConnectorRestartTimer) {
+        deferredConnectorRestartReason = reason;
+        deferredConnectorRestartRequestedAtMs = nowMs;
+        log("connector restart deferred until active work finishes", {
+          reason,
+          busy: getConnectorBusySummary(),
+        });
+        const pollDeferredRestart = () => {
+          deferredConnectorRestartTimer = null;
+          if (!deferredConnectorRestartReason) return;
+          if (!isConnectorBusyForUpdate()) {
+            const deferredReason = deferredConnectorRestartReason;
+            clearDeferredConnectorRestart();
+            requestProcessRestart(deferredReason, { force: true });
+            return;
+          }
+          const waitedMs = Math.max(0, Date.now() - deferredConnectorRestartRequestedAtMs);
+          if (waitedMs >= CONNECTOR_RESTART_DEFER_MAX_MS) {
+            const deferredReason = deferredConnectorRestartReason;
+            warn("connector restart defer window exhausted; restarting with active work", {
+              reason: deferredReason,
+              waitedMs,
+              busy: getConnectorBusySummary(),
+            });
+            clearDeferredConnectorRestart();
+            requestProcessRestart(deferredReason, { force: true });
+            return;
+          }
+          log("connector restart still deferred; active work remains", {
+            reason: deferredConnectorRestartReason,
+            waitedMs,
+            busy: getConnectorBusySummary(),
+          });
+          deferredConnectorRestartTimer = setTimeout(
+            pollDeferredRestart,
+            CONNECTOR_RESTART_DEFER_POLL_MS
+          );
+        };
+        deferredConnectorRestartTimer = setTimeout(
+          pollDeferredRestart,
+          CONNECTOR_RESTART_DEFER_POLL_MS
+        );
+      } else {
+        log("connector restart already deferred", {
+          reason,
+          deferredReason: deferredConnectorRestartReason,
+          busy: getConnectorBusySummary(),
+        });
+      }
+      return true;
+    }
+    clearDeferredConnectorRestart();
     connectorRestartRequested = true;
     log("connector restart requested", { reason });
     shouldReconnect = false;
@@ -7089,6 +8324,10 @@ async function main() {
     setTimeout(async () => {
       await stopAiyraVoiceRuntime(reason).catch(() => {});
       await releaseSingleInstanceLock();
+      if (process.env.GROOVY_CONNECTOR_SUPERVISED === "1") {
+        log("exiting for supervisor-managed restart", { reason });
+        process.exit(0);
+      }
       const scriptPath = new URL(import.meta.url).pathname;
       const restartArgs = buildRestartArgs();
       const child = spawn(process.execPath, [scriptPath, ...restartArgs], {
@@ -7143,7 +8382,39 @@ async function main() {
     return true;
   }
 
+  function isAiyraWakewordConfigurationError(reason = "", detail = "") {
+    const text = `${reason} ${detail}`.toLowerCase();
+    return (
+      text.includes("openwakeword_model_init_failed") ||
+      text.includes("could not find pretrained model") ||
+      text.includes("invalid_openwakeword_model") ||
+      text.includes("missing_openwakeword_model")
+    );
+  }
+
   function scheduleAiyraRuntimeRecovery(reason = "runtime_failed", detail = "") {
+    if (isAiyraWakewordConfigurationError(reason, detail)) {
+      clearAiyraRuntimeRecoveryTimer({ resetAttempt: true });
+      log("aiyra runtime recovery suppressed for invalid wake-word configuration", {
+        reason,
+        detail: detail || null,
+        configuredModelPath: aiyraOpenWakewordModelPath || null,
+      });
+      noteAiyraVoiceDegraded(
+        "aiyra_wakeword_config_invalid",
+        detail ||
+          "Wake-word configuration is invalid. Update the OpenWakeWord model settings to recover.",
+        {
+          listening: false,
+          active: false,
+          muted: false,
+          mic_input_level: 0,
+          mic_input_updated_at: null,
+          ...buildAiyraMicSelectionHealthExtra(),
+        }
+      );
+      return false;
+    }
     if (!canAutoRecoverAiyraRuntime() || aiyraRuntimeRecoveryTimer) {
       return !!aiyraRuntimeRecoveryTimer;
     }
@@ -7668,10 +8939,21 @@ async function main() {
           }
           if (
             event?.reason === "aiyra_wakeword_failed" &&
-            event?.active !== true &&
-            scheduleAiyraRuntimeRecovery(event.reason, event.detail || "")
+            event?.active !== true
           ) {
-            return;
+            if (isAiyraWakewordConfigurationError(event.reason, event.detail || "")) {
+              clearAiyraRuntimeRecoveryTimer({ resetAttempt: true });
+              noteAiyraVoiceDegraded(
+                "aiyra_wakeword_config_invalid",
+                event.detail ||
+                  "Wake-word configuration is invalid. Update the OpenWakeWord model settings to recover.",
+                healthExtra
+              );
+              return;
+            }
+            if (scheduleAiyraRuntimeRecovery(event.reason, event.detail || "")) {
+              return;
+            }
           }
           noteAiyraVoiceDegraded(
             event.reason || "aiyra_voice_degraded",
@@ -7718,13 +9000,31 @@ async function main() {
       return true;
     } catch (e) {
       aiyraActiveRuntimeDeviceName = "";
+      const message = e instanceof Error ? e.message : String(e);
+      if (isAiyraWakewordConfigurationError("aiyra_runtime_start_failed", message)) {
+        clearAiyraRuntimeRecoveryTimer({ resetAttempt: true });
+        noteAiyraVoiceDegraded(
+          "aiyra_wakeword_config_invalid",
+          message ||
+            "Wake-word configuration is invalid. Update the OpenWakeWord model settings to recover.",
+          {
+            listening: false,
+            active: false,
+            muted: false,
+            mic_input_level: 0,
+            mic_input_updated_at: null,
+            ...buildAiyraMicSelectionHealthExtra(),
+          }
+        );
+        return false;
+      }
       noteAiyraVoiceDegraded(
         "aiyra_runtime_start_failed",
-        e instanceof Error ? e.message : String(e)
+        message
       );
       scheduleAiyraRuntimeRecovery(
         "aiyra_runtime_start_failed",
-        e instanceof Error ? e.message : String(e)
+        message
       );
       return false;
     } finally {
@@ -7835,14 +9135,20 @@ async function main() {
       log("connected to relay");
       const connectorVersion = getConnectorVersion();
 
-      // Check if Claude CLI is installed
+      // Check which code CLI harnesses are installed
       let claudeCliInstalled = false;
       try {
         claudeCliInstalled = detectClaudeCliInstalled();
       } catch {
         // ignore
       }
-      
+      let codexCliInstalled = false;
+      try {
+        codexCliInstalled = detectCodexCliInstalled();
+      } catch {
+        // ignore
+      }
+
       ws.send(
         JSON.stringify({
           type: "connector_hello",
@@ -7851,7 +9157,13 @@ async function main() {
           device_name: deviceName,
           public_key: null,
           version: connectorVersion,
-          capabilities: { claudeCliInstalled, skillsManager: true },
+          capabilities: {
+            claudeCliInstalled,
+            codexCliInstalled,
+            skillsManager: true,
+            agentTasks: true,
+            managedByDesktop: process.env.GROOVY_MANAGED_BY_DESKTOP === "1",
+          },
         })
       );
       flushRelayResultBacklog();
@@ -8324,7 +9636,8 @@ async function main() {
               })
               .catch(async (e) => {
                 const msg = e instanceof Error ? e.message : String(e);
-                if (msg !== "whatsapp_qr_required") {
+                const keepBridgeForLateReady = shouldKeepWhatsAppBridgeForLateReady(msg);
+                if (msg !== "whatsapp_qr_required" && !keepBridgeForLateReady) {
                   whatsappBridge = null;
                 }
                 warn("whatsapp bridge failed", msg);
@@ -8338,6 +9651,15 @@ async function main() {
                   noteWhatsAppRecovering(
                     "whatsapp_qr_required",
                     "WhatsApp session reset requires QR re-link"
+                  );
+                } else if (keepBridgeForLateReady) {
+                  noteWhatsAppRecovering(
+                    "whatsapp_bridge_late_ready_pending",
+                    `WhatsApp bridge startup timed out (${msg}); keeping live bridge while it finishes becoming ready`
+                  );
+                  scheduleWhatsAppLateReadyProbe(
+                    "whatsapp_bridge_late_ready",
+                    "WhatsApp bridge became ready after startup timeout"
                   );
                 } else if (isStartupRetryable) {
                   // Stay in "recovering" while we run our own 5s local bridge retry.
@@ -8353,7 +9675,7 @@ async function main() {
                   noteWhatsAppDegraded("whatsapp_bridge_start_failed", msg, msg);
                 }
 
-                if (isStartupRetryable) {
+                if (isStartupRetryable && !keepBridgeForLateReady) {
                   warn("Detected WhatsApp startup failure — retrying bridge in 5s", {
                     retryWithoutPin,
                     retryWithSessionReset,
@@ -8440,7 +9762,8 @@ async function main() {
                     }
                   } catch (retryErr) {
                     const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-                    if (retryMsg !== "whatsapp_qr_required") {
+                    const keepRetryBridgeForLateReady = shouldKeepWhatsAppBridgeForLateReady(retryMsg);
+                    if (retryMsg !== "whatsapp_qr_required" && !keepRetryBridgeForLateReady) {
                       whatsappBridge = null;
                     }
                     warn("WhatsApp bridge retry also failed:", retryMsg);
@@ -8448,6 +9771,15 @@ async function main() {
                       noteWhatsAppRecovering(
                         "whatsapp_qr_required",
                         "WhatsApp session reset requires QR re-link"
+                      );
+                    } else if (keepRetryBridgeForLateReady) {
+                      noteWhatsAppRecovering(
+                        "whatsapp_bridge_late_ready_pending",
+                        `WhatsApp bridge retry timed out (${retryMsg}); keeping live bridge while it finishes becoming ready`
+                      );
+                      scheduleWhatsAppLateReadyProbe(
+                        "whatsapp_bridge_late_ready",
+                        "WhatsApp bridge became ready after retry timeout"
                       );
                     } else {
                       noteWhatsAppDegraded("whatsapp_bridge_retry_failed", retryMsg, retryMsg);
@@ -8602,6 +9934,19 @@ async function main() {
       }
 
       // Manual trigger from UI to run a job immediately
+      if (msg.type === "schedule_status_request") {
+        const requestId = String(msg.request_id || "");
+        if (requestId) {
+          ws.send(JSON.stringify({
+            type: "schedule_status_result",
+            request_id: requestId,
+            ok: true,
+            active_job_ids: Array.from(inFlightJobs),
+          }));
+        }
+        return;
+      }
+
       if (msg.type === "schedule_trigger") {
         const requestId = String(msg.request_id || "");
         const jobId = String(msg.job_id || "");
@@ -9642,7 +10987,11 @@ async function main() {
           abortRun(targetRequestId, pendingClaudeRuns.get(targetRequestId));
         }
 
-        if (cancelAllForAgent && targetAgentId) {
+        // A request-specific cancel must never fan out to a newer run for the
+        // same agent. Stale mobile tabs and relay timeout timers can outlive
+        // their original request id; broadening that stale cancel would abort
+        // unrelated work that started later.
+        if (!targetRequestId && cancelAllForAgent && targetAgentId) {
           for (const [runRequestId, entry] of pendingClaudeRuns.entries()) {
             if (entry?.agentId === targetAgentId) {
               abortRun(runRequestId, entry);
@@ -9684,7 +11033,7 @@ async function main() {
         const agentId = typeof msg.agent_id === "string" ? msg.agent_id.trim() : "";
         const requestedAllowedTools =
           typeof msg.allowed_tools === "string" ? msg.allowed_tools.trim() : "Read,Edit,Bash";
-        const timeoutMs = Number.isFinite(Number(msg.timeout_ms)) ? Number(msg.timeout_ms) : 15 * 60 * 1000;
+        const timeoutMs = Number.isFinite(Number(msg.timeout_ms)) ? Number(msg.timeout_ms) : 20 * 60 * 1000;
         const sessionId = typeof msg.session_id === "string" ? msg.session_id.trim() : "";
         const planMode = msg.plan_mode === true;
         const requestedModel = typeof msg.model === "string" ? msg.model.trim() : "";
@@ -10069,6 +11418,10 @@ async function main() {
               cwd: safeCwd,
               promptLen: effectivePrompt.length,
               model: cliModel,
+              reasoningEffort:
+                typeof msg?.reasoning_effort === "string" && msg.reasoning_effort.trim()
+                  ? msg.reasoning_effort.trim()
+                  : null,
               claudeBin,
               allowedTools,
               planMode,
@@ -10205,6 +11558,8 @@ async function main() {
                   timeoutMs,
                   codexBin,
                   model: cliModel,
+                  reasoningEffort:
+                    typeof msg?.reasoning_effort === "string" ? msg.reasoning_effort : undefined,
                   sessionId: sessionId || undefined,
                   apiKey: apiKey || undefined,
                   planMode,
@@ -10218,6 +11573,8 @@ async function main() {
                   timeoutMs,
                   claudeBin,
                   model: cliModel,
+                  reasoningEffort:
+                    typeof msg?.reasoning_effort === "string" ? msg.reasoning_effort : undefined,
                   allowedTools: allowedTools || undefined,
                   planMode,
                   sessionId: sessionId || undefined,
@@ -11165,6 +12522,155 @@ async function main() {
         return;
       }
 
+      // ===== Workspace instruction files (CLAUDE.md / AGENTS.md) =====
+      // Scoped replacements for generic file_read/file_write: only the two
+      // well-known instruction filenames, only at the given workspace root.
+      if (msg.type === "workspace_md_read" || msg.type === "workspace_md_write") {
+        const requestId = String(msg.request_id || "");
+        const workspaceRoot = String(msg.workspace_root || "").trim();
+        const filename = String(msg.filename || "").trim();
+        const respond = (payload) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: `${msg.type}_result`,
+                request_id: requestId,
+                ...payload,
+              })
+            );
+          }
+        };
+        if (filename !== "CLAUDE.md" && filename !== "AGENTS.md") {
+          respond({ ok: false, error: "filename_not_allowed" });
+          return;
+        }
+        if (!workspaceRoot || !isDirectory(workspaceRoot)) {
+          respond({ ok: false, error: "invalid_workspace_root" });
+          return;
+        }
+        const targetPath = path.join(workspaceRoot, filename);
+        try {
+          if (msg.type === "workspace_md_read") {
+            let content = "";
+            let exists = false;
+            try {
+              content = await fsp.readFile(targetPath, "utf8");
+              exists = true;
+            } catch {
+              // Missing file is a valid empty state.
+            }
+            respond({ ok: true, exists, content, path: targetPath });
+          } else {
+            const content = typeof msg.content === "string" ? msg.content : "";
+            await fsp.writeFile(targetPath, content, "utf8");
+            respond({ ok: true, path: targetPath });
+          }
+        } catch (error) {
+          respond({ ok: false, error: error?.message || String(error) });
+        }
+        return;
+      }
+
+      // ===== Approved plans (harness plan mode) =====
+      // Read-only repository fingerprint used to detect plans that became stale
+      // between exploration and approval/execution.
+      if (msg.type === "workspace_repo_snapshot") {
+        const requestId = String(msg.request_id || "");
+        const workspaceRoot = String(msg.workspace_root || "").trim();
+        const respond = (payload) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "workspace_repo_snapshot_result",
+                request_id: requestId,
+                ...payload,
+              })
+            );
+          }
+        };
+        if (!workspaceRoot || !isDirectory(workspaceRoot)) {
+          respond({ ok: false, error: "invalid_workspace_root" });
+          return;
+        }
+        try {
+          const git = (...args) =>
+            execFileSync("git", ["-C", workspaceRoot, ...args], {
+              encoding: "utf8",
+              timeout: 10_000,
+              maxBuffer: 8 * 1024 * 1024,
+            }).trim();
+          const commitSha = git("rev-parse", "HEAD");
+          const branch = git("rev-parse", "--abbrev-ref", "HEAD");
+          // Directory-level untracked reporting keeps the fingerprint bounded
+          // for repositories containing generated trees while still detecting
+          // tracked edits and the appearance/removal of untracked paths.
+          const status = git("status", "--porcelain=v1", "--untracked-files=normal");
+          respond({
+            ok: true,
+            commit_sha: commitSha,
+            branch,
+            dirty: !!status,
+            status_hash: createHash("sha256").update(status).digest("hex"),
+            changed_file_count: status ? status.split("\n").filter(Boolean).length : 0,
+            captured_at: new Date().toISOString(),
+          });
+        } catch (error) {
+          respond({ ok: false, error: error?.message || "git_snapshot_failed" });
+        }
+        return;
+      }
+
+      // Writes a plan markdown file under <workspace_root>/.claude/plans/ so
+      // any harness (Claude Code or Codex) working in that workspace can read
+      // it, and the Plans browser picks it up.
+      if (msg.type === "workspace_plan_write") {
+        const requestId = String(msg.request_id || "");
+        const workspaceRoot = String(msg.workspace_root || "").trim();
+        const rawSlug = String(msg.slug || "plan");
+        const content = typeof msg.content === "string" ? msg.content : "";
+        const respond = (payload) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: "workspace_plan_write_result",
+                request_id: requestId,
+                ...payload,
+              })
+            );
+          }
+        };
+        if (!workspaceRoot || !isDirectory(workspaceRoot)) {
+          respond({ ok: false, error: "invalid_workspace_root" });
+          return;
+        }
+        const slug = rawSlug
+          .toLowerCase()
+          .replace(/[^a-z0-9-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 80) || "plan";
+        try {
+          const plansDir = path.join(workspaceRoot, ".claude", "plans");
+          await fsp.mkdir(plansDir, { recursive: true });
+          const stamp = new Date().toISOString().slice(0, 10);
+          let filename = `${stamp}-${slug}.md`;
+          let target = path.join(plansDir, filename);
+          for (let i = 2; i <= 50; i++) {
+            try {
+              await fsp.access(target);
+              filename = `${stamp}-${slug}-${i}.md`;
+              target = path.join(plansDir, filename);
+            } catch {
+              break;
+            }
+          }
+          await fsp.writeFile(target, content, "utf8");
+          respond({ ok: true, path: target, filename });
+        } catch (error) {
+          respond({ ok: false, error: error?.message || String(error) });
+        }
+        return;
+      }
+
       // ===== File System Operations =====
       if (msg.type === "file_read") {
         const requestId = String(msg.request_id || "");
@@ -11903,6 +13409,23 @@ async function main() {
           const duplicateHits = Number(cachedSuccess.duplicateHits || 0) + 1;
           cachedSuccess.duplicateHits = duplicateHits;
           recentBrowserTaskSuccessBySignature.set(browserTaskSignature, cachedSuccess);
+          const cachedResult =
+            cachedSuccess.result && typeof cachedSuccess.result === "object"
+              ? cachedSuccess.result
+              : {};
+          const cachedUsedAuthFallback =
+            cachedResult.meta &&
+            typeof cachedResult.meta === "object" &&
+            cachedResult.meta.authFallbackUsed === true;
+          const cachedBillingChargeType = cachedUsedAuthFallback
+            ? "external_key_fee"
+            : billingChargeType;
+          const cachedBillingAuthOrigin = cachedUsedAuthFallback
+            ? "user"
+            : billingAuthOrigin;
+          const cachedBillingAuthMethod = cachedUsedAuthFallback
+            ? "local_claude_login"
+            : billingAuthMethod;
           log("browser_task_run duplicate detected; reusing cached success", {
             duplicateHits,
             cacheAgeMs: nowMs - Number(cachedSuccess.tsMs || nowMs),
@@ -11912,11 +13435,11 @@ async function main() {
               JSON.stringify({
                 type: "browser_task_run_result",
                 request_id: requestId,
-                ...(cachedSuccess.result || {}),
+                ...cachedResult,
                 ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
-                ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
-                ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
-                ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
+                ...(cachedBillingChargeType ? { billing_charge_type: cachedBillingChargeType } : {}),
+                ...(cachedBillingAuthOrigin ? { billing_auth_origin: cachedBillingAuthOrigin } : {}),
+                ...(cachedBillingAuthMethod ? { billing_auth_method: cachedBillingAuthMethod } : {}),
                 cached_duplicate: true,
                 loop_guard: true,
                 warning:
@@ -12009,6 +13532,21 @@ async function main() {
           () => undefined
         );
         const result = await queuedRun;
+        const usedAuthFallback =
+          result &&
+          typeof result === "object" &&
+          result.meta &&
+          typeof result.meta === "object" &&
+          result.meta.authFallbackUsed === true;
+        const effectiveBillingChargeType = usedAuthFallback
+          ? "external_key_fee"
+          : billingChargeType;
+        const effectiveBillingAuthOrigin = usedAuthFallback
+          ? "user"
+          : billingAuthOrigin;
+        const effectiveBillingAuthMethod = usedAuthFallback
+          ? "local_claude_login"
+          : billingAuthMethod;
 
         if (
           result &&
@@ -12038,9 +13576,9 @@ async function main() {
           request_id: requestId,
           ...result,
           ...(typeof billingBillable === "boolean" ? { billing_billable: billingBillable } : {}),
-          ...(billingChargeType ? { billing_charge_type: billingChargeType } : {}),
-          ...(billingAuthOrigin ? { billing_auth_origin: billingAuthOrigin } : {}),
-          ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
+          ...(effectiveBillingChargeType ? { billing_charge_type: effectiveBillingChargeType } : {}),
+          ...(effectiveBillingAuthOrigin ? { billing_auth_origin: effectiveBillingAuthOrigin } : {}),
+          ...(effectiveBillingAuthMethod ? { billing_auth_method: effectiveBillingAuthMethod } : {}),
         });
         return;
       }

@@ -10,6 +10,7 @@ import {
 import { createAndPayTopupInvoice } from "@/lib/billing/stripe";
 import { recordWorkspaceTopupCredit } from "@/lib/billing/guard";
 import { resolveWorkspaceTokenBillingPolicy } from "@/lib/billing/policy";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,6 +18,9 @@ export const dynamic = "force-dynamic";
 const TOPUP_AMOUNT_USD = 10;
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },

@@ -1,14 +1,14 @@
 import { NextResponse } from "next/server";
 import { createHash } from "crypto";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getAppUrl } from "@/lib/config/appConfig";
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
 
 function appBaseUrl(): string {
-  const fromEnv = (process.env.NEXT_PUBLIC_APP_URL || "").trim();
-  return fromEnv.replace(/\/+$/, "") || "http://localhost:3000";
+  return getAppUrl();
 }
 
 function redirectToDashboard(status: "linked" | "invalid" | "expired" | "conflict") {

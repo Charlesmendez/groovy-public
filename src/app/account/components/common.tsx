@@ -28,6 +28,14 @@ export function ErrorState({ error }: { error: string }) {
   return <p className="mt-6 rounded-lg border border-red-400/20 bg-red-500/10 p-4 text-sm text-red-200">{error}</p>;
 }
 
+function artifactLabel(item: Artifact, kind: "download" | "source"): string {
+  if (kind === "source") return item.version;
+  if (item.platform === "macos") return `Groovy Connector ${item.version} for macOS`;
+  if (item.platform === "windows") return `Groovy Connector ${item.version} for Windows`;
+  if (item.platform === "macos-desktop") return `Groovy Desktop ${item.version} for macOS`;
+  return item.version;
+}
+
 export function ArtifactList({ items, kind }: { items: Artifact[]; kind: "download" | "source" }) {
   if (!items.length) {
     return <p className="mt-6 text-sm text-zinc-400">No {kind === "download" ? "downloads" : "source snapshots"} are available yet.</p>;
@@ -41,8 +49,7 @@ export function ArtifactList({ items, kind }: { items: Artifact[]; kind: "downlo
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="font-medium text-white">
-                  {item.version}
-                  {item.platform ? <span className="text-zinc-500"> · {item.platform}</span> : null}
+                  {artifactLabel(item, kind)}
                 </div>
                 <div className="mt-1 text-xs text-zinc-500">
                   {kind === "source" && item.git_ref ? `Git ref: ${item.git_ref} · ` : ""}

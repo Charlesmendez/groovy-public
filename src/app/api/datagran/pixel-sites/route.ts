@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import {
+  getOrCreateWorkspaceForUser,
+  isWorkspaceOperatorRole,
+} from "@/lib/workspaces";
 
 const DATAGRAN_API_KEY = process.env.DATAGRAN_API_KEY;
 const PIXEL_SITES_TIMEOUT_MS = 5_000;
@@ -28,6 +32,10 @@ export async function GET() {
     if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    const workspace = await getOrCreateWorkspaceForUser();
+    if (!isWorkspaceOperatorRole(workspace.role)) {
+      return NextResponse.json({ error: "Workspace member access required" }, { status: 403 });
+    }
 
     // Use server-side Datagran API key
     if (!DATAGRAN_API_KEY) {
@@ -54,6 +62,20 @@ export async function GET() {
 // POST: Fetch pixel sites with user-provided API key (legacy)
 export async function POST(req: NextRequest) {
   try {
+    const supabase = await createSupabaseServerClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+    const workspace = await getOrCreateWorkspaceForUser();
+    if (workspace.role !== "admin") {
+      return NextResponse.json(
+        { error: "Only workspace admins can manage integrations" },
+        { status: 403 },
+      );
+    }
     const body = await req.json();
     const apiKey = body.apiKey;
 

@@ -5,7 +5,7 @@ This checklist is the operating reference for finishing the licensing/distributi
 ## Current Model
 
 - Private source of truth: `Charlesmendez/groovy`
-- Public delayed mirror: `Charlesmendez/groovy-public`
+- Public release-synchronized mirror: `Charlesmendez/groovy-public`
 - Release artifacts: `Charlesmendez/groovy-releases`
 - App host: Vercel project `groovy`
 - Database/storage/auth: Supabase project `tjcdifsssxgxitaccadb`
@@ -51,7 +51,7 @@ GitHub > `Charlesmendez/groovy` > Actions.
 Only use source snapshot tags matching `source-v*`:
 
 ```bash
-git tag -a source-v1.2.3 -m "Paid source snapshot v1.2.3"
+git tag -a source-v1.2.3 -m "Groovy source release v1.2.3"
 git push origin source-v1.2.3
 ```
 
@@ -67,10 +67,12 @@ Workflow:
 
 Default behavior:
 
-- Runs weekly.
-- Looks for the newest `source-v*` tag older than 90 days.
-- Publishes that snapshot to `Charlesmendez/groovy-public`.
-- Does nothing if no eligible tag exists.
+- A `source-v*` tag push publishes that snapshot to
+  `Charlesmendez/groovy-public` immediately.
+- A weekly reconciliation run selects the newest matching tag and repairs a
+  missed or failed publication.
+- Public `public-source-v*` tags are immutable.
+- Does nothing if no matching tag exists.
 
 Manual behavior:
 
@@ -79,7 +81,6 @@ GitHub > private `groovy` > Actions > Publish Public Mirror > Run workflow.
 Inputs:
 
 - `source_ref=source-v1.2.3`
-- `delay_days=90`
 - `tag_pattern=source-v*`
 - `target_repo=Charlesmendez/groovy-public`
 
@@ -318,7 +319,7 @@ GITHUB_SOURCE_ACCESS_TOKEN
 4. Confirm Stripe webhook receives events.
 5. Create first paid source tag:
    ```bash
-   git tag -a source-v0.2.0 -m "Paid source snapshot v0.2.0"
+   git tag -a source-v0.2.0 -m "Groovy source release v0.2.0"
    git push origin source-v0.2.0
    ```
 6. Upload current source snapshot and artifacts to private Supabase buckets.
@@ -329,7 +330,9 @@ GITHUB_SOURCE_ACCESS_TOKEN
    git tag -a cli-v0.2.0 -m "Publish Groovy CLI v0.2.0"
    git push origin cli-v0.2.0
    ```
-10. Wait for delayed public mirror automation, or manually publish an approved old tag.
+10. Confirm the tag-triggered public mirror Action completed and
+    `public-source-v0.2.0` exists in `groovy-public`; use the manual workflow if
+    reconciliation is needed.
 
 ## 10. Verification Commands
 

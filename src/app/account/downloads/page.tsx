@@ -6,7 +6,7 @@ export default function AccountDownloadsPage() {
       <section className="mx-auto max-w-4xl px-6 py-16">
         <h1 className="text-3xl font-semibold">Downloads</h1>
         <p className="mt-4 text-zinc-400">
-          Download current Groovy installers while your license is active.
+          Choose the recommended installer for this computer to run Groovy agents locally.
         </p>
         <DownloadsPanel />
       </section>

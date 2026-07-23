@@ -45,12 +45,15 @@ export type RunAgentSdkOrchestratorArgs = {
   systemPrompt: string;
   messages: ModelMessage[];
   tools: ExecutableTools;
+  builtinTools?: string[];
   model: string;
   betas?: string[];
   maxTurns: number;
   apiKey?: string | null;
   cwd?: string;
   unrestricted?: boolean;
+  /** Cancels the Claude Agent SDK subprocess and all in-flight SDK work. */
+  abortController?: AbortController;
   callbacks?: AgentSdkCallbacks;
 };
 
@@ -415,16 +418,17 @@ export async function runAgentSdkOrchestrator(
       mcpServers: {
         [mcpServerName]: mcpServer,
       },
-      // Only expose our MCP tools — do NOT use the claude_code preset which
-      // includes interactive built-in tools (AskUserQuestion, etc.) that waste
-      // step budget in headless/server contexts.
-      tools: [],
+      // Expose only explicitly requested built-ins plus our MCP tools. Avoid the
+      // claude_code preset, which includes interactive built-ins that waste step
+      // budget in headless/server contexts.
+      tools: args.builtinTools || [],
       permissionMode: args.unrestricted ? "bypassPermissions" : "default",
       allowDangerouslySkipPermissions: args.unrestricted ? true : undefined,
       persistSession: false,
       pathToClaudeCodeExecutable,
       settingSources: ["project"],
       includePartialMessages: true,
+      abortController: args.abortController,
       hooks: {
         PreToolUse: [{ hooks: [preToolUseHook] }],
         PostToolUse: [{ hooks: [postToolUseHook] }],
@@ -537,4 +541,3 @@ export async function runAgentSdkOrchestrator(
     },
   };
 }
-

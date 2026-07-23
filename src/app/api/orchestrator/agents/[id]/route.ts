@@ -144,7 +144,11 @@ export async function GET(_req: Request, { params }: RouteParams) {
     .from("orchestrator_messages")
     .select("*")
     .eq("session_id", runtimeSessionId)
-    .order("created_at", { ascending: true });
+    // PostgREST caps responses at 1,000 rows. Fetch newest-first so long-lived
+    // orchestrator sessions do not silently lose their latest replies, then
+    // reverse below for chronological rendering.
+    .order("created_at", { ascending: false })
+    .limit(1000);
   if (!isWorkspaceShared && useEpochScope && activeEpochId) {
     if (epochCountForAgent > 1) {
       messageQuery = messageQuery.eq("epoch_id", activeEpochId);
@@ -153,6 +157,7 @@ export async function GET(_req: Request, { params }: RouteParams) {
     }
   }
   const { data: messages } = await messageQuery;
+  const chronologicalMessages = [...(messages || [])].reverse();
 
   let activities: Array<{
     id: string;
@@ -181,7 +186,7 @@ export async function GET(_req: Request, { params }: RouteParams) {
       runtimeSessionId,
       agentId: runtimeAgentId || "",
     },
-    messages: (messages || []).map((m) => ({
+    messages: chronologicalMessages.map((m) => ({
       id: m.id,
       role: m.role,
       content: m.content,

@@ -4,6 +4,11 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { decryptLlmApiKey, encryptLlmApiKey } from "@/lib/crypto/llmKey";
 import type { DatagranProvider } from "@/lib/datagran/prompts";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { ensureOrchestratorIntegrationAssignment } from "@/lib/integrations/assignments";
+import {
+  getOrCreateWorkspaceForUser,
+  isWorkspaceOperatorRole,
+} from "@/lib/workspaces";
 
 type PostBody = {
   agentId?: unknown;
@@ -311,6 +316,11 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const workspace = await getOrCreateWorkspaceForUser();
+  if (!isWorkspaceOperatorRole(workspace.role)) {
+    return NextResponse.json({ error: "Workspace member access required" }, { status: 403 });
+  }
+  const ownerUserId = workspace.billing_admin_user_id;
   const admin = createSupabaseAdminClient();
   const { data, error } = await admin
     .from("datagran_agent_configs")
@@ -322,7 +332,7 @@ export async function GET() {
       datagran_api_key_enc,
       agents!datagran_agent_configs_agent_id_fkey(name)
     `)
-    .eq("user_id", user.id)
+    .eq("user_id", ownerUserId)
     .order("created_at", { ascending: true });
 
   if (error) {
@@ -360,6 +370,15 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const workspace = await getOrCreateWorkspaceForUser();
+  if (workspace.role !== "admin") {
+    return NextResponse.json(
+      { error: "Only workspace admins can manage integrations" },
+      { status: 403 },
+    );
+  }
+  const ownerUserId = workspace.billing_admin_user_id;
+  const admin = createSupabaseAdminClient();
   const body = (await req.json().catch(() => null)) as PostBody | null;
   if (!body) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
@@ -380,14 +399,14 @@ export async function POST(req: Request) {
 
   // Case 1: Update existing agent with connection ID
   if (agentId) {
-    const { data: updated, error } = await supabase
+    const { data: updated, error } = await admin
       .from("datagran_agent_configs")
       .update({
         connection_id: connectionId,
         updated_at: new Date().toISOString(),
       })
       .eq("agent_id", agentId)
-      .eq("user_id", user.id)
+      .eq("user_id", ownerUserId)
       .select("agent_id")
       .maybeSingle();
 
@@ -422,10 +441,10 @@ export async function POST(req: Request) {
 
     // Create the agent with custom name or fallback to provider name
     const agentName = name || provider.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
-    const { data: newAgent, error: agentError } = await supabase
+    const { data: newAgent, error: agentError } = await admin
       .from("agents")
       .insert({
-        user_id: user.id,
+        user_id: ownerUserId,
         type: "datagran",
         name: agentName,
       })
@@ -440,26 +459,34 @@ export async function POST(req: Request) {
     }
 
     // Create the datagran config with the connection ID
-    const { error: configError } = await supabase
+    const { error: configError } = await admin
       .from("datagran_agent_configs")
       .insert({
         agent_id: newAgent.id,
-        user_id: user.id,
+        user_id: ownerUserId,
         datagran_api_key_enc: datagranApiKeyEnc,
         datagran_api_key_hash: datagranApiKeyHash,
         provider,
         connection_id: connectionId,
-        end_user_external_id: `flow_${user.id}`,
+        end_user_external_id: `flow_${ownerUserId}`,
       });
 
     if (configError) {
       // Clean up the agent if config creation fails
-      await supabase.from("agents").delete().eq("id", newAgent.id);
+      await admin.from("agents").delete().eq("id", newAgent.id);
       return NextResponse.json(
         { error: configError.message || "Failed to create agent config" },
         { status: 500 }
       );
     }
+
+    await ensureOrchestratorIntegrationAssignment({
+      supabase: admin,
+      userId: ownerUserId,
+      integrationId: String(newAgent.id),
+    }).catch((error) => {
+      console.warn("[datagran-connection] failed to auto-assign integration", error);
+    });
 
     return NextResponse.json({ success: true, agentId: newAgent.id });
   }

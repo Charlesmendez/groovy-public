@@ -6,6 +6,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getWorkspaceMembershipsForUser } from "@/lib/billing/state";
 import { toChunkedStorageReference } from "@/lib/downloads/artifacts";
 import { verifyArtifactDownloadToken } from "@/lib/downloads/artifactToken";
+import { getProductAccessForUser } from "@/lib/licensing/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -113,6 +114,9 @@ async function activeLicenseTypesForSession(admin: SupabaseClient): Promise<stri
     error: authErr,
   } = await supabase.auth.getUser();
   if (authErr || !user) return null;
+
+  const productAccess = await getProductAccessForUser({ userId: user.id, admin });
+  if (productAccess.accessStatus === "trial") return ["personal"];
 
   const memberships = await getWorkspaceMembershipsForUser({ userId: user.id, admin });
   const workspaceIds = memberships.map((membership) => membership.workspace_id).filter(Boolean);

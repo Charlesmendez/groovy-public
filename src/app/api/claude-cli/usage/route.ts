@@ -1,10 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { insertBillingUsageEventBestEffort } from "@/lib/billing/events";
-import { settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
-import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
-import { estimateTokensFromCostUsd, normalizeTokenUsage } from "@/lib/billing/usage";
 import { verifyCodeAgentUsageBillingToken } from "@/lib/billing/codeAgentUsageToken";
+import { recordCodeAgentUsage } from "@/lib/billing/recordCodeAgentUsage";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -12,7 +9,7 @@ export const dynamic = "force-dynamic";
 type PostBody = {
   agentId?: string;
   requestId?: string;
-  billingToken?: string | null;
+  billingToken?: string;
   ok?: boolean | null;
   model?: string | null;
   sessionId?: string | null;
@@ -28,16 +25,6 @@ type PostBody = {
 function asFiniteNumber(value: unknown): number | null {
   const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(n) ? n : null;
-}
-
-function fallbackCodeAgentModel(args: {
-  provider: "anthropic" | "openai";
-  codeCliProvider: "claude" | "codex";
-}): string {
-  if (args.provider === "openai" || args.codeCliProvider === "codex") {
-    return "gpt-5.5";
-  }
-  return "claude-opus-4-7";
 }
 
 export async function POST(req: Request) {
@@ -75,122 +62,41 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Code session not configured" }, { status: 404 });
   }
 
-  const workspaceId = await getOrCreateWorkspaceIdForUser({
+  const outcome = await recordCodeAgentUsage({
     userId: user.id,
-    email: user.email || null,
-  }).catch((e) => {
-    console.warn(
-      "[claude-cli/usage] getOrCreateWorkspaceIdForUser failed:",
-      e instanceof Error ? e.message : String(e)
-    );
-    return null;
-  });
-  if (!workspaceId) {
-    return NextResponse.json({ ok: true, recorded: false, reason: "no_billing_workspace" });
-  }
-
-  const usage = body?.usage;
-  const normalizedUsage = normalizeTokenUsage(usage || body);
-  const totalCostUsd =
-    asFiniteNumber(body?.total_cost_usd) ??
-    asFiniteNumber(body?.cost_usd);
-  const model = typeof body?.model === "string" && body.model.trim() ? body.model.trim() : null;
-  const modelForEstimation = model || fallbackCodeAgentModel(billing);
-
-  let inputTokens = asFiniteNumber(body?.input_tokens) ?? normalizedUsage?.inputTokens ?? null;
-  let outputTokens = asFiniteNumber(body?.output_tokens) ?? normalizedUsage?.outputTokens ?? null;
-  let totalTokens = asFiniteNumber(body?.total_tokens) ?? normalizedUsage?.totalTokens ?? null;
-  let estimated = false;
-  let estimationReason: string | null = null;
-
-  if (
-    (typeof totalTokens !== "number" || totalTokens <= 0) &&
-    typeof totalCostUsd === "number" &&
-    totalCostUsd > 0
-  ) {
-    const est = estimateTokensFromCostUsd({
-      totalCostUsd,
-      model: modelForEstimation,
-      outputRatio: 0.25,
-    });
-    if (est) {
-      inputTokens = est.inputTokens;
-      outputTokens = est.outputTokens;
-      totalTokens = est.totalTokens;
-      estimated = true;
-      estimationReason = est.estimationReason;
-    }
-  }
-
-  const hasPositiveTokenUsage =
-    (typeof inputTokens === "number" && inputTokens > 0) ||
-    (typeof outputTokens === "number" && outputTokens > 0) ||
-    (typeof totalTokens === "number" && totalTokens > 0);
-  const hasPositiveCostUsage = typeof totalCostUsd === "number" && totalCostUsd > 0;
-  if (!hasPositiveTokenUsage) {
-    inputTokens = null;
-    outputTokens = null;
-    totalTokens = null;
-  }
-
-  const durationMs = asFiniteNumber(body?.durationMs);
-  const source = "code_agent_cli";
-  const modelForStorage = model || modelForEstimation;
-  const meta = {
+    userEmail: user.email || null,
     agentId: billing.agentId,
-    codeCliProvider: billing.codeCliProvider,
-    authMethod: billing.authMethod,
-    authOrigin: billing.authOrigin,
-    upstreamCostUsd: totalCostUsd,
-    modelForEstimation: estimated && !model ? modelForEstimation : undefined,
-    durationMs,
-    sessionId: typeof body?.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : null,
-    noUsageReturned: !hasPositiveTokenUsage && !hasPositiveCostUsage,
-    runOk: typeof body?.ok === "boolean" ? body.ok : null,
-  };
-
-  await insertBillingUsageEventBestEffort({
-    workspaceId,
-    userId: user.id,
-    turnId: billing.requestId,
-    traceId: billing.requestId,
-    source,
-    spanId: "main",
-    provider: billing.provider,
-    model: modelForStorage,
-    usage,
-    inputTokens,
-    outputTokens,
-    totalTokens,
-    estimated,
-    estimationReason,
-    modelCostUsd: typeof totalCostUsd === "number" ? totalCostUsd : null,
-    billable: hasPositiveTokenUsage || hasPositiveCostUsage ? billing.billable : false,
-    chargeType: hasPositiveTokenUsage || hasPositiveCostUsage ? billing.chargeType : "no_charge",
-    meta,
+    requestId: billing.requestId,
+    billing: {
+      billable: billing.billable,
+      chargeType: billing.chargeType,
+      provider: billing.provider,
+      codeCliProvider: billing.codeCliProvider,
+      authMethod: billing.authMethod,
+      authOrigin: billing.authOrigin,
+    },
+    result: {
+      ok: typeof body?.ok === "boolean" ? body.ok : null,
+      model: typeof body?.model === "string" ? body.model : null,
+      sessionId: typeof body?.sessionId === "string" ? body.sessionId : null,
+      durationMs: asFiniteNumber(body?.durationMs),
+      usage: body?.usage ?? null,
+      inputTokens: asFiniteNumber(body?.input_tokens),
+      outputTokens: asFiniteNumber(body?.output_tokens),
+      totalTokens: asFiniteNumber(body?.total_tokens),
+      totalCostUsd: asFiniteNumber(body?.total_cost_usd) ?? asFiniteNumber(body?.cost_usd),
+    },
   });
 
-  if (billing.billable && (hasPositiveTokenUsage || hasPositiveCostUsage)) {
-    await settleGroovyUsageDebitBestEffort({
-      workspaceId,
-      userId: user.id,
-      traceId: billing.requestId,
-      turnId: billing.requestId,
-      source,
-      spanId: "main",
-      model: modelForStorage,
-      usage: normalizedUsage || { inputTokens, outputTokens, totalTokens },
-      modelCostUsdOverride: typeof totalCostUsd === "number" ? totalCostUsd : null,
-      chargeType: billing.chargeType,
-      meta,
-    }).catch(() => {});
+  if (!outcome.recorded) {
+    return NextResponse.json({ ok: true, recorded: false, reason: outcome.reason });
   }
 
   return NextResponse.json({
     ok: true,
     recorded: true,
-    billable: hasPositiveTokenUsage || hasPositiveCostUsage ? billing.billable : false,
-    chargeType: hasPositiveTokenUsage || hasPositiveCostUsage ? billing.chargeType : "no_charge",
-    unmetered: !hasPositiveTokenUsage && !hasPositiveCostUsage,
+    billable: outcome.billable,
+    chargeType: outcome.chargeType,
+    unmetered: outcome.unmetered,
   });
 }

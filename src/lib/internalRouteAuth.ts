@@ -13,8 +13,9 @@ function getInternalAuthSecret(): string {
 }
 
 function signInternalScope(scope: string, userId: string, ts: string): string {
+  // Keep this byte-for-byte aligned with apps/relay/server.mjs.
   return createHmac("sha256", getInternalAuthSecret())
-    .update(JSON.stringify({ scope, userId, ts }))
+    .update(`${scope}:${userId}:${ts}`)
     .digest("base64url");
 }
 

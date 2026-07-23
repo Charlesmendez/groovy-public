@@ -314,3 +314,36 @@ body {
   -webkit-overflow-scrolling: touch;
   padding-bottom: var(--safe-area-inset-bottom);
 }
+
+/* Fixed app shells must fit inside the viewport left after the body's iOS
+   safe-area inset. Using 100vh here clips the bottom in Home Screen mode. */
+.app-viewport-shell {
+  height: calc(100vh - var(--safe-area-inset-top));
+  height: calc(100dvh - var(--safe-area-inset-top));
+  min-height: 0;
+}
+
+.touch-scroll-y {
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Harness: running-agent beam */
+@keyframes harness-beam {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+@media (max-width: 767px) {
+  .worker-grid-responsive {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-auto-rows: minmax(420px, 1fr);
+    padding-bottom: calc(0.75rem + var(--safe-area-inset-bottom));
+  }
+}

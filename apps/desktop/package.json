@@ -1,0 +1,26 @@
+{
+  "name": "groovy-desktop",
+  "version": "0.1.6",
+  "private": true,
+  "description": "Groovy Desktop — Electron shell for the hosted Groovy web app with a managed local connector",
+  "main": "dist/main/main.js",
+  "author": "Groovy",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "bundle-connector": "node scripts/bundle-connector.mjs",
+    "rebuild-update-zip": "node scripts/rebuild-macos-update-zip.mjs",
+    "dev": "npm run bundle-connector && npm run build && electron .",
+    "dist": "npm run bundle-connector && npm run build && electron-builder --mac dmg zip --arm64"
+  },
+  "dependencies": {
+    "electron-log": "^5.2.4",
+    "electron-updater": "^6.3.9"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2"
+  }
+}

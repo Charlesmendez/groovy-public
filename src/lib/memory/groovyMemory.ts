@@ -11,7 +11,18 @@ import {
   datagranCompileRawText,
   type DatagranBrainResponse,
 } from "@/lib/datagran/memory";
-import { planMemoryQueries, shouldStoreMemory, type MemoryPlannerInput } from "./memoryPlanner";
+import {
+  planMemoryQueries,
+  shouldStoreMemory,
+  type MemoryPlannerInput,
+} from "./memoryPlanner";
+import type { ProviderId } from "@/lib/ai/modelResolver";
+import {
+  containsSecretLikeMaterial,
+  fileLearningToWiki,
+  type WikiLearningResult,
+  type WikiLearningTarget,
+} from "./wikiMemory";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 const GROOVY_DATAGRAN_API_KEY = process.env.DATAGRAN_API_KEY || "";
@@ -322,9 +333,21 @@ export type MemoryLoadResult = {
 
 export type MemoryStoreResult = {
   stored: boolean;
+  datagranStored?: boolean;
+  wikiFiled?: boolean;
+  wikiPath?: string;
+  wikiReason?: string;
   memoryNote?: string;
   label?: string;
   reason?: string;
+};
+
+export type WikiMemorySyncOptions = {
+  supabase: SupabaseClient;
+  userId: string;
+  source?: string;
+  target?: WikiLearningTarget;
+  profileId?: string;
 };
 
 const DEFAULT_PREFERENCE_QUERY =
@@ -424,11 +447,62 @@ function buildPreferenceFallbackContext(data: DatagranBrainResponse, maxContextC
 export async function getGroovyMemoryConnection(
   userId: string,
   email?: string,
-  _supabase?: SupabaseClient
+  _supabase?: SupabaseClient,
+  profileId?: string,
 ): Promise<string | null> {
   if (!GROOVY_DATAGRAN_API_KEY) {
     console.warn("[groovyMemory] DATAGRAN_API_KEY not configured, memory disabled");
     return null;
+  }
+
+  const normalizedProfileId =
+    typeof profileId === "string" && /^[a-f0-9-]{16,64}$/i.test(profileId.trim())
+      ? profileId.trim()
+      : null;
+  if (profileId && !normalizedProfileId) {
+    console.error("[groovyMemory][SECURITY] rejected invalid profile memory scope", {
+      userId,
+      profileId,
+    });
+    return null;
+  }
+  if (normalizedProfileId) {
+    const scopedCacheKey = `${userId}:profile:${normalizedProfileId}`;
+    const cachedProfileConnection = connectionCache.get(scopedCacheKey);
+    if (cachedProfileConnection) return cachedProfileConnection;
+
+    // A distinct Datagran end-user connection is the isolation boundary.
+    // Query-time instructions and note prefixes remain useful context, but are
+    // deliberately not trusted to prevent cross-profile retrieval.
+    const scopedExternalId = `flow_${userId}_profile_${normalizedProfileId}`;
+    const scoped = await createMemoryConnectionWithRetry({
+      apiKey: GROOVY_DATAGRAN_API_KEY,
+      endUserExternalId: scopedExternalId,
+      userId,
+      label: "primary",
+    });
+    const returnedExternalId =
+      scoped.ok && typeof scoped.data?.end_user_external_id === "string"
+        ? scoped.data.end_user_external_id.trim()
+        : null;
+    if (
+      !scoped.ok ||
+      !scoped.data?.connection_id ||
+      (returnedExternalId && returnedExternalId !== scopedExternalId)
+    ) {
+      console.error(
+        "[groovyMemory][SECURITY] failed to establish isolated profile memory connection",
+        {
+          userId,
+          profileId: normalizedProfileId,
+          expectedExternalId: scopedExternalId,
+          returnedExternalId,
+        },
+      );
+      return null;
+    }
+    connectionCache.set(scopedCacheKey, scoped.data.connection_id);
+    return scoped.data.connection_id;
   }
 
   // Fast path: only cached canonical selections (resolved below) are trusted.
@@ -885,10 +959,19 @@ export async function loadMemoryWithPlanner(
     userEmail?: string;
     maxContextChars?: number;
     llmApiKey?: string;
+    llmProvider?: ProviderId;
+    llmModel?: string;
     supabase?: SupabaseClient;
   }
 ): Promise<MemoryLoadResult> {
-  const { userEmail, maxContextChars = 3000, llmApiKey, supabase } = options || {};
+  const {
+    userEmail,
+    maxContextChars = 3000,
+    llmApiKey,
+    llmProvider,
+    llmModel,
+    supabase,
+  } = options || {};
 
   // Get connection
   const connectionId = await getGroovyMemoryConnection(userId, userEmail, supabase);
@@ -903,7 +986,11 @@ export async function loadMemoryWithPlanner(
   }
 
   // Plan queries using AI
-  const planning = await planMemoryQueries(input, { apiKey: llmApiKey });
+  const planning = await planMemoryQueries(input, {
+    apiKey: llmApiKey,
+    provider: llmProvider,
+    model: llmModel,
+  });
   const questions = planning.questions;
 
   if (questions.length === 0) {
@@ -1009,6 +1096,104 @@ ${content}
 }
 
 /**
+ * Store a durable learning in semantic memory and, when configured, in the
+ * user's structured private Wiki. Each backend is best-effort and independent.
+ */
+export async function storeDurableLearning(
+  connectionId: string,
+  content: string,
+  label?: string,
+  options?: { wiki?: WikiMemorySyncOptions }
+): Promise<MemoryStoreResult> {
+  const sensitiveMaterial = [
+    content,
+    label,
+    options?.wiki?.target?.page,
+    options?.wiki?.target?.title,
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+  if (containsSecretLikeMaterial(sensitiveMaterial)) {
+    return {
+      stored: false,
+      datagranStored: false,
+      wikiFiled: false,
+      wikiReason: "secret_like_material_blocked",
+      reason: "Sensitive secret-like material is not eligible for durable memory",
+      label,
+    };
+  }
+
+  const datagranContent = options?.wiki?.profileId
+    ? `[HARNESS_PROFILE:${options.wiki.profileId}]\n${content}`
+    : content;
+  const datagranPromise = connectionId
+    ? storeMemoryNote(connectionId, datagranContent, label)
+    : Promise.resolve(false);
+  const wikiPromise: Promise<WikiLearningResult | null> = options?.wiki
+    ? fileLearningToWiki({
+        supabase: options.wiki.supabase,
+        userId: options.wiki.userId,
+        content,
+        label,
+        source: options.wiki.source || "orchestrator memory",
+        target: options.wiki.target,
+        profileId: options.wiki.profileId,
+      }).catch((error) => ({
+        filed: false,
+        reason: error instanceof Error ? error.message : String(error),
+      }))
+    : Promise.resolve(null);
+
+  const [datagranStored, wikiResult] = await Promise.all([
+    datagranPromise,
+    wikiPromise,
+  ]);
+  const wikiKnown =
+    wikiResult?.filed === true || wikiResult?.reason === "duplicate";
+
+  return {
+    stored: datagranStored || wikiKnown,
+    datagranStored,
+    wikiFiled: wikiResult?.filed === true,
+    wikiPath: wikiResult?.path,
+    wikiReason: wikiResult?.reason,
+    memoryNote: content,
+    label,
+  };
+}
+
+export function formatDurableLearningConfirmation(
+  content: string,
+  result: MemoryStoreResult
+): string {
+  if (!result.stored) {
+    return (
+      result.reason ||
+      "I could not save that to Datagran or the Wiki. Please try again later."
+    );
+  }
+
+  const quotedContent = `"${content}"`;
+  if (result.datagranStored && result.wikiFiled && result.wikiPath) {
+    return `I've saved that to Datagran memory and filed it in ${result.wikiPath}: ${quotedContent}`;
+  }
+  if (result.datagranStored && result.wikiPath) {
+    return `I've saved that to Datagran memory; it was already present in ${result.wikiPath}: ${quotedContent}`;
+  }
+  if (result.datagranStored) {
+    return `I've saved that to Datagran memory, but Wiki filing did not complete: ${quotedContent}`;
+  }
+  if (result.wikiFiled && result.wikiPath) {
+    return `I've filed that in ${result.wikiPath}, but Datagran semantic storage did not complete: ${quotedContent}`;
+  }
+  if (result.wikiPath) {
+    return `That learning was already present in ${result.wikiPath}, but Datagran semantic storage did not complete: ${quotedContent}`;
+  }
+  return `I've saved that to durable memory: ${quotedContent}`;
+}
+
+/**
  * AI-decided memory storage: decide if conversation should be stored and do it.
  * Returns whether storage happened and details.
  */
@@ -1017,7 +1202,12 @@ export async function maybeStoreConversation(
   userMessage: string,
   assistantResponse: string,
   existingMemoryContext?: string,
-  options?: { llmApiKey?: string }
+  options?: {
+    llmApiKey?: string;
+    llmProvider?: ProviderId;
+    llmModel?: string;
+    wiki?: WikiMemorySyncOptions;
+  }
 ): Promise<MemoryStoreResult> {
   if (!connectionId || !userMessage.trim() || !assistantResponse.trim()) {
     return { stored: false, reason: "Missing required inputs" };
@@ -1033,7 +1223,11 @@ export async function maybeStoreConversation(
   // Ask AI if we should store
   const decision = await shouldStoreMemory(
     { userMessage, assistantResponse, existingMemoryContext },
-    { apiKey: options?.llmApiKey }
+    {
+      apiKey: options?.llmApiKey,
+      provider: options?.llmProvider,
+      model: options?.llmModel,
+    }
   );
 
   if (!decision.shouldStore || !decision.memoryNote) {
@@ -1041,15 +1235,21 @@ export async function maybeStoreConversation(
     return { stored: false, reason: decision.reason };
   }
 
-  // Store the distilled memory note
-  const stored = await storeMemoryNote(connectionId, decision.memoryNote, decision.label);
+  const result = await storeDurableLearning(
+    connectionId,
+    decision.memoryNote,
+    decision.label,
+    {
+      wiki: options?.wiki
+        ? {
+            ...options.wiki,
+            target: decision.wikiTarget || options.wiki.target,
+          }
+        : undefined,
+    }
+  );
 
-  return {
-    stored,
-    memoryNote: decision.memoryNote,
-    label: decision.label,
-    reason: decision.reason,
-  };
+  return { ...result, reason: decision.reason };
 }
 
 /**
@@ -1135,38 +1335,6 @@ Use this context to provide informed, personalized responses. If the context see
 }
 
 /**
- * Format user preference context for injection into system prompt.
- */
-export function formatPreferenceForPrompt(
-  preferenceContext: string,
-  options?: { channel?: "interactive" | "heartbeat" }
-): string {
-  const context = preferenceContext.trim();
-  if (!context) return "";
-
-  const isHeartbeat = options?.channel === "heartbeat";
-  const extraInstruction = isHeartbeat
-    ? `- This block is the highest-priority constraint set for heartbeat generation and gating.
-- Apply these constraints before evaluating novelty, urgency, or style.
-- Never mention excluded items even if they appear in RECENT_EMAILS, UPCOMING_CALENDAR_EVENTS, MEMORY_CONTEXT, or examples.
-- If a draft conflicts with these constraints, regenerate it to comply.
-- If compliance is uncertain, err on omission; if exclusions remove all useful content, return __SKIP__.`
-    : "- Apply these before deciding what tools to call and before composing your answer.";
-
-  return `
-## USER PREFERENCES (CONSTRAINTS)
-These are standing user preferences and constraints retrieved from memory.
-- Treat them as active constraints unless the user explicitly overrides them in this request.
-- Use these for behavior/style constraints, not as authoritative factual evidence for the current turn.
-- Current conversation turns and latest tool outputs remain the factual source of truth.
-- If a request appears to conflict with a preference, ask a brief clarification before violating it.
-${extraInstruction}
-
-${context}
-`;
-}
-
-/**
  * Simple query for recall tool (single question, no planner).
  */
 export async function queryMemoryDirect(
@@ -1176,3 +1344,4 @@ export async function queryMemoryDirect(
   const result = await queryBrain(connectionId, question);
   return { context: result.context, data: result.data };
 }
+export { formatPreferenceForPrompt } from "./preferencePrompt";

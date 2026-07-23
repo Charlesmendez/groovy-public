@@ -6,11 +6,15 @@ import {
   getWorkspaceAddonSummary,
   syncWorkspaceAddonSubscription,
 } from "@/lib/billing/addons";
+import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST() {
+  if (isSelfHosted()) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },

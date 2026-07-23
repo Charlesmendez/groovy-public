@@ -280,6 +280,9 @@ export const memoryTools = {
     inputSchema: z.object({
       content: z.string().describe("What to remember"),
       label: z.string().optional().describe("A short label for this memory"),
+      wiki_category: z.enum(["entities", "concepts", "projects"]).optional(),
+      wiki_page: z.string().optional(),
+      wiki_title: z.string().optional(),
     }),
   }),
 
@@ -288,6 +291,32 @@ export const memoryTools = {
       "Search memory for relevant information about a topic.",
     inputSchema: z.object({
       query: z.string().describe("What to search for in memory"),
+    }),
+  }),
+
+  wiki_search: tool({
+    description: "Search the user's private structured Wiki.",
+    inputSchema: z.object({
+      query: z.string().describe("What to search for in the Wiki"),
+      limit: z.number().int().min(1).max(8).optional(),
+    }),
+  }),
+
+  wiki_read: tool({
+    description: "Read one private Wiki page by its relative path.",
+    inputSchema: z.object({
+      path: z.string().describe("Wiki-relative path"),
+    }),
+  }),
+
+  wiki_file_learning: tool({
+    description: "Add one durable structured learning to the private Wiki.",
+    inputSchema: z.object({
+      content: z.string().describe("Concise durable learning"),
+      label: z.string().optional(),
+      category: z.enum(["entities", "concepts", "projects"]).optional(),
+      page: z.string().optional(),
+      title: z.string().optional(),
     }),
   }),
 };
@@ -323,8 +352,26 @@ export function getToolsForAgents(agents: AgentType[]) {
 /**
  * Map tool name to agent type
  */
-export function toolToAgent(toolName: string): AgentType | "memory" | "handshake" | "telegram" | null {
+export function toolToAgent(
+  toolName: string
+): AgentType | "memory" | "handshake" | "telegram" | "harness" | null {
+  if (
+    toolName === "list_agents" ||
+    toolName === "list_skills_and_docs" ||
+    toolName === "assign_skill_or_doc" ||
+    toolName === "remove_skill_or_doc_assignment" ||
+    toolName === "assign_task" ||
+    toolName === "consult_agent" ||
+    toolName === "finalize_plan" ||
+    toolName === "check_agent_status" ||
+    toolName === "collect_result" ||
+    toolName === "transfer_context" ||
+    toolName === "usage_report"
+  ) {
+    return "harness";
+  }
   if (toolName.startsWith("runtime_branch_")) return "chat";
+  if (toolName === "web_search" || toolName === "WebSearch") return "browser";
   if (toolName.startsWith("skill_")) return "code";
   if (toolName.startsWith("code_")) return "code";
   if (toolName.startsWith("browser_")) return "browser";
@@ -349,7 +396,13 @@ export function toolToAgent(toolName: string): AgentType | "memory" | "handshake
   ) {
     return "chat";
   }
-  if (toolName === "remember" || toolName === "recall") return "memory";
+  if (
+    toolName === "remember" ||
+    toolName === "recall" ||
+    toolName.startsWith("wiki_")
+  ) {
+    return "memory";
+  }
   if (toolName === "handshake_send") return "handshake";
   return null;
 }
@@ -407,7 +460,7 @@ export function toolToConnectorMessage(
   // Supports --resume via session_id for multi-turn conversations
   // Supports cli_token (CLAUDE_CODE_OAUTH_TOKEN) as alternative to api_key
   if (toolName === "code_cli_run") {
-    const timeoutMs = 10 * 60 * 1000;
+    const timeoutMs = 20 * 60 * 1000;
 
     return {
       type: "claude_run",

@@ -124,6 +124,38 @@ This lets you talk to Groovy from a WhatsApp group on **this Mac**, without any 
 WHATSAPP_GROUP_NAME="Groovy" GROOVY_APP_URL="https://your-app" node connector.mjs --relay wss://groovy-relay.fly.dev --whatsapp
 ```
 
+### Memory tuning
+
+The WhatsApp bridge runs Chromium in headless mode by default once a local
+WhatsApp Web session exists. First-time pairing or reset sessions open a visible
+browser window so the QR code can be scanned, unless headless mode is explicitly
+forced with `GROOVY_WHATSAPP_HEADLESS=1`. The bridge also disables GPU,
+audio/video capture, large renderer heaps, and post-auth image/media downloads,
+then restarts the WhatsApp Web browser during idle windows so long-running
+sessions do not keep growing memory indefinitely. Background recovery polls and
+messages from unrelated chats do not postpone cleanup. A bounded eight-hour
+maximum renderer age also guarantees a restart between active operations when a
+busy account never reaches the normal five-minute idle window. The connector
+also measures the WhatsApp Chrome process tree once per minute and fully
+restarts that browser between operations when it reaches 5 GB RSS.
+
+Rollback/debug switches:
+
+- `GROOVY_WHATSAPP_HEADLESS=0` or `--whatsapp-headed` — run WhatsApp Web in a visible browser window
+- `GROOVY_WHATSAPP_BLOCK_IMAGES=0` — keep image/media requests enabled after login
+- `GROOVY_WHATSAPP_RECYCLE_MS=0` — disable idle page refresh
+- `GROOVY_WHATSAPP_RECYCLE_IDLE_MS=<ms>` — tune how long the bridge must be idle before a refresh can happen
+- `GROOVY_WHATSAPP_RECYCLE_MAX_AGE_MS=<ms>` — tune the hard renderer lifetime, or set `0` to disable the hard limit
+- `GROOVY_WHATSAPP_RECYCLE_MEMORY_MB=<mb>` — tune the browser process-tree RSS limit, or set `0` to disable the memory guard
+
+Useful before/after checks while the connector is running:
+
+```bash
+ps -axo rss,command | grep -i groovy | grep -v grep | awk '{s+=$1} END {printf "%.0f MB\n", s/1024}'
+ps -axo pid,command | grep -i groovy | grep -E "MacOS/Google Chrome" | grep -vE "type=" | sed 's/ --/\n    --/g'
+ps -axo rss,command | grep -i groovy | grep "type=utility" | grep -oE "utility-sub-type=[^ ]*" | sort | uniq -c
+```
+
 ### Commands in the group
 
 - `@orch <message>` — talk to the orchestrator

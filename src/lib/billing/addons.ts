@@ -11,6 +11,7 @@ import {
   GROOVY_MAC_SEAT_PRICE_USD,
   KAPSO_ALLOWLIST_PRICE_USD,
 } from "@/lib/billing/pricing";
+import { isSelfHosted } from "@/lib/config/edition";
 export {
   GROOVY_MAC_MIN_SEATS,
   GROOVY_MAC_SEAT_PRICE_USD,
@@ -139,13 +140,18 @@ async function getWorkspaceAddonRow(args: {
 async function countRows(args: {
   table: "workspace_members" | "workspace_whatsapp_allowlist";
   workspaceId: string;
+  excludeGuestMembers?: boolean;
   admin?: SupabaseClient;
 }): Promise<number> {
   const admin = args.admin || createSupabaseAdminClient();
-  const { count, error } = await admin
+  let query = admin
     .from(args.table)
     .select("workspace_id", { count: "exact", head: true })
     .eq("workspace_id", args.workspaceId);
+  if (args.table === "workspace_members" && args.excludeGuestMembers) {
+    query = query.neq("role", "guest");
+  }
+  const { count, error } = await query;
   if (error) throw new Error(error.message);
   return toCount(count);
 }
@@ -219,6 +225,10 @@ export async function getWorkspaceAddonQuantities(args: {
   const memberCount = await countRows({
     table: "workspace_members",
     workspaceId: args.workspaceId,
+    // Channel guests do not receive a Groovy Mac seat. Counting them here
+    // would silently increase the Stripe subscription when an admin invited a
+    // limited-access collaborator.
+    excludeGuestMembers: true,
     admin,
   });
   const kapsoAllowlistCount = await countRows({
@@ -275,6 +285,13 @@ export async function syncWorkspaceAddonSubscription(args: {
   enforcePaymentSuccess?: boolean;
   admin?: SupabaseClient;
 }): Promise<AddonSyncResult> {
+  if (isSelfHosted()) {
+    return {
+      ok: false,
+      reason: "stripe_error",
+      message: "Hosted add-ons are unavailable in the self-hosted edition",
+    };
+  }
   const admin = args.admin || createSupabaseAdminClient();
   const enforcePaymentSuccess = args.enforcePaymentSuccess !== false;
 
@@ -541,6 +558,10 @@ export async function syncWorkspaceAddonSubscriptionBestEffort(args: {
   admin?: SupabaseClient;
   context: string;
 }): Promise<void> {
+  // Membership and invite mutations call this hook opportunistically. They
+  // must remain fully functional without even initializing Stripe in the
+  // self-hosted edition.
+  if (isSelfHosted()) return;
   try {
     const result = await syncWorkspaceAddonSubscription({
       workspaceId: args.workspaceId,

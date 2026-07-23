@@ -21,6 +21,7 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Upload,
   X,
 } from "lucide-react";
 import { useRelay, type RelayMessage } from "@/hooks/useRelay";
@@ -67,8 +68,9 @@ type Assignment = {
   id: string;
   artifact_id: string;
   agent_id?: string | null;
+  profile_id?: string | null;
   target: Target;
-  scope: "workspace" | "agent";
+  scope: "workspace" | "agent" | "profile";
   enabled: boolean;
 };
 
@@ -105,6 +107,37 @@ type Agent = {
   ownerEmail?: string | null;
 };
 
+type RuntimeSkillVersion = {
+  id: string;
+  skill_id: string;
+  version: number;
+  lifecycle: string;
+  runner: string;
+  validation_status: string;
+  validation_task?: string | null;
+  validated_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+type RuntimeSkill = {
+  id: string;
+  user_id: string;
+  agent_id: string;
+  agent_name: string;
+  slug: string;
+  name: string;
+  description: string;
+  lifecycle: string;
+  runner: string;
+  latest_version: number;
+  active_version_id?: string | null;
+  rollback_version_id?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  versions: RuntimeSkillVersion[];
+};
+
 type SkillsState = {
   currentUserId: string;
   workspace: WorkspaceInfo;
@@ -114,6 +147,7 @@ type SkillsState = {
   syncs: SyncState[];
   auditEvents: AuditEvent[];
   agents: Agent[];
+  runtimeSkills: RuntimeSkill[];
   privacy: {
     storesContents: boolean;
     summary: string;
@@ -123,13 +157,37 @@ type SkillsState = {
 type CreateKind = "skill" | "instruction_doc";
 
 const TARGETS: Array<{ id: Target; label: string; icon: typeof Sparkles }> = [
-  { id: "flow", label: "Flow", icon: Sparkles },
+  { id: "flow", label: "Orchestrator", icon: Sparkles },
   { id: "claude", label: "Claude", icon: Terminal },
   { id: "codex", label: "Codex", icon: Code2 },
 ];
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function formatSkillsActionError(json: Record<string, unknown>, fallback: string) {
+  const result = asRecord(json.result);
+  const diagnostics = asRecord(result.diagnostics);
+  const errorCode = asString(json.error || result.error || result.error_code || result.code);
+  if (errorCode === "artifact_already_exists") {
+    const relativePath = asString(result.relativePath || result.relative_path || diagnostics.relativePath);
+    const localPath = asString(result.localPath || result.local_path || diagnostics.localPath);
+    const artifactType = asString(result.artifactType || result.artifact_type || diagnostics.artifactType);
+    return [
+      `Artifact already exists${relativePath ? ` at ${relativePath}` : ""}.`,
+      artifactType ? `Type: ${artifactType}` : "",
+      localPath ? `Local checkout: ${localPath}` : "",
+      "Retry Sync succeeded, so Git access is working. If this is an existing artifact, select the same repo/path after sync so Skills Manager can update it; otherwise change the name or path before writing.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  return errorCode || fallback;
 }
 
 function shortSha(value?: string | null) {
@@ -213,6 +271,7 @@ export function SkillsManagerContent() {
   const [state, setState] = useState<SkillsState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null);
@@ -284,6 +343,7 @@ export function SkillsManagerContent() {
   const assignments = useMemo(() => state?.assignments || [], [state?.assignments]);
   const syncs = useMemo(() => state?.syncs || [], [state?.syncs]);
   const agents = useMemo(() => state?.agents || [], [state?.agents]);
+  const runtimeSkills = useMemo(() => state?.runtimeSkills || [], [state?.runtimeSkills]);
   const isAdmin = state?.workspace?.role === "admin";
 
   const repoById = useMemo(() => new Map(repositories.map((repo) => [repo.id, repo])), [repositories]);
@@ -317,6 +377,37 @@ export function SkillsManagerContent() {
     });
   }, [artifacts, query, selectedRepoId]);
 
+  const existingCreateArtifact = useMemo(() => {
+    const normalizedPath = createPath.trim();
+    if (!selectedRepoId || !normalizedPath) return null;
+    return (
+      artifacts.find(
+        (artifact) =>
+          artifact.repository_id === selectedRepoId &&
+          artifact.artifact_type === createKind &&
+          artifact.relative_path === normalizedPath
+      ) || null
+    );
+  }, [artifacts, createKind, createPath, selectedRepoId]);
+
+  const filteredRuntimeSkills = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return runtimeSkills;
+    return runtimeSkills.filter((skill) =>
+      [
+        skill.name,
+        skill.description,
+        skill.slug,
+        skill.agent_name,
+        skill.lifecycle,
+        skill.runner,
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(q)
+    );
+  }, [query, runtimeSkills]);
+
   const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) || null;
 
   useEffect(() => {
@@ -332,15 +423,24 @@ export function SkillsManagerContent() {
       setCreatePath(`skills/${slug || "new-skill"}/SKILL.md`);
       setCreateContent(defaultSkillContent(createName, createTargets));
     } else {
-      const filename = createName.trim().toUpperCase() === "CLAUDE" ? "CLAUDE.md" : createName.trim().toUpperCase() === "CODEX" ? "CODEX.md" : "AGENTS.md";
+      const normalizedName = createName.trim().toUpperCase();
+      const filename =
+        normalizedName === "AGENTS"
+          ? "AGENTS.md"
+          : normalizedName === "CLAUDE"
+            ? "CLAUDE.md"
+            : normalizedName === "CODEX"
+              ? "CODEX.md"
+              : `${slug || "agent-instructions"}.md`;
       setCreatePath(`instructions/shared/${filename}`);
       setCreateContent(defaultInstructionContent(createName || filename.replace(/\.md$/i, ""), createTargets));
     }
   }, [createKind, createName, createTargets]);
 
-  async function postAction(body: Record<string, unknown>, busy: string) {
+  async function postAction(body: Record<string, unknown>, busy: string, successMessage?: string) {
     setBusyKey(busy);
     setError(null);
+    setNotice(null);
     try {
       const res = await fetch("/api/workspaces/skills", {
         method: "POST",
@@ -350,12 +450,14 @@ export function SkillsManagerContent() {
       const json = await res.json().catch(() => ({}));
       if (!res.ok || json.error || json.ok === false) {
         await loadState();
-        throw new Error(json.error || "Skills Manager action failed");
+        throw new Error(formatSkillsActionError(asRecord(json), "Skills Manager action failed"));
       }
       await loadState();
+      if (successMessage) setNotice(successMessage);
       return json;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Skills Manager action failed");
+      setNotice(null);
       return null;
     } finally {
       setBusyKey(null);
@@ -371,7 +473,8 @@ export function SkillsManagerContent() {
         defaultRef: repoRef || "main",
         deviceId: activeDeviceId || undefined,
       },
-      "connect_repo"
+      "connect_repo",
+      activeDeviceId ? "Repo connected and synced." : "Repo connected."
     );
     if (result) {
       setRepoUrl("");
@@ -386,7 +489,20 @@ export function SkillsManagerContent() {
     }
     await postAction(
       { action: "sync_repo", repositoryId, deviceId: activeDeviceId },
-      `sync:${repositoryId}`
+      `sync:${repositoryId}`,
+      "Repo sync completed."
+    );
+  };
+
+  const pushRepoChanges = async (repositoryId: string, label = "Repo") => {
+    if (!activeDeviceId) {
+      setError("Start the Groovy Connector first, then retry sync.");
+      return;
+    }
+    await postAction(
+      { action: "push_repo", repositoryId, deviceId: activeDeviceId },
+      `push:${repositoryId}`,
+      `${label} synced to the repo.`
     );
   };
 
@@ -397,7 +513,8 @@ export function SkillsManagerContent() {
     }
     await postAction(
       { action: "preflight", deviceId: activeDeviceId, target, agentId: agentId || null },
-      `preflight:${target}:${agentId || "workspace"}`
+      `preflight:${target}:${agentId || "workspace"}`,
+      "Preflight completed."
     );
   };
 
@@ -420,10 +537,33 @@ export function SkillsManagerContent() {
         content: createContent,
         name: createName,
         targets: createTargets,
+        overwrite: Boolean(existingCreateArtifact),
       },
-      "create_artifact"
+      "create_artifact",
+      existingCreateArtifact ? "Artifact updated and pushed to the repo." : "Artifact created and pushed to the repo."
     );
     if (result) setCreateOpen(false);
+  };
+
+  const exportRuntimeSkill = async (skill: RuntimeSkill) => {
+    if (!selectedRepoId) {
+      setError("Select a skills repo first.");
+      return;
+    }
+    if (!activeDeviceId) {
+      setError("Start the Groovy Connector first. Export writes into the local repo checkout.");
+      return;
+    }
+    await postAction(
+      {
+        action: "export_runtime_skill",
+        runtimeSkillId: skill.id,
+        repositoryId: selectedRepoId,
+        deviceId: activeDeviceId,
+      },
+      `export_runtime:${skill.id}`,
+      `${skill.name} synced to the repo.`
+    );
   };
 
   const isAssigned = (artifactId: string, target: Target, agentId?: string | null) =>
@@ -432,6 +572,7 @@ export function SkillsManagerContent() {
         assignment.enabled &&
         assignment.artifact_id === artifactId &&
         assignment.target === target &&
+        !assignment.profile_id &&
         (agentId ? assignment.agent_id === agentId : !assignment.agent_id)
     );
 
@@ -459,7 +600,25 @@ export function SkillsManagerContent() {
 
   const activeRepo = selectedRepoId ? repoById.get(selectedRepoId) || null : null;
   const activeRepoSync = activeRepo ? syncByRepo.get(activeRepo.id) || null : null;
-  const permissionError = activeRepoSync?.status === "no_permission";
+  const activeRepoStatus = activeRepoSync?.status || "never";
+  const activeRepoNeedsAttention = Boolean(activeRepo && activeRepoStatus !== "synced");
+  const activeRepoSyncBusy = activeRepo ? busyKey === `sync:${activeRepo.id}` : false;
+  const activeRepoProblemTitle =
+    activeRepoStatus === "no_permission"
+      ? "Repo access failed on this Mac"
+      : activeRepoStatus === "offline"
+        ? "Connector is offline"
+        : activeRepoStatus === "error"
+          ? "Repo sync failed"
+          : "Repo has not synced yet";
+  const activeRepoProblemBody =
+    activeRepoStatus === "no_permission"
+      ? "Your local Git CLI could not access this repo."
+      : activeRepoStatus === "offline"
+        ? "Start the Groovy Connector on this Mac, then retry the sync."
+        : activeRepoStatus === "error"
+          ? "The last local sync attempt failed before this repo could be scanned."
+          : "Run a sync to clone or refresh the local repo checkout.";
   const agentById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
 
   const reassignAssignment = async (
@@ -509,10 +668,10 @@ export function SkillsManagerContent() {
             <div>
               <div className="flex items-center gap-2">
                 <ShieldCheck className="h-5 w-5 text-emerald-300" />
-                <h1 className="text-lg font-semibold">Skills Manager</h1>
+                <h1 className="text-lg font-semibold">Skills &amp; Docs</h1>
               </div>
               <p className="text-xs text-zinc-500">
-                Git-owned skills and instruction docs for Flow, Claude Code, and Codex.
+                Your shared library for orchestrator and worker-agent behavior.
               </p>
             </div>
           </div>
@@ -538,15 +697,38 @@ export function SkillsManagerContent() {
       </div>
 
       <main className="mx-auto grid max-w-7xl gap-5 px-4 py-6 sm:px-6 lg:grid-cols-[360px_1fr]">
+        <section className="rounded-2xl border border-cyan-400/20 bg-gradient-to-r from-cyan-500/10 to-violet-500/10 p-5 lg:col-span-2">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div className="max-w-2xl">
+              <h2 className="text-base font-semibold text-white">
+                One library, assigned exactly where you need it
+              </h2>
+              <p className="mt-1 text-sm leading-relaxed text-zinc-300">
+                Skills are reusable playbooks. Instruction docs are Markdown context and rules.
+                Assign either globally to the orchestrator, Claude, or Codex, or only to one
+                selected agent.
+              </p>
+            </div>
+            <div className="grid shrink-0 grid-cols-3 gap-2 text-center text-[11px] text-zinc-300">
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">1. Sync library</div>
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">2. Assign</div>
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">3. Agents use it</div>
+            </div>
+          </div>
+        </section>
         <section className="space-y-4">
           <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/10 p-4">
             <div className="flex items-start gap-3">
               <LockKeyhole className="mt-0.5 h-5 w-5 shrink-0 text-emerald-300" />
               <div>
-                <div className="text-sm font-medium text-emerald-100">No skill contents stored</div>
+                <div className="text-sm font-medium text-emerald-100">
+                  {state?.privacy?.storesContents
+                    ? "Cross-surface Markdown snapshots enabled"
+                    : "Repo contents stay local"}
+                </div>
                 <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
                   {state?.privacy?.summary ||
-                    "Flow stores repo metadata, checksums, assignments, and sync status. Bodies stay in Git and local connector checkouts."}
+                    "Groovy stores metadata, assignments, and bounded snapshots of assigned Markdown so the same capability works in Chat, Command Center, messaging, and API runs. The connector still performs repository discovery and writes locally."}
                 </p>
               </div>
             </div>
@@ -587,7 +769,7 @@ export function SkillsManagerContent() {
           <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
             <div className="mb-3 flex items-center gap-2">
               <GitBranch className="h-4 w-4 text-cyan-300" />
-              <h2 className="text-sm font-semibold">Connect Repo</h2>
+              <h2 className="text-sm font-semibold">Connect Library Repo</h2>
             </div>
             <div className="space-y-3">
               <input
@@ -620,7 +802,7 @@ export function SkillsManagerContent() {
                 className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 px-3 py-2 text-sm font-semibold text-black transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {busyKey === "connect_repo" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                Connect and Sync
+                Connect Library
               </button>
               {!isAdmin && <p className="text-xs text-zinc-500">Only workspace admins can connect or assign repos.</p>}
             </div>
@@ -640,33 +822,48 @@ export function SkillsManagerContent() {
                 repositories.map((repo) => {
                   const sync = syncByRepo.get(repo.id);
                   const active = repo.id === selectedRepoId;
+                  const status = sync?.status || "never";
+                  const needsRetry = status !== "synced";
+                  const repoSyncBusy = busyKey === `sync:${repo.id}`;
                   return (
-                    <button
+                    <div
                       key={repo.id}
-                      type="button"
-                      onClick={() => setSelectedRepoId(repo.id)}
                       className={`w-full rounded-lg border p-3 text-left transition ${
                         active
                           ? "border-cyan-400/35 bg-cyan-500/10"
                           : "border-white/10 bg-black/20 hover:bg-white/[0.06]"
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate text-sm font-medium">{repo.label}</span>
-                        {sync?.status === "synced" ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-300" />
-                        ) : sync?.status === "no_permission" ? (
-                          <AlertTriangle className="h-4 w-4 text-amber-300" />
-                        ) : (
-                          <GitBranch className="h-4 w-4 text-zinc-500" />
-                        )}
-                      </div>
-                      <div className="mt-1 truncate font-mono text-[11px] text-zinc-500">{repo.repo_url}</div>
-                      <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500">
-                        <span>{sync?.status || "never synced"}</span>
-                        <span>{shortSha(sync?.commit_sha || repo.last_commit_sha)}</span>
-                      </div>
-                    </button>
+                      <button type="button" onClick={() => setSelectedRepoId(repo.id)} className="w-full text-left">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-sm font-medium">{repo.label}</span>
+                          {status === "synced" ? (
+                            <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                          ) : status === "no_permission" || status === "error" || status === "offline" ? (
+                            <AlertTriangle className="h-4 w-4 text-amber-300" />
+                          ) : (
+                            <GitBranch className="h-4 w-4 text-zinc-500" />
+                          )}
+                        </div>
+                        <div className="mt-1 truncate font-mono text-[11px] text-zinc-500">{repo.repo_url}</div>
+                        <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500">
+                          <span>{status === "never" ? "never synced" : status}</span>
+                          <span>{shortSha(sync?.commit_sha || repo.last_commit_sha)}</span>
+                        </div>
+                      </button>
+                      {needsRetry && (
+                        <button
+                          type="button"
+                          onClick={() => void syncRepo(repo.id)}
+                          disabled={!activeDeviceId || repoSyncBusy}
+                          title={!activeDeviceId ? "Start the Groovy Connector first" : "Retry syncing this repo"}
+                          className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-amber-300/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 transition hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {repoSyncBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                          Retry Sync
+                        </button>
+                      )}
+                    </div>
                   );
                 })
               )}
@@ -676,15 +873,22 @@ export function SkillsManagerContent() {
 
         <section className="min-w-0 space-y-5">
           {error && (
-            <div className="rounded-xl border border-rose-400/25 bg-rose-500/10 p-4 text-sm text-rose-100">
+            <div className="whitespace-pre-wrap rounded-xl border border-rose-400/25 bg-rose-500/10 p-4 text-sm text-rose-100">
               {error}
             </div>
           )}
+          {notice && (
+            <div className="flex items-center gap-2 rounded-xl border border-emerald-400/25 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-300" />
+              {notice}
+            </div>
+          )}
 
-          <div className="grid gap-3 sm:grid-cols-4">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
             {[
               ["Repos", repositories.length, "text-cyan-300"],
               ["Artifacts", artifacts.length, "text-emerald-300"],
+              ["Runtime", runtimeSkills.length, "text-violet-300"],
               ["Assignments", assignments.length, "text-sky-300"],
               ["Synced", syncs.filter((sync) => sync.status === "synced").length, "text-amber-300"],
             ].map(([label, value, color]) => (
@@ -695,32 +899,144 @@ export function SkillsManagerContent() {
             ))}
           </div>
 
-          {permissionError && (
+          {activeRepoNeedsAttention && (
             <div className="rounded-xl border border-amber-400/25 bg-amber-500/10 p-4">
-              <div className="flex items-start gap-3">
-                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
-                <div>
-                  <div className="text-sm font-semibold text-amber-100">Repo access failed on this Mac</div>
-                  <p className="mt-1 text-sm text-amber-100/75">
-                    Flow did not connect to GitHub. Your local Git CLI could not access this repo.
-                  </p>
-                  <div className="mt-3 rounded-lg border border-amber-400/20 bg-black/25 p-3 font-mono text-xs text-amber-100/80">
-                    git ls-remote {activeRepo?.repo_url}
-                    <br />
-                    ssh -T git@github.com
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+                  <div>
+                    <div className="text-sm font-semibold text-amber-100">{activeRepoProblemTitle}</div>
+                    <p className="mt-1 text-sm text-amber-100/75">{activeRepoProblemBody}</p>
+                    {activeRepoSync?.last_error_message && (
+                      <div className="mt-3 break-words rounded-lg border border-amber-400/20 bg-black/25 p-3 font-mono text-xs text-amber-100/80">
+                        {activeRepoSync.last_error_message}
+                      </div>
+                    )}
+                    {activeRepoStatus === "no_permission" && (
+                      <div className="mt-3 rounded-lg border border-amber-400/20 bg-black/25 p-3 font-mono text-xs text-amber-100/80">
+                        git ls-remote {activeRepo?.repo_url}
+                        <br />
+                        ssh -T git@github.com
+                      </div>
+                    )}
+                    <p className="mt-3 text-xs text-amber-100/70">
+                      Retry uses your active Groovy Connector and the Git credentials configured on this Mac.
+                    </p>
                   </div>
-                  <p className="mt-3 text-xs text-amber-100/70">
-                    Confirm your SSH key or credential helper is configured and that your GitHub user has access, then retry sync.
+                </div>
+                <button
+                  type="button"
+                  onClick={() => activeRepo && void syncRepo(activeRepo.id)}
+                  disabled={!activeRepo || !activeDeviceId || activeRepoSyncBusy}
+                  title={!activeDeviceId ? "Start the Groovy Connector first" : "Retry syncing this repo"}
+                  className="flex shrink-0 items-center justify-center gap-2 rounded-lg border border-amber-300/25 bg-amber-400 px-3 py-2 text-xs font-semibold text-black transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-50 md:min-w-32"
+                >
+                  {activeRepoSyncBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                  Retry Sync
+                </button>
+              </div>
+            </div>
+          )}
+
+          {runtimeSkills.length > 0 && (
+            <div className="rounded-xl border border-violet-400/20 bg-violet-500/10 p-4">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 text-violet-200" />
+                    <h2 className="text-base font-semibold text-violet-50">Agent-Authored Skills</h2>
+                  </div>
+                  <p className="mt-1 text-xs text-violet-100/70">
+                    Created through Orchestrator and stored in the runtime skill registry.
                   </p>
                 </div>
+                <span className="rounded-md border border-violet-300/20 bg-black/20 px-2 py-1 text-xs text-violet-100">
+                  {filteredRuntimeSkills.length} shown
+                </span>
               </div>
+
+              {filteredRuntimeSkills.length === 0 ? (
+                <div className="mt-4 rounded-lg border border-dashed border-violet-300/20 p-4 text-xs text-violet-100/65">
+                  No runtime skills match the current search.
+                </div>
+              ) : (
+                <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                  {filteredRuntimeSkills.map((skill) => {
+                    const activeVersion = skill.versions.find((version) => version.id === skill.active_version_id) || null;
+                    const latestVersion = skill.versions[0] || null;
+                    const validationStatus =
+                      activeVersion?.validation_status ||
+                      latestVersion?.validation_status ||
+                      "unvalidated";
+                    return (
+                      <div key={skill.id} className="rounded-lg border border-violet-300/15 bg-black/20 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <Sparkles className="h-4 w-4 text-violet-200" />
+                              <h3 className="truncate text-sm font-semibold text-white">{skill.name}</h3>
+                            </div>
+                            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-violet-100/65">
+                              {skill.description || "Orchestrator runtime skill"}
+                            </p>
+                          </div>
+                          <span className="rounded-md border border-violet-300/20 bg-violet-500/10 px-2 py-1 text-[10px] uppercase text-violet-100">
+                            {skill.lifecycle}
+                          </span>
+                        </div>
+                        <div className="mt-3 grid gap-2 text-xs text-violet-100/70 sm:grid-cols-2">
+                          <div className="truncate">
+                            <span className="text-violet-100/45">Agent:</span> {skill.agent_name}
+                          </div>
+                          <div className="truncate">
+                            <span className="text-violet-100/45">Tool:</span> skill_{skill.slug}
+                          </div>
+                          <div>
+                            <span className="text-violet-100/45">Versions:</span> {skill.versions.length || skill.latest_version || 1}
+                          </div>
+                          <div>
+                            <span className="text-violet-100/45">Validation:</span> {validationStatus}
+                          </div>
+                        </div>
+                        <div className="mt-3 flex items-center justify-end border-t border-violet-300/10 pt-3">
+                          <button
+                            type="button"
+                            onClick={() => void exportRuntimeSkill(skill)}
+                            disabled={
+                              !isAdmin ||
+                              !selectedRepoId ||
+                              !activeDeviceId ||
+                              busyKey === `export_runtime:${skill.id}`
+                            }
+                            title={
+                              !selectedRepoId
+                                ? "Select a skills repo first"
+                                : !activeDeviceId
+                                  ? "Start the Groovy Connector first"
+                                  : "Write this runtime skill into the selected skills repo"
+                            }
+                            className="flex items-center gap-2 rounded-lg border border-violet-300/20 bg-violet-500/10 px-3 py-2 text-xs text-violet-50 transition hover:bg-violet-500/15 disabled:opacity-50"
+                          >
+                            {busyKey === `export_runtime:${skill.id}` ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <GitBranch className="h-3.5 w-3.5" />
+                            )}
+                            Sync to Repo
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
           <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div>
-                <h2 className="text-base font-semibold">{activeRepo?.label || "Skill Catalog"}</h2>
+                <h2 className="text-base font-semibold">{activeRepo?.label || "Skills & Docs Library"}</h2>
                 <p className="text-xs text-zinc-500">
                   Last sync {formatTime(activeRepoSync?.synced_at || activeRepo?.last_synced_at)} · commit{" "}
                   {shortSha(activeRepoSync?.commit_sha || activeRepo?.last_commit_sha)}
@@ -738,12 +1054,21 @@ export function SkillsManagerContent() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => activeRepo && void pushRepoChanges(activeRepo.id, activeRepo.label || "Repo")}
+                  disabled={!isAdmin || !activeRepo || !activeDeviceId || busyKey === `push:${activeRepo?.id}`}
+                  className="flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100 transition hover:bg-cyan-500/15 disabled:opacity-50"
+                >
+                  {busyKey === `push:${activeRepo?.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                  Push Changes
+                </button>
+                <button
+                  type="button"
                   onClick={() => void preflight(agentTarget === "claude" || agentTarget === "codex" ? agentTarget : "flow", selectedAgentId || null)}
                   disabled={!activeDeviceId || busyKey?.startsWith("preflight:")}
                   className="flex items-center gap-2 rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-500/15 disabled:opacity-50"
                 >
                   {busyKey?.startsWith("preflight:") ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-                  Preflight
+                  Prepare for selected agent
                 </button>
                 <button
                   type="button"
@@ -752,7 +1077,7 @@ export function SkillsManagerContent() {
                   className="flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-xs font-semibold text-black transition hover:bg-zinc-200 disabled:opacity-50"
                 >
                   <Plus className="h-4 w-4" />
-                  Create
+                  Create skill or doc
                 </button>
               </div>
             </div>
@@ -801,6 +1126,7 @@ export function SkillsManagerContent() {
               filteredArtifacts.map((artifact) => {
                 const repo = repoById.get(artifact.repository_id);
                 const isSkill = artifact.artifact_type === "skill";
+                const artifactRepoPushBusy = busyKey === `push:${artifact.repository_id}`;
                 const agentAssignments = assignments.filter(
                   (assignment) =>
                     assignment.enabled &&
@@ -835,8 +1161,8 @@ export function SkillsManagerContent() {
                   : agentAssignments;
                 return (
                   <div key={artifact.id} className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           {isSkill ? (
                             <Sparkles className="h-4 w-4 text-emerald-300" />
@@ -849,9 +1175,21 @@ export function SkillsManagerContent() {
                           {artifact.description || (isSkill ? "Repo-backed Agent Skill" : "Markdown instruction document")}
                         </p>
                       </div>
-                      <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[10px] uppercase tracking-wide text-zinc-400">
-                        {isSkill ? "Skill" : "Doc"}
-                      </span>
+                      <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                        <span className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-[10px] uppercase tracking-wide text-zinc-400">
+                          {isSkill ? "Skill" : "Doc"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void pushRepoChanges(artifact.repository_id, artifact.name)}
+                          disabled={!isAdmin || !activeDeviceId || artifactRepoPushBusy}
+                          title={!activeDeviceId ? "Start the Groovy Connector first" : "Commit and push local repo changes"}
+                          className="flex min-h-8 items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100 transition hover:bg-cyan-500/15 disabled:opacity-50"
+                        >
+                          {artifactRepoPushBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
+                          Sync to Repo
+                        </button>
+                      </div>
                     </div>
 
                     <div className="mt-3 space-y-2 text-xs">
@@ -876,10 +1214,10 @@ export function SkillsManagerContent() {
 
                     <div className="mt-4 border-t border-white/10 pt-4">
                       <div className="mb-2">
-                        <div className="text-[11px] uppercase tracking-wide text-zinc-500">Global assignment</div>
-                        <div className="mt-0.5 text-[11px] text-zinc-600">Applies to every agent matching the target.</div>
+                        <div className="text-[11px] uppercase tracking-wide text-zinc-500">Assign globally</div>
+                        <div className="mt-0.5 text-[11px] text-zinc-600">The orchestrator or every worker using that harness receives it.</div>
                       </div>
-                      <div className="grid grid-cols-3 gap-2">
+                      <div className="grid gap-2 sm:grid-cols-3">
                         {TARGETS.map((target) => {
                           const Icon = target.icon;
                           const assigned = isAssigned(artifact.id, target.id);
@@ -898,7 +1236,7 @@ export function SkillsManagerContent() {
                               }`}
                             >
                               <Icon className="h-3.5 w-3.5" />
-                              All {target.label}
+                              {target.id === "flow" ? target.label : `All ${target.label} agents`}
                             </button>
                           );
                         })}
@@ -1160,6 +1498,11 @@ export function SkillsManagerContent() {
                   className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-mono text-xs text-white outline-none"
                   placeholder="instructions/shared/AGENTS.md"
                 />
+                {existingCreateArtifact && (
+                  <div className="rounded-lg border border-cyan-300/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100/80">
+                    Existing artifact path. Write will update this artifact.
+                  </div>
+                )}
                 <div className="grid grid-cols-2 gap-2">
                   {(["all", "flow", "claude", "codex"] as Target[]).map((target) => {
                     const enabled = createTargets.includes(target);

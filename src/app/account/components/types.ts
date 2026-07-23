@@ -43,6 +43,8 @@ export type LicenseEntitlement = {
 
 export type LicenseStatus = {
   licensed?: boolean;
+  hasAccess?: boolean;
+  accessStatus?: "licensed" | "trial" | "trial_available" | "expired";
   status?: string;
   workspaceId?: string | null;
   license?: {
@@ -52,6 +54,15 @@ export type LicenseStatus = {
   devices?: Device[];
   canManageLicense?: boolean;
   licenses?: LicenseEntitlement[];
+  trial?: {
+    status?: "not_started" | "active" | "expired";
+    eligible?: boolean;
+    startedAt?: string | null;
+    endsAt?: string | null;
+    daysRemaining?: number;
+    durationDays?: number;
+  };
+  requiresPurchase?: boolean;
   error?: string;
 };
 
@@ -70,6 +81,8 @@ export type Artifact = {
 
 export type DownloadsStatus = {
   licensed?: boolean;
+  hasAccess?: boolean;
+  accessStatus?: "licensed" | "trial" | "trial_available" | "expired";
   canReceiveUpdates?: boolean;
   licenseStatus?: string;
   message?: string;

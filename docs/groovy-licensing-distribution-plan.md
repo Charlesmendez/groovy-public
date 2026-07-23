@@ -12,11 +12,14 @@ Scope: move Groovy from a closed usage-billed app to a source-available licensed
 - Token usage may still be tracked for analytics, cost estimation, debugging, budgets, and optimization.
 - Token-consumption billing may only be re-enabled for authorized enterprise reseller licenses.
 - Customers should bring their own model provider keys by default.
-- Personal users pay yearly and receive source access while active.
-- Expired personal users keep the last paid version but lose access to new source snapshots, downloads, updates, activations, device resets, and support.
+- Personal users pay yearly for personal usage rights and receive packaged
+  source snapshots and signed artifacts while active.
+- Expired personal users keep fallback rights to the last paid version but lose
+  the right to run newer releases and lose access to new portal artifacts,
+  updates, activations, device resets, and support.
 - Enterprise customers use a manual sales flow and receive commercial rights, source access, and fallback rights according to their agreement.
-- GitHub stays, but as a delayed public source-available mirror and contribution surface, not the payment, licensing, or current-update entitlement system.
-- Current paid source snapshots, installers, license files, and release metadata are distributed through the Groovy portal and Groovy CLI.
+- GitHub stays as a release-synchronized public source-available mirror and contribution surface, not the payment or licensing system.
+- Packaged source snapshots, signed installers, license files, and release metadata are distributed through the Groovy portal and Groovy CLI.
 - CLI setup is first-class for developers and enterprise customers.
 - AI-agent setup documentation is required so customers can copy a full instruction document into their AI agent and have the agent perform setup through the CLI.
 - Datagran Memory and Datagran-backed Data Integrations are first-class setup requirements.
@@ -29,7 +32,10 @@ Scope: move Groovy from a closed usage-billed app to a source-available licensed
 - Billing: Stripe yearly subscription.
 - Rights: one individual, personal non-commercial use only.
 - Devices: 2 activated devices.
-- Source access: current source snapshots while subscription is active.
+- Source visibility: tagged releases are public.
+- Usage rights: releases published during the active subscription, subject to
+  the Personal terms.
+- Packaged source snapshots and signed installers while active.
 - Expiration:
   - Existing installed version may continue for personal non-commercial use.
   - User sees expired license state.
@@ -57,7 +63,7 @@ GitHub should remain part of the product, but its job changes.
 
 ### GitHub Should Be Used For
 
-- Public delayed source-available mirror.
+- Public release-synchronized source-available mirror.
 - Transparency and evaluation.
 - Documentation.
 - Examples and SDKs.
@@ -69,23 +75,27 @@ GitHub should remain part of the product, but its job changes.
 
 - Personal payment unlock.
 - Primary license activation.
-- Current paid source snapshot access.
+- Usage rights or license activation.
+- Signed installers and portal-only packaged artifacts.
 - Current paid downloads.
 - Enforcing update entitlement.
 
 ### Recommended Flow
 
-1. Public GitHub shows delayed source-available code and contribution branches.
+1. Pushing a reviewed `source-v*` tag publishes the same release to public
+   GitHub and makes it available to contribution branches.
 2. Paid personal and enterprise customers authenticate to the Groovy portal or CLI.
-3. Portal/CLI exposes current source snapshots, checksums, license files, release notes, and installers.
-4. Expired customers retain their last paid source snapshot but lose access to newer snapshots.
+3. Portal/CLI exposes packaged source snapshots, checksums, license files, release notes, and signed installers.
+4. Expired customers may inspect newer public releases but retain usage rights
+   only as defined by their fallback terms; they lose access to newer portal
+   artifacts.
 5. Enterprise customers may additionally receive private GitHub access or private patch workflow if included in their contract.
 
 ## Contribution Model
 
 ### Public Contributors
 
-- Open issues and pull requests against the public delayed mirror.
+- Open issues and pull requests against the current public release.
 - Must follow `CONTRIBUTING.md`.
 - Must sign CLA or DCO, depending on final legal choice.
 
@@ -307,7 +317,7 @@ Deliverables:
 
 - Finalize personal, enterprise, reseller, and commercial-use terms.
 - Define CLA or DCO policy.
-- Define delayed GitHub mirror cadence.
+- Define the source-tag release and public mirror synchronization policy.
 - Define source snapshot retention policy.
 - Define fallback rights by license type.
 
@@ -614,7 +624,8 @@ Tasks:
 - Add signed short-lived download URLs.
 - Add entitlement checks.
 - Add release/channel model.
-- Keep delayed GitHub mirror publication separate.
+- Keep public source publication tied to reviewed `source-v*` releases and
+  separate from private development commits.
 
 Acceptance criteria:
 
@@ -662,7 +673,7 @@ Test coverage:
 - Datagran Data Integration setup and reauth behavior.
 - CLI JSON/noninteractive behavior.
 - Portal download entitlement.
-- Delayed GitHub mirror process.
+- Release-synchronized GitHub mirror process.
 
 Migration:
 
@@ -673,7 +684,8 @@ Migration:
 
 ## Open Decisions
 
-- Exact delayed GitHub mirror cadence.
+- Whether public source publication should remain tag-based or move to
+  commit-by-commit mirroring in the future.
 - CLA vs DCO.
 - Whether enterprise private source access uses GitHub, portal snapshots, or both by default.
 - Whether the first CLI is a Node package in this repo or a separate package published later.

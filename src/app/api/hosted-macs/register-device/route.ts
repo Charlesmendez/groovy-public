@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type Body = {
   request_id?: string;
@@ -14,6 +15,12 @@ type Body = {
  * and update request status.
  */
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Groovy-hosted Macs are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const deviceToken = req.headers.get("x-device-token") || "";
@@ -111,4 +118,3 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }
-

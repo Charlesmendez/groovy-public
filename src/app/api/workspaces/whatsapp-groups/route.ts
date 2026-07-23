@@ -13,12 +13,18 @@ export async function GET() {
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin
       .from("workspace_members")
-      .select("workspace_id")
+      .select("workspace_id, role")
       .eq("user_id", user.id)
       .limit(1)
       .single();
     if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    }
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
     }
     const { data, error } = await admin
       .from("workspace_whatsapp_groups")

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createHmac, timingSafeEqual } from "crypto";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
+import { isSelfHosted } from "@/lib/config/edition";
 
 /**
  * POST /api/whatsapp/kapso/phone-connected
@@ -42,6 +43,12 @@ function verifyKapsoSignature(args: { rawBody: string; signatureHex: string; sec
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Kapso webhooks are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const rawBody = await req.text();

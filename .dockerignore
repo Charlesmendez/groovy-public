@@ -1,0 +1,14 @@
+.git
+.github
+.next
+.vercel
+node_modules
+**/node_modules
+**/dist
+**/.env*
+.env*
+!.env.self-hosted.example
+apps/connector/whatsapp-web-session
+apps/connector/dist
+apps/desktop/dist
+npm-debug.log*

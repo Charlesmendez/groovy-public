@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
+import { getRelayUrl } from "@/lib/config/appConfig";
 
 export type RelayStatus = "disconnected" | "connecting" | "ready" | "error";
 
@@ -71,7 +72,7 @@ export function useRelay({
 }: {
   enabled?: boolean;
 } = {}) {
-  const relayUrl = process.env.NEXT_PUBLIC_RELAY_URL;
+  const relayUrl = getRelayUrl();
   const [status, setStatus] = useState<RelayStatus>(
     relayUrl ? "disconnected" : "error"
   );
@@ -486,5 +487,16 @@ export function useRelay({
     };
   }, [clearCheckingTimer, clearOnlineRevalidateTimer]);
 
-  return { status, error, userId, send, subscribe, reconnect, isChecking: isCheckingConnection };
+  return useMemo(
+    () => ({
+      status,
+      error,
+      userId,
+      send,
+      subscribe,
+      reconnect,
+      isChecking: isCheckingConnection,
+    }),
+    [status, error, userId, send, subscribe, reconnect, isCheckingConnection]
+  );
 }

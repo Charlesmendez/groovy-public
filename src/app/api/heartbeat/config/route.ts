@@ -144,6 +144,12 @@ export async function GET() {
     .maybeSingle();
   const hasUpreadyReadiness = !!upreadyLink;
 
+  const heartbeatTaskOptions =
+    heartbeatJob &&
+    typeof (heartbeatJob.task as Record<string, unknown>)?.options === "object"
+      ? ((heartbeatJob.task as Record<string, unknown>).options as Record<string, unknown>)
+      : null;
+
   return NextResponse.json({
     enabled: heartbeatJob ? heartbeatJob.enabled === true : false,
     jobId: heartbeatJob?.id || null,
@@ -151,6 +157,10 @@ export async function GET() {
     agentId: (heartbeatJob as { agent_id?: unknown } | null)?.agent_id || null,
     lastRunAt: heartbeatJob?.last_run_at || null,
     lastStatus: heartbeatJob?.last_status || null,
+    model:
+      typeof heartbeatTaskOptions?.model_name === "string" && heartbeatTaskOptions.model_name
+        ? heartbeatTaskOptions.model_name
+        : null,
     delivery: heartbeatJob
       ? (heartbeatJob.task as Record<string, unknown>)?.delivery || { dashboard: true, whatsapp: true }
       : { dashboard: true, whatsapp: true },
@@ -184,7 +194,50 @@ export async function POST(req: Request) {
     enabled?: boolean;
     delivery?: { dashboard?: boolean; whatsapp?: boolean; telegram?: boolean };
     deviceId?: string;
+    /** Digest model override; null clears back to the default. */
+    model?: string | null;
   } | null;
+
+  // Model-only update: patch task.options.model_name on the existing heartbeat
+  // job without touching enablement/schedule/device.
+  if (body && typeof body.enabled !== "boolean" && "model" in body) {
+    const model =
+      typeof body.model === "string" && body.model.trim() ? body.model.trim() : null;
+    const { data: jobs } = await supabase
+      .from("scheduled_jobs")
+      .select("id,task")
+      .eq("user_id", user.id)
+      .eq("kind", "orchestrator")
+      .order("updated_at", { ascending: false })
+      .limit(50);
+    const heartbeatJob = (jobs || []).find((j) => {
+      const t = j.task as Record<string, unknown> | null;
+      return t && t.type === "heartbeat_v1";
+    });
+    if (!heartbeatJob) {
+      return NextResponse.json(
+        { error: "No heartbeat job yet — enable the heartbeat first." },
+        { status: 404 }
+      );
+    }
+    const taskObj = { ...((heartbeatJob.task as Record<string, unknown>) || {}) };
+    const options = {
+      ...((taskObj.options as Record<string, unknown>) || {}),
+    };
+    if (model) options.model_name = model;
+    else delete options.model_name;
+    taskObj.options = options;
+    const { error: updateErr } = await supabase
+      .from("scheduled_jobs")
+      .update({ task: taskObj, updated_at: new Date().toISOString() })
+      .eq("id", heartbeatJob.id)
+      .eq("user_id", user.id);
+    if (updateErr) {
+      return NextResponse.json({ error: updateErr.message }, { status: 500 });
+    }
+    return NextResponse.json({ ok: true, jobId: heartbeatJob.id, model });
+  }
+
   if (!body || typeof body.enabled !== "boolean") {
     return NextResponse.json({ error: "Missing enabled (boolean)" }, { status: 400 });
   }

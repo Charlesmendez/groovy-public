@@ -100,19 +100,30 @@ export function LicensePanel() {
   if (loading) return <LoadingState label="Loading license..." />;
   if (error) return <ErrorState error={error} />;
   if (!data?.licensed || entitlements.length === 0) {
+    const trialActive = data?.accessStatus === "trial";
+    const trialAvailable = data?.accessStatus === "trial_available";
     return (
-      <div className="mt-8 rounded-lg border border-white/10 bg-white/[0.03] p-5">
-        <div className="text-sm font-medium text-white">No Groovy license is attached yet.</div>
+      <div className={`mt-8 rounded-lg border p-5 ${trialActive ? "border-cyan-400/20 bg-cyan-400/10" : "border-white/10 bg-white/[0.03]"}`}>
+        <div className="text-sm font-medium text-white">
+          {trialActive
+            ? `Free trial active · ${data.trial?.daysRemaining || 1} day${data.trial?.daysRemaining === 1 ? "" : "s"} remaining`
+            : trialAvailable
+              ? "Your free 5-day trial is ready"
+              : "Your Groovy trial has ended"}
+        </div>
         <p className="mt-2 text-sm leading-relaxed text-zinc-400">
-          Buy Groovy Personal for individual, non-commercial use, or contact sales for company use,
-          source access terms, and enterprise deployment rights.
+          {trialActive
+            ? `You have full access until ${formatDate(data.trial?.endsAt || undefined)}. Purchase Groovy Personal to continue without interruption.`
+            : trialAvailable
+              ? "Start the trial from the dashboard. No credit card is required and the clock starts only when you activate it."
+              : "Buy Groovy Personal to resume your agents and orchestrator, or contact sales for company use."}
         </p>
         <div className="mt-4 flex flex-wrap gap-3">
           <a
-            href="/pricing"
+            href={trialAvailable ? "/dashboard" : "/pricing"}
             className="rounded-lg bg-cyan-400 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-cyan-300"
           >
-            Buy Groovy Personal
+            {trialAvailable ? "Start free trial" : "Buy Groovy Personal"}
           </a>
           <a
             href="/enterprise"

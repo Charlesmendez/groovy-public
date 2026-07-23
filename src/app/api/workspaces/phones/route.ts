@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
+import { isSelfHosted } from "@/lib/config/edition";
 
 function generateCode() {
   return String(Math.floor(100000 + Math.random() * 900000));
@@ -11,16 +12,28 @@ type Body = {
 };
 
 export async function GET() {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   try {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin
       .from("workspace_members")
-      .select("workspace_id")
+      .select("workspace_id, role")
       .eq("user_id", user.id)
       .limit(1)
       .single();
     if (!membership) return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
+    }
 
     const { data } = await admin
       .from("workspace_member_phones")
@@ -37,6 +50,12 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as Body | null;
@@ -46,11 +65,17 @@ export async function POST(req: Request) {
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin
       .from("workspace_members")
-      .select("workspace_id")
+      .select("workspace_id, role")
       .eq("user_id", user.id)
       .limit(1)
       .single();
     if (!membership) return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
+    }
 
     const code = generateCode();
     const { data, error } = await admin

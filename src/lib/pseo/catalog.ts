@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 
 import keywordUniverseJson from "@/content/pseo/keyword-universe.en.json";
 import pageCatalogJson from "@/content/pseo/page-catalog.en.json";
+import { getAppUrl } from "@/lib/config/appConfig";
 
 import type {
   PseoCatalog,
@@ -23,13 +24,10 @@ const pseoPageByRef = new Map<string, PseoPageRecord>(
 );
 
 export function getSiteBaseUrl(): string {
-  const fallback = "https://gogroovy.ai";
-  const candidate = process.env.NEXT_PUBLIC_APP_URL || fallback;
-
   try {
-    return new URL(candidate).origin;
+    return new URL(getAppUrl()).origin;
   } catch {
-    return fallback;
+    return "http://localhost:3000";
   }
 }
 

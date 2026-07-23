@@ -3,7 +3,13 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 const MEMBER_EMAIL_LOOKUP_CONCURRENCY = 8;
 
-export type WorkspaceRole = "admin" | "member";
+export type WorkspaceRole = "admin" | "member" | "guest";
+
+export function isWorkspaceOperatorRole(
+  role: string | null | undefined,
+): role is "admin" | "member" {
+  return role === "admin" || role === "member";
+}
 
 export type WorkspaceMember = {
   user_id: string;

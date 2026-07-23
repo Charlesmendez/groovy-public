@@ -6,6 +6,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { resolveChatModel } from "@/lib/ai/modelResolver";
 import { runOrchestratorRound } from "@/lib/orchestrator/runOrchestratorRound";
 import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
+import { getAppUrl } from "@/lib/config/appConfig";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -1576,7 +1577,7 @@ async function processClaimedMaterialQuery(args: {
   );
 
   const roundStartedAtMs = Date.now();
-  const appBaseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+  const appBaseUrl = getAppUrl();
   const runRound = (
     toolResults?:
       | Array<{

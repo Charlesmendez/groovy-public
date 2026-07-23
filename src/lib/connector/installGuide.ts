@@ -1,35 +1,38 @@
 import { useEffect, useState } from "react";
 import { getConnectorInstallGuide } from "./catalog";
-import { detectConnectorPlatformFromNavigator } from "./platform";
+import {
+  detectConnectorPlatformFromNavigator,
+  type ConnectorClientPlatform,
+} from "./platform";
 import { readConnectorPlatformOverride } from "./override";
 
 export function useConnectorInstallGuide() {
-  const [, setTick] = useState(0);
+  const [platform, setPlatform] = useState<ConnectorClientPlatform>("unknown");
 
-  const guide = (() => {
-    if (typeof window === "undefined") return getConnectorInstallGuide("unknown");
-    const override = readConnectorPlatformOverride();
-    const platform =
-      override === "windows" || override === "macos"
-        ? override
-        : detectConnectorPlatformFromNavigator(window.navigator);
-    return getConnectorInstallGuide(platform);
-  })();
-
-  // Recompute when platform override changes (other tabs, Settings, etc).
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === "groovy:connector:platformOverride") setTick((n) => n + 1);
+    const detectPlatform = () => {
+      if (typeof window === "undefined") return;
+      const override = readConnectorPlatformOverride();
+      setPlatform(
+        override === "windows" || override === "macos"
+          ? override
+          : detectConnectorPlatformFromNavigator(window.navigator)
+      );
     };
-    const onOverride = () => setTick((n) => n + 1);
+
+    detectPlatform();
+
+    // Recompute when platform override changes (other tabs, Settings, etc).
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === "groovy:connector:platformOverride") detectPlatform();
+    };
     window.addEventListener("storage", onStorage);
-    window.addEventListener("groovy:connector:platformOverrideChanged", onOverride);
+    window.addEventListener("groovy:connector:platformOverrideChanged", detectPlatform);
     return () => {
       window.removeEventListener("storage", onStorage);
-      window.removeEventListener("groovy:connector:platformOverrideChanged", onOverride);
+      window.removeEventListener("groovy:connector:platformOverrideChanged", detectPlatform);
     };
   }, []);
 
-  return guide;
+  return getConnectorInstallGuide(platform);
 }

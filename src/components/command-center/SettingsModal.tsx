@@ -32,9 +32,11 @@ import {
   Wrench,
   CreditCard,
   Send,
+  Plug,
 } from "lucide-react";
 import { UsageDashboardContent } from "@/components/usage/UsageDashboardContent";
 import { BillingCardSetupForm } from "@/components/billing/BillingCardSetupForm";
+import { IntegrationSettingsSection } from "@/components/command-center/IntegrationSettingsSection";
 import { useConnectorInstallGuide } from "@/lib/connector/installGuide";
 import {
   readConnectorPlatformOverride,
@@ -44,6 +46,8 @@ import {
 import { detectConnectorPlatformFromNavigator, type ConnectorClientPlatform } from "@/lib/connector/platform";
 
 import type { Provider, LlmKeyMode, KeyModes } from "@/lib/keys/resolveKeyMode";
+import { isServerKeyEligibleProvider } from "@/lib/keys/providerKeyPolicy";
+import { useEdition } from "@/hooks/useEdition";
 
 // Kept for backwards-compat with existing imports; not used by this modal anymore.
 export type FilesAgentInfo = { id: string; name: string; createdAt?: string };
@@ -53,6 +57,7 @@ export type SettingsFocusSection =
   | "connector"
   | "billing"
   | "api-keys"
+  | "integrations"
   | "files-agent"
   | "obsidian"
   | "aiyra-voice";
@@ -154,7 +159,10 @@ type SettingsModalProps = {
   currentKeys: Partial<Record<Provider, { configured: boolean; lastUpdated?: string }>>;
   currentKeyMode?: LlmKeyMode;
   currentKeyModes?: KeyModes;
+  serverProviderKeysAllowed?: boolean;
   currentUserEmail?: string | null;
+  currentOrchestratorSessionId?: string | null;
+  currentOrchestratorAgentId?: string | null;
   onSignOut?: () => void | Promise<void>;
   autoRunTeamRequests?: boolean;
   onSetAutoRunTeamRequests?: (next: boolean) => void | Promise<void>;
@@ -166,6 +174,7 @@ type SettingsModalProps = {
   isHostedConnectorActive?: boolean;
   connectorVersion?: string | null;
   minConnectorVersion?: string;
+  connectorSupportsInPlaceUpdate?: boolean;
   connectorDownloadUrl?: string;
   aiyraConfig?: AiyraConfigSnapshot;
   onLoadAiyraConfig?: (input: {
@@ -302,6 +311,7 @@ type SettingsSection =
   | "connector"
   | "aiyra-voice"
   | "api-keys"
+  | "integrations"
   | "billing"
   | "team"
   | "usage"
@@ -316,6 +326,7 @@ const SECTION_NAV: { id: SettingsSection; label: string; icon: typeof Settings }
   { id: "connector", label: "Connector", icon: Wifi },
   { id: "aiyra-voice", label: "Aiyra Voice", icon: Mic },
   { id: "api-keys", label: "API Keys", icon: Key },
+  { id: "integrations", label: "Integrations", icon: Plug },
   { id: "billing", label: "Billing", icon: CreditCard },
   { id: "team", label: "Team", icon: Users },
   { id: "usage", label: "Usage", icon: BarChart3 },
@@ -401,7 +412,7 @@ const PROVIDER_ORDER: Provider[] = [
 ];
 
 function providerManagedModeLabel(provider: Provider): string {
-  if (provider === "codex_cli") return "Local login";
+  if (provider === "codex_cli" || provider === "claude_cli") return "Local login";
   return "Server env";
 }
 
@@ -409,11 +420,22 @@ function providerUserModeLabel(provider: Provider): string {
   return provider === "codex_cli" ? "API key" : "Own key";
 }
 
-function buildInitialProviderModes(globalMode: LlmKeyMode, keyModes?: KeyModes): KeyModes {
+function buildInitialProviderModes(
+  globalMode: LlmKeyMode,
+  keyModes?: KeyModes,
+  allowServerProviderKeys = true
+): KeyModes {
   const out: KeyModes = {};
   for (const p of PROVIDER_ORDER) {
     const m = keyModes?.[p];
-    out[p] = m === "groovy" || m === "user" ? m : globalMode;
+    out[p] =
+      !allowServerProviderKeys && isServerKeyEligibleProvider(p)
+        ? "user"
+        : m === "groovy" || m === "user"
+          ? m
+          : p === "claude_cli" || p === "codex_cli"
+            ? "groovy"
+            : globalMode;
   }
   return out;
 }
@@ -433,14 +455,16 @@ function resolveInitialSettingsSection({
   if (focusSection === "connector") return "connector";
   if (focusSection === "billing") return "billing";
   if (focusSection === "api-keys") return "api-keys";
+  if (focusSection === "integrations") return "integrations";
   if (focusSection === "aiyra-voice") return "aiyra-voice";
   const hasPerProvider = Object.keys(currentKeyModes || {}).length > 0;
-  const needsUserKey = (provider: Provider) =>
-    (hasPerProvider ? currentKeyModes?.[provider] : currentKeyMode) === "user";
-  const anyMissing = PROVIDER_ORDER.some(
-    (provider) => needsUserKey(provider) && !currentKeys[provider]?.configured
-  );
-  return anyMissing ? "api-keys" : "connector";
+  const providerReady = (provider: Provider) => {
+    const mode = hasPerProvider ? currentKeyModes?.[provider] : currentKeyMode;
+    return mode === "groovy" || currentKeys[provider]?.configured === true;
+  };
+  return providerReady("anthropic") || providerReady("openai")
+    ? "connector"
+    : "api-keys";
 }
 
 type HeartbeatIntegrations = {
@@ -498,7 +522,10 @@ export function SettingsModal({
   currentKeys,
   currentKeyMode = "groovy",
   currentKeyModes,
+  serverProviderKeysAllowed = false,
   currentUserEmail,
+  currentOrchestratorSessionId,
+  currentOrchestratorAgentId,
   onSignOut,
   focusSection,
   autoRunTeamRequests,
@@ -511,6 +538,7 @@ export function SettingsModal({
   isHostedConnectorActive = false,
   connectorVersion,
   minConnectorVersion,
+  connectorSupportsInPlaceUpdate = false,
   connectorDownloadUrl,
   aiyraConfig,
   onLoadAiyraConfig,
@@ -522,6 +550,7 @@ export function SettingsModal({
   onRestartConnector,
   onUpdateConnector,
 }: SettingsModalProps) {
+  const edition = useEdition();
   const connectorGuide = useConnectorInstallGuide();
   const resolvedConnectorOpenWakewordThreshold = Number.isFinite(
     Number(connectorAiyraVoiceHealth?.openwakeword_threshold)
@@ -551,6 +580,11 @@ export function SettingsModal({
     }
     prevFocusSectionRef.current = focusSection;
   }, [focusSection, isOpen, currentKeyMode, currentKeyModes, currentKeys]);
+  useEffect(() => {
+    if (edition.selfHosted && activeSection === "billing") {
+      setActiveSection("account");
+    }
+  }, [activeSection, edition.selfHosted]);
   const [keys, setKeys] = useState<Partial<Record<Provider, string>>>({});
   const [showKeys, setShowKeys] = useState<Partial<Record<Provider, boolean>>>({});
   const [saving, setSaving] = useState(false);
@@ -560,10 +594,10 @@ export function SettingsModal({
   const [keyMode, setKeyMode] = useState<LlmKeyMode>(currentKeyMode);
   const [initialKeyMode, setInitialKeyMode] = useState<LlmKeyMode>(currentKeyMode);
   const [perProviderModes, setPerProviderModes] = useState<KeyModes>(() =>
-    buildInitialProviderModes(currentKeyMode, currentKeyModes)
+    buildInitialProviderModes(currentKeyMode, currentKeyModes, serverProviderKeysAllowed)
   );
   const [initialProviderModes, setInitialProviderModes] = useState<KeyModes>(() =>
-    buildInitialProviderModes(currentKeyMode, currentKeyModes)
+    buildInitialProviderModes(currentKeyMode, currentKeyModes, serverProviderKeysAllowed)
   );
   const [copiedRePair, setCopiedRePair] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -708,6 +742,11 @@ export function SettingsModal({
   const formatUsd = (value: number) => `$${(Number.isFinite(value) ? value : 0).toFixed(2)}`;
 
   const refreshBillingStatus = async () => {
+    if (edition.selfHosted) {
+      setBillingStatus(null);
+      setBillingLoading(false);
+      return;
+    }
     setBillingLoading(true);
     setBillingError(null);
     try {
@@ -922,7 +961,11 @@ export function SettingsModal({
     setSuccessMessage(null);
     setKeyMode(currentKeyMode);
     setInitialKeyMode(currentKeyMode);
-    const init = buildInitialProviderModes(currentKeyMode, currentKeyModes);
+    const init = buildInitialProviderModes(
+      currentKeyMode,
+      currentKeyModes,
+      serverProviderKeysAllowed
+    );
     setPerProviderModes(init);
     setInitialProviderModes(init);
     setInviteError(null);
@@ -977,7 +1020,15 @@ export function SettingsModal({
         currentKeys,
       })
     );
-  }, [isOpen, focusSection, currentKeyMode, currentKeyModes, currentKeys, aiyraConfig]);
+  }, [
+    isOpen,
+    focusSection,
+    currentKeyMode,
+    currentKeyModes,
+    currentKeys,
+    aiyraConfig,
+    serverProviderKeysAllowed,
+  ]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1322,7 +1373,7 @@ export function SettingsModal({
   };
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || edition.loading) return;
     (async () => {
       setWorkspaceLoading(true);
       try {
@@ -1330,8 +1381,11 @@ export function SettingsModal({
         const prefsRes = await fetch("/api/user-preferences", { cache: "no-store" });
         const prefsJson = await prefsRes.json().catch(() => ({}));
         const modeRaw = prefsJson?.onboardingData?.connectorMode;
-        const mode: "local" | "groovy" | null =
-          modeRaw === "groovy" || modeRaw === "local" ? modeRaw : null;
+        const mode: "local" | "groovy" | null = edition.selfHosted
+          ? "local"
+          : modeRaw === "groovy" || modeRaw === "local"
+            ? modeRaw
+            : null;
         setConnectorMode(mode);
         const bc = prefsJson?.branchController;
         if (bc && typeof bc === "object") {
@@ -1378,22 +1432,28 @@ export function SettingsModal({
             if (invRes.ok) {
               setInvites(Array.isArray(invJson.invites) ? invJson.invites : []);
             }
-            const listRes = await fetch("/api/workspaces/whatsapp-allowlist", { cache: "no-store" });
-            const listJson = await listRes.json().catch(() => ({}));
-            if (listRes.ok) {
-              setAllowlist(Array.isArray(listJson.allowlist) ? listJson.allowlist : []);
-            }
-            const cwRes = await fetch("/api/workspaces/company-whatsapp", { cache: "no-store" });
-            const cwJson = await cwRes.json().catch(() => ({}));
-            if (cwRes.ok && cwJson.companyWhatsapp) {
-              setCompanyWhatsappStatus(String(cwJson.companyWhatsapp.status || ""));
-              setCompanyWhatsappSetupUrl(
-                typeof cwJson.companyWhatsapp.setup_link_url === "string"
-                  ? cwJson.companyWhatsapp.setup_link_url
-                  : null
-              );
+            if (!edition.selfHosted) {
+              const listRes = await fetch("/api/workspaces/whatsapp-allowlist", { cache: "no-store" });
+              const listJson = await listRes.json().catch(() => ({}));
+              if (listRes.ok) {
+                setAllowlist(Array.isArray(listJson.allowlist) ? listJson.allowlist : []);
+              }
+              const cwRes = await fetch("/api/workspaces/company-whatsapp", { cache: "no-store" });
+              const cwJson = await cwRes.json().catch(() => ({}));
+              if (cwRes.ok && cwJson.companyWhatsapp) {
+                setCompanyWhatsappStatus(String(cwJson.companyWhatsapp.status || ""));
+                setCompanyWhatsappSetupUrl(
+                  typeof cwJson.companyWhatsapp.setup_link_url === "string"
+                    ? cwJson.companyWhatsapp.setup_link_url
+                    : null
+                );
+              } else {
+                setCompanyWhatsappStatus(null);
+              }
             } else {
+              setAllowlist([]);
               setCompanyWhatsappStatus(null);
+              setCompanyWhatsappSetupUrl(null);
             }
             const groupsRes = await fetch("/api/workspaces/whatsapp-groups", { cache: "no-store" });
             const groupsJson = await groupsRes.json().catch(() => ({}));
@@ -1402,21 +1462,23 @@ export function SettingsModal({
             }
           }
         }
-        const phoneRes = await fetch("/api/workspaces/phones", { cache: "no-store" });
-        const phoneJson = await phoneRes.json().catch(() => ({}));
-        if (phoneRes.ok && phoneJson.phone) {
-          setPhoneEntry(String(phoneJson.phone.phone_e164 || ""));
-          setPhoneCode(phoneJson.phone.verification_code || null);
-          setPhoneVerified(!!phoneJson.phone.verified_at);
+        if (!edition.selfHosted) {
+          const phoneRes = await fetch("/api/workspaces/phones", { cache: "no-store" });
+          const phoneJson = await phoneRes.json().catch(() => ({}));
+          if (phoneRes.ok && phoneJson.phone) {
+            setPhoneEntry(String(phoneJson.phone.phone_e164 || ""));
+            setPhoneCode(phoneJson.phone.verification_code || null);
+            setPhoneVerified(!!phoneJson.phone.verified_at);
+          }
+          await refreshBillingStatus();
         }
-        await refreshBillingStatus();
       } catch {
         // ignore
       } finally {
         setWorkspaceLoading(false);
       }
     })();
-  }, [isOpen]);
+  }, [edition.loading, edition.selfHosted, isOpen]);
 
   const requestHostedMacAction = async (action: "restart" | "update") => {
     setHostedMacActionLoading(action);
@@ -1441,6 +1503,10 @@ export function SettingsModal({
   };
 
   const setConnectorModePreference = async (next: "local" | "groovy") => {
+    if (edition.selfHosted && next === "groovy") {
+      setConnectorModeError("Groovy-hosted Macs are unavailable in the self-hosted edition.");
+      return;
+    }
     setConnectorModeSaving(true);
     setConnectorModeError(null);
     setConnectorMode(next);
@@ -1672,14 +1738,14 @@ export function SettingsModal({
   const handleSave = async () => {
     const keysToSave = Object.fromEntries(Object.entries(keys).filter(([, v]) => v && v.trim()));
 
-    // Validate: any provider set to "user" without an existing key must have a new key entered
-    for (const provider of PROVIDER_ORDER) {
-      const mode = perProviderModes[provider] || keyMode;
-      if (mode === "user" && !currentKeys[provider]?.configured && !keysToSave[provider]) {
-        const info = PROVIDER_INFO[provider];
-        setError(
-          `Missing ${info.name} key. Either paste it, or switch ${info.name} to ${providerManagedModeLabel(provider)}.`
-        );
+    if (!serverProviderKeysAllowed) {
+      const hasPrimaryKey = ["anthropic", "openai"].some(
+        (provider) =>
+          currentKeys[provider as Provider]?.configured ||
+          typeof keysToSave[provider] === "string"
+      );
+      if (!hasPrimaryKey) {
+        setError("Add an Anthropic or OpenAI API key so the orchestrator can run.");
         return;
       }
     }
@@ -1689,7 +1755,9 @@ export function SettingsModal({
     setSuccess(false);
     try {
       // Derive legacy global mode from non-headless providers only.
-      const effectiveGlobalMode: LlmKeyMode = PROVIDER_ORDER
+      const effectiveGlobalMode: LlmKeyMode = !serverProviderKeysAllowed
+        ? "user"
+        : PROVIDER_ORDER
         .filter((provider) => provider !== "claude_cli" && provider !== "codex_cli")
         .some((provider) => perProviderModes[provider] === "user")
         ? "user"
@@ -1966,6 +2034,17 @@ export function SettingsModal({
           : aiyraMicName
             ? `Pinned to ${aiyraMicName}, but it is not currently available. The connector will fall back to the computer microphone until it reappears.`
             : "Choose a specific microphone to pin by name.";
+  const canSelfUpdateActiveConnector =
+    connectorOnline === true &&
+    connectorSupportsInPlaceUpdate &&
+    !!onUpdateConnector;
+  const canSelfUpdateActiveHostedConnector =
+    connectorMode === "groovy" &&
+    isHostedConnectorActive &&
+    canSelfUpdateActiveConnector;
+  const canSelfUpdateLocalConnector =
+    connectorMode !== "groovy" &&
+    canSelfUpdateActiveConnector;
 
   if (!isOpen) return null;
 
@@ -2147,22 +2226,26 @@ export function SettingsModal({
               >
                 Local (your computer)
               </button>
-              <button
-                type="button"
-                onClick={() => setConnectorModePreference("groovy")}
-                disabled={connectorModeSaving || connectorMode === "groovy"}
-                className={`flex-1 px-4 py-2.5 rounded-lg border text-sm transition-all disabled:opacity-50 ${
-                  connectorMode === "groovy"
-                    ? "bg-cyan-500/15 border-cyan-500/40 text-cyan-200"
-                    : "bg-white/5 border-white/10 text-zinc-300 hover:bg-white/10"
-                }`}
-                title="Use the workspace Groovy Mac connector (shared)"
-              >
-                Groovy Mac (workspace)
-              </button>
+              {!edition.selfHosted ? (
+                <button
+                  type="button"
+                  onClick={() => setConnectorModePreference("groovy")}
+                  disabled={connectorModeSaving || connectorMode === "groovy"}
+                  className={`flex-1 px-4 py-2.5 rounded-lg border text-sm transition-all disabled:opacity-50 ${
+                    connectorMode === "groovy"
+                      ? "bg-cyan-500/15 border-cyan-500/40 text-cyan-200"
+                      : "bg-white/5 border-white/10 text-zinc-300 hover:bg-white/10"
+                  }`}
+                  title="Use the workspace Groovy Mac connector (shared)"
+                >
+                  Groovy Mac (workspace)
+                </button>
+              ) : null}
             </div>
             <div className="text-xs text-zinc-500 mt-3 leading-relaxed">
-              Local runs on your computer. Groovy Mac runs on a shared hosted machine for this workspace.
+              {edition.selfHosted
+                ? "The connector runs on your computer and connects to this deployment."
+                : "Local runs on your computer. Groovy Mac runs on a shared hosted machine for this workspace."}
             </div>
             {connectorModeError && (
               <div className="text-xs text-red-300 mt-2">{connectorModeError}</div>
@@ -2218,10 +2301,10 @@ export function SettingsModal({
             <div className="p-4 rounded-xl bg-black/30 border border-white/10">
               <div className="text-xs text-zinc-400 mb-2">Groovy Mac management</div>
               <div className="flex gap-2">
-                {connectorOnline && isHostedConnectorActive && onUpdateConnector && (
+                {canSelfUpdateActiveHostedConnector && (
                   <button
                     type="button"
-                    onClick={onUpdateConnector}
+                    onClick={() => onUpdateConnector?.()}
                     className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-200 hover:bg-amber-500/15 text-xs transition-all"
                     title="Self-update hosted connector and restart"
                   >
@@ -2291,17 +2374,22 @@ export function SettingsModal({
                           Update available
                         </div>
                         <div className="text-xs text-zinc-400 mt-1">
-                          You&apos;re on v{connectorVersion}. Latest is v{minConnectorVersion}. Local connectors
-                          auto-update in the background when idle.
+                          {connectorMode === "groovy"
+                            ? canSelfUpdateActiveHostedConnector
+                              ? `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Self-update hosted Mac to install the latest connector.`
+                              : `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Request update and we will handle it.`
+                            : canSelfUpdateLocalConnector
+                              ? `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Update now to install the latest connector, then it will restart itself.`
+                              : `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Download and install it once; future versions can update in place.`}
                         </div>
                       </div>
                       {connectorMode === "groovy" ? (
                         workspace?.role === "admin" ? (
-                          connectorOnline && isHostedConnectorActive && onUpdateConnector ? (
+                          canSelfUpdateActiveHostedConnector ? (
                             <button
                               type="button"
                               disabled={hostedMacActionLoading === "update"}
-                              onClick={onUpdateConnector}
+                              onClick={() => onUpdateConnector?.()}
                               className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 text-zinc-200 hover:bg-white/10 text-xs transition-all disabled:opacity-50"
                               title="Self-update the Groovy Mac connector now"
                             >
@@ -2321,6 +2409,16 @@ export function SettingsModal({
                             </button>
                           )
                         ) : null
+                      ) : canSelfUpdateLocalConnector ? (
+                        <button
+                          type="button"
+                          onClick={() => onUpdateConnector?.()}
+                          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 text-zinc-200 hover:bg-white/10 text-xs transition-all"
+                          title="Update the local connector and restart it"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          Update now
+                        </button>
                       ) : (
                         <a
                           href={connectorDownloadUrl || connectorGuide.downloadUrl}
@@ -2340,15 +2438,19 @@ export function SettingsModal({
                         <div className="mt-2 text-xs text-zinc-500 space-y-1 pl-3 border-l border-zinc-700">
                           <p>Hosted mode: no DMG download needed (this connector runs on Groovy Mac).</p>
                           <p>
-                            {connectorOnline && isHostedConnectorActive
+                            {canSelfUpdateActiveHostedConnector
                               ? 'Use "Self-update hosted Mac" to update and restart it.'
-                              : 'Hosted connector is not active here. Click "Request update" and we\'ll redeploy it.'}
+                              : 'Click "Request update" and we will redeploy it.'}
                           </p>
                           <p>If you want to update your own machine, switch to Local and use Download.</p>
                         </div>
                       ) : (
                         <div className="mt-2 text-xs text-zinc-500 space-y-1 pl-3 border-l border-zinc-700">
-                          <p>Local mode auto-updates in background. Use manual download only if needed.</p>
+                          <p>
+                            {canSelfUpdateLocalConnector
+                              ? "Local mode can update in place while the connector is online. Use manual download only if needed."
+                              : "This installed connector is too old to self-update. Install the latest connector manually once; future updates can run in place."}
+                          </p>
                           {connectorGuide.installSteps.map((stepText, idx) => (
                             <p key={`${connectorGuide.platform}-${idx}`}>{idx + 1}. {stepText}</p>
                           ))}
@@ -2936,7 +3038,9 @@ export function SettingsModal({
       <div>
         <h3 className="text-lg font-medium text-white mb-1">API Keys</h3>
         <p className="text-sm text-zinc-500">
-          Choose per provider. Add your own provider keys or use server environment keys in a self-hosted deployment. Codex CLI can use local login or an API key. Keys are encrypted with AES-256-GCM.
+          {serverProviderKeysAllowed
+            ? "Choose your key source per provider. This self-hosted deployment explicitly allows server environment keys."
+            : "Hosted Groovy uses your provider accounts directly. Add an Anthropic or OpenAI key for the orchestrator; other providers are optional. CLI agents may use their authenticated local login."} Keys are encrypted with AES-256-GCM.
         </p>
       </div>
 
@@ -2961,7 +3065,7 @@ export function SettingsModal({
                   )}
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <button
+                  {(serverProviderKeysAllowed || provider === "claude_cli" || provider === "codex_cli") && <button
                     type="button"
                     onClick={() => setPerProviderModes((prev) => ({ ...prev, [provider]: "groovy" }))}
                     className={`px-3 py-1.5 rounded-lg text-xs border transition-all ${
@@ -2971,7 +3075,7 @@ export function SettingsModal({
                     }`}
                   >
                     {managedModeLabel}
-                  </button>
+                  </button>}
                   <button
                     type="button"
                     onClick={() => setPerProviderModes((prev) => ({ ...prev, [provider]: "user" }))}
@@ -3601,7 +3705,11 @@ export function SettingsModal({
     <div className="space-y-6">
       <div>
         <h3 className="text-lg font-medium text-white mb-1">WhatsApp</h3>
-        <p className="text-sm text-zinc-500">Company WhatsApp, DM allowlist, phone verification, and groups.</p>
+        <p className="text-sm text-zinc-500">
+          {edition.selfHosted
+            ? "Manage the Personal WhatsApp groups used by your local connector."
+            : "Company WhatsApp, DM allowlist, phone verification, and groups."}
+        </p>
       </div>
 
       {workspaceLoading ? (
@@ -3612,7 +3720,7 @@ export function SettingsModal({
       ) : workspace ? (
         <div className="space-y-4">
           {/* Company WhatsApp setup */}
-          {workspace.role === "admin" && !companyWhatsappStatus && (
+          {!edition.selfHosted && workspace.role === "admin" && !companyWhatsappStatus && (
             <div className="p-4 rounded-xl bg-black/30 border border-white/10 space-y-3">
               <div className="text-sm text-zinc-300">Company WhatsApp (Kapso)</div>
               <div className="text-xs text-zinc-500">
@@ -3643,7 +3751,7 @@ export function SettingsModal({
           )}
 
           {/* Company WhatsApp status + allowlist */}
-          {workspace.role === "admin" && companyWhatsappStatus && (
+          {!edition.selfHosted && workspace.role === "admin" && companyWhatsappStatus && (
             <div className="p-4 rounded-xl bg-black/30 border border-white/10 space-y-3">
               <div className="text-sm text-zinc-300">
                 Company WhatsApp (Kapso) · <span className="text-zinc-400">{companyWhatsappStatus}</span>
@@ -3702,7 +3810,7 @@ export function SettingsModal({
           )}
 
           {/* Phone verification */}
-          {companyWhatsappStatus === "active" && (
+          {!edition.selfHosted && companyWhatsappStatus === "active" && (
             <div className="p-4 rounded-xl bg-black/30 border border-white/10 space-y-3">
               <div className="text-sm text-zinc-300">Verify your phone (DM access)</div>
               <div className="flex gap-2">
@@ -4274,6 +4382,13 @@ export function SettingsModal({
         return renderAiyraVoiceSection();
       case "api-keys":
         return renderApiKeysSection();
+      case "integrations":
+        return (
+          <IntegrationSettingsSection
+            currentSessionId={currentOrchestratorSessionId}
+            currentOrchestratorAgentId={currentOrchestratorAgentId}
+          />
+        );
       case "billing":
         return renderBillingSection();
       case "team":
@@ -4323,7 +4438,9 @@ export function SettingsModal({
           {/* Left sidebar */}
           <nav className="w-full md:w-56 border-b md:border-b-0 md:border-r border-white/10 py-2 md:py-4 px-3 shrink-0 overflow-x-auto md:overflow-y-auto">
             <div className="flex md:flex-col gap-1 min-w-max md:min-w-0">
-              {SECTION_NAV.map((section) => {
+              {SECTION_NAV.filter(
+                (section) => !edition.selfHosted || section.id !== "billing"
+              ).map((section) => {
                 const Icon = section.icon;
                 const isActive = activeSection === section.id;
                 return (

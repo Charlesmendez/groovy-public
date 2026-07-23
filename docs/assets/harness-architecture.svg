@@ -1,0 +1,61 @@
+<svg width="680" viewBox="0 0 680 536" role="img" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Groovy harness architecture</title>
+<desc>Four communication surfaces (team chat, dashboard, messaging, and a customer-facing API plus widget) feed into a company workspace containing personalizable harness profiles, a shared harness kernel, and worker agents.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#8888a0" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="680" height="536" rx="16" fill="#0a0a0f"/>
+<g>
+  <rect x="40" y="40" width="138" height="56" rx="8" fill="#0a2226" stroke="#00f0ff55" stroke-width="1"/>
+  <text x="109" y="63" text-anchor="middle" font-size="14" font-weight="600" fill="#aef7ff">Team chat</text>
+  <text x="109" y="81" text-anchor="middle" font-size="12" fill="#6fb9c4">channels + DMs</text>
+</g>
+<g>
+  <rect x="194" y="40" width="138" height="56" rx="8" fill="#0a2226" stroke="#00f0ff55" stroke-width="1"/>
+  <text x="263" y="63" text-anchor="middle" font-size="14" font-weight="600" fill="#aef7ff">Dashboard</text>
+  <text x="263" y="81" text-anchor="middle" font-size="12" fill="#6fb9c4">command center</text>
+</g>
+<g>
+  <rect x="348" y="40" width="138" height="56" rx="8" fill="#0a2226" stroke="#00f0ff55" stroke-width="1"/>
+  <text x="417" y="63" text-anchor="middle" font-size="14" font-weight="600" fill="#aef7ff">Messaging</text>
+  <text x="417" y="81" text-anchor="middle" font-size="12" fill="#6fb9c4">WhatsApp, Telegram</text>
+</g>
+<g>
+  <rect x="502" y="40" width="138" height="56" rx="8" fill="#2a1d08" stroke="#f59e0b66" stroke-width="1"/>
+  <text x="571" y="63" text-anchor="middle" font-size="14" font-weight="600" fill="#fcd38d">API + widget</text>
+  <text x="571" y="81" text-anchor="middle" font-size="12" fill="#c9a25e">your customers</text>
+</g>
+<line x1="109" y1="96" x2="109" y2="142" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="263" y1="96" x2="263" y2="142" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="417" y1="96" x2="417" y2="142" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="571" y1="96" x2="571" y2="142" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<rect x="40" y="150" width="600" height="338" rx="20" fill="#12121a" stroke="#ffffff1f" stroke-width="1"/>
+<text x="340" y="181" text-anchor="middle" font-size="14" font-weight="600" fill="#f0f0f5">Your company workspace</text>
+<g>
+  <rect x="80" y="196" width="240" height="56" rx="12" fill="#1d1030" stroke="#a855f766" stroke-width="1"/>
+  <text x="200" y="219" text-anchor="middle" font-size="14" font-weight="600" fill="#d8b4fe">Support harness</text>
+  <text x="200" y="237" text-anchor="middle" font-size="12" fill="#a78bca">persona, model, tool policy</text>
+</g>
+<g>
+  <rect x="360" y="196" width="240" height="56" rx="12" fill="#1d1030" stroke="#a855f766" stroke-width="1"/>
+  <text x="480" y="219" text-anchor="middle" font-size="14" font-weight="600" fill="#d8b4fe">Internal ops harness</text>
+  <text x="480" y="237" text-anchor="middle" font-size="12" fill="#a78bca">persona, model, tool policy</text>
+</g>
+<line x1="200" y1="252" x2="200" y2="288" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="480" y1="252" x2="480" y2="288" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<g>
+  <rect x="140" y="296" width="400" height="56" rx="8" fill="#1a1a24" stroke="#ffffff26" stroke-width="1"/>
+  <text x="340" y="319" text-anchor="middle" font-size="14" font-weight="600" fill="#f0f0f5">Shared harness kernel</text>
+  <text x="340" y="337" text-anchor="middle" font-size="12" fill="#8888a0">one brain: tools, memory, delegation</text>
+</g>
+<line x1="340" y1="352" x2="340" y2="404" stroke="#8888a0" stroke-width="1" marker-end="url(#arrow)"/>
+<g>
+  <rect x="140" y="412" width="400" height="56" rx="8" fill="#1a1a24" stroke="#ffffff26" stroke-width="1"/>
+  <text x="340" y="435" text-anchor="middle" font-size="14" font-weight="600" fill="#f0f0f5">Worker agents</text>
+  <text x="340" y="453" text-anchor="middle" font-size="12" fill="#8888a0">Claude Code, data, files, browser</text>
+</g>
+<rect x="142" y="503" width="10" height="10" rx="2" fill="#0a2226" stroke="#00f0ff55"/>
+<text x="158" y="512" text-anchor="start" font-size="12" fill="#8888a0">your team</text>
+<rect x="241" y="503" width="10" height="10" rx="2" fill="#2a1d08" stroke="#f59e0b66"/>
+<text x="257" y="512" text-anchor="start" font-size="12" fill="#8888a0">your customers</text>
+<rect x="372" y="503" width="10" height="10" rx="2" fill="#1d1030" stroke="#a855f766"/>
+<text x="388" y="512" text-anchor="start" font-size="12" fill="#8888a0">personalizable identity</text>
+</svg>

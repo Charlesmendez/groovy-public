@@ -191,6 +191,11 @@ type InboxActionRow = {
   updated_at: string;
 };
 
+type InsertInboxActionResult = {
+  row: InboxActionRow;
+  inserted: boolean;
+};
+
 type InboxCommandConfirmationPayload =
   | {
       kind: "approve" | "reject";
@@ -1625,7 +1630,7 @@ async function insertInboxAction(args: {
   draft?: { to: string[]; cc?: string[]; subject: string; body: string; gmailDraftId?: string | null } | null;
   metadata?: Record<string, unknown>;
   status?: ActionStatus;
-}): Promise<InboxActionRow | null> {
+}): Promise<InsertInboxActionResult | null> {
   const existing = await args.supabase
     .from("inbox_actions")
     .select("*")
@@ -1637,7 +1642,8 @@ async function insertInboxAction(args: {
     .maybeSingle();
 
   if (existing.data) {
-    return rowToInboxAction(existing.data);
+    const row = rowToInboxAction(existing.data);
+    return row ? { row, inserted: false } : null;
   }
 
   const payload: Record<string, unknown> = {
@@ -1672,7 +1678,10 @@ async function insertInboxAction(args: {
   };
 
   const inserted = await args.supabase.from("inbox_actions").insert(payload).select("*").maybeSingle();
-  if (inserted.data) return rowToInboxAction(inserted.data);
+  if (inserted.data) {
+    const row = rowToInboxAction(inserted.data);
+    return row ? { row, inserted: true } : null;
+  }
 
   if (inserted.error && /duplicate key|unique/i.test(inserted.error.message || "")) {
     const reRead = await args.supabase
@@ -1684,9 +1693,66 @@ async function insertInboxAction(args: {
       .eq("gmail_message_id", args.item.id)
       .eq("recommended_action", args.decision.action)
       .maybeSingle();
-    return rowToInboxAction(reRead.data);
+    const row = rowToInboxAction(reRead.data);
+    if (row) return { row, inserted: false };
+
+    if (args.decision.action === "draft_reply" && args.item.threadId) {
+      const reReadThread = await args.supabase
+        .from("inbox_actions")
+        .select("*")
+        .eq("user_id", args.userId)
+        .eq("provider", "gmail")
+        .eq("connection_id", args.item.connectionId)
+        .eq("gmail_thread_id", args.item.threadId)
+        .eq("recommended_action", "draft_reply")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const threadRow = rowToInboxAction(reReadThread.data);
+      if (threadRow) return { row: threadRow, inserted: false };
+    }
   }
   return null;
+}
+
+async function findExistingDraftReplyAction(args: {
+  supabase: SupabaseClient;
+  userId: string;
+  connectionId: string;
+  messageId: string;
+  threadId?: string | null;
+}): Promise<InboxActionRow | null> {
+  const messageId = toTrimmed(args.messageId);
+  if (messageId) {
+    const byMessage = await args.supabase
+      .from("inbox_actions")
+      .select("*")
+      .eq("user_id", args.userId)
+      .eq("provider", "gmail")
+      .eq("connection_id", args.connectionId)
+      .eq("gmail_message_id", messageId)
+      .eq("recommended_action", "draft_reply")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const row = rowToInboxAction(byMessage.data);
+    if (row) return row;
+  }
+
+  const threadId = toTrimmed(args.threadId);
+  if (!threadId) return null;
+  const byThread = await args.supabase
+    .from("inbox_actions")
+    .select("*")
+    .eq("user_id", args.userId)
+    .eq("provider", "gmail")
+    .eq("connection_id", args.connectionId)
+    .eq("gmail_thread_id", threadId)
+    .eq("recommended_action", "draft_reply")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return rowToInboxAction(byThread.data);
 }
 
 function rowToInboxAction(v: unknown): InboxActionRow | null {
@@ -2107,7 +2173,6 @@ async function syncSessionAliases(args: {
     .from("inbox_action_aliases_agent")
     .select("alias")
     .eq("user_id", args.userId)
-    .eq("agent_id", args.agentId)
     .order("alias", { ascending: false })
     .limit(1);
   const maxAliasRaw = Number((maxAliasRes.data?.[0] as { alias?: unknown } | undefined)?.alias);
@@ -2290,14 +2355,49 @@ function parseAliasNumbers(value: unknown, allowedAliases: Set<number>): number[
 
 function extractMentionedAliases(userText: string, allowedAliases: Set<number>): Set<number> {
   const out = new Set<number>();
-  const nums = toTrimmed(userText).match(/\d+/g) || [];
-  for (const n of nums) {
-    const alias = Number(n);
-    if (!Number.isFinite(alias) || alias <= 0) continue;
+  const nums = extractPositiveNumbers(userText);
+  for (const alias of nums) {
     if (!allowedAliases.has(alias)) continue;
     out.add(alias);
   }
   return out;
+}
+
+function extractPositiveNumbers(value: unknown): number[] {
+  const nums = toTrimmed(value).match(/\d+/g) || [];
+  const out: number[] = [];
+  for (const n of nums) {
+    const alias = Number(n);
+    if (!Number.isFinite(alias) || alias <= 0) continue;
+    out.push(alias);
+  }
+  return Array.from(new Set(out)).sort((a, b) => a - b);
+}
+
+function extractStrictInboxCommandAliases(userText: string): number[] {
+  const text = normalizeInboxCommandText(userText);
+  if (!text) return [];
+
+  const editMatch = text.match(/^\s*edit\s+#?(\d+)\s*:/i);
+  if (editMatch) return extractPositiveNumbers(editMatch[1]);
+
+  const singleAliasMatch = text.match(
+    /^\s*(?:why|draft|show\s+draft(?:\s+of)?)\s+#?(\d+)\s*(?:please|pls)?[.!]?\s*$/i
+  );
+  if (singleAliasMatch) return extractPositiveNumbers(singleAliasMatch[1]);
+
+  if (/\b(approve|reject|send)\b/i.test(text) && /#\d+/.test(text)) {
+    return Array.from(new Set(Array.from(text.matchAll(/#(\d+)/g)).map((m) => Number(m[1]))))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .sort((a, b) => a - b);
+  }
+
+  const actionMatch = text.match(/^\s*(?:approve|reject|send)\s+(.+?)\s*(?:please|pls)?[.!]?\s*$/i);
+  if (!actionMatch) return [];
+
+  const body = toTrimmed(actionMatch[1]);
+  if (!/^(?:\d+|\s|,|;|&|\band\b)+$/i.test(body)) return [];
+  return extractPositiveNumbers(body);
 }
 
 function parseBatchDecisions(
@@ -2376,6 +2476,113 @@ async function loadInboxAliasIntentContext(args: {
     .sort((a, b) => a.alias - b.alias);
 }
 
+async function recoverExplicitAliasesForAgent(args: {
+  supabase: SupabaseClient;
+  userId: string;
+  agentId: string;
+  userText: string;
+  targetAliases?: number[];
+  aliasContext: InboxAliasIntentContext[];
+}): Promise<InboxAliasIntentContext[]> {
+  const numbers = Array.isArray(args.targetAliases) ? args.targetAliases : extractStrictInboxCommandAliases(args.userText);
+  if (numbers.length === 0) return args.aliasContext;
+
+  const currentAliases = new Set(args.aliasContext.map((item) => item.alias));
+  const missingAliases = numbers.filter((alias) => !currentAliases.has(alias));
+  if (missingAliases.length === 0) return args.aliasContext;
+
+  const aliasRows = await args.supabase
+    .from("inbox_action_aliases_agent")
+    .select("alias,action_id,updated_at,created_at")
+    .eq("user_id", args.userId)
+    .in("alias", missingAliases)
+    .order("updated_at", { ascending: false })
+    .limit(COMMAND_LIST_MAX_ROWS * 10);
+
+  const candidates = (aliasRows.data || [])
+    .map((row) => ({
+      alias: Number((row as { alias?: unknown }).alias),
+      actionId: toTrimmed((row as { action_id?: unknown }).action_id),
+      updatedAt: toTrimmed((row as { updated_at?: unknown }).updated_at),
+      createdAt: toTrimmed((row as { created_at?: unknown }).created_at),
+    }))
+    .filter((row) => Number.isFinite(row.alias) && row.alias > 0 && row.actionId);
+  if (candidates.length === 0) return args.aliasContext;
+
+  const actionIds = Array.from(new Set(candidates.map((row) => row.actionId)));
+  const actionRows = await args.supabase
+    .from("inbox_actions")
+    .select("id,recommended_action,status,subject")
+    .eq("user_id", args.userId)
+    .in("id", actionIds);
+
+  const actionById = new Map<string, { action: string; status: string; subject: string }>();
+  for (const row of actionRows.data || []) {
+    const rec = asRecord(row) || {};
+    const id = toTrimmed(rec.id);
+    if (!id) continue;
+    actionById.set(id, {
+      action: toTrimmed(rec.recommended_action) || "unknown",
+      status: toTrimmed(rec.status) || "unknown",
+      subject: toTrimmed(rec.subject) || "(no subject)",
+    });
+  }
+
+  const adoptedActionIds: string[] = [];
+  for (const alias of missingAliases) {
+    const aliasCandidates = candidates
+      .filter((row) => row.alias === alias && actionById.has(row.actionId))
+      .sort((a, b) => {
+        const aTime = Date.parse(a.updatedAt || a.createdAt || "");
+        const bTime = Date.parse(b.updatedAt || b.createdAt || "");
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+      });
+    if (aliasCandidates.length === 0) continue;
+    const pending = aliasCandidates.filter((row) => actionById.get(row.actionId)?.status === "pending");
+    const eligible = pending.length > 0 ? pending : aliasCandidates;
+    const uniqueActionIds = Array.from(new Set(eligible.map((row) => row.actionId)));
+    if (uniqueActionIds.length === 1) {
+      adoptedActionIds.push(uniqueActionIds[0]);
+      continue;
+    }
+
+    console.warn("[inbox-actions] ambiguous alias recovery skipped", {
+      userId: args.userId,
+      agentId: args.agentId,
+      alias,
+      candidateCount: uniqueActionIds.length,
+    });
+  }
+
+  const existingActionIds = args.aliasContext.map((item) => item.actionId).filter(Boolean);
+  const syncActionIds = Array.from(new Set([...existingActionIds, ...adoptedActionIds]));
+  if (adoptedActionIds.length === 0 || syncActionIds.length === existingActionIds.length) {
+    return args.aliasContext;
+  }
+
+  await syncSessionAliases({
+    supabase: args.supabase,
+    userId: args.userId,
+    agentId: args.agentId,
+    actionIds: syncActionIds,
+  });
+
+  const recovered = await loadInboxAliasIntentContext({
+    supabase: args.supabase,
+    userId: args.userId,
+    agentId: args.agentId,
+  });
+  if (recovered.length > args.aliasContext.length) {
+    console.log("[inbox-actions] recovered explicit aliases from another agent scope", {
+      userId: args.userId,
+      agentId: args.agentId,
+      aliases: missingAliases,
+      recoveredAliases: recovered.length,
+    });
+  }
+  return recovered.length > 0 ? recovered : args.aliasContext;
+}
+
 async function resolveInboxCommandIntentModel(args: {
   supabase: SupabaseClient;
   userId: string;
@@ -2435,7 +2642,7 @@ function parseDeterministicInboxCommand(args: {
   const actionVerbMatches = Array.from(text.matchAll(/\b(approve|reject|send)\b/gi));
   if (actionVerbMatches.length === 1) {
     const verb = normalizeKey(actionVerbMatches[0]?.[1] || "");
-    const aliases = parseAliasNumbers(text, args.allowedAliases);
+    const aliases = extractStrictInboxCommandAliases(text).filter((alias) => args.allowedAliases.has(alias));
     if (aliases.length > 0) {
       if (verb === "approve" || verb === "reject") {
         return { kind: verb, aliases, all: false };
@@ -2467,6 +2674,10 @@ function parseAiInboxCommandObject(args: {
     if (!kind || kind === "none" || kind === "multi") return null;
 
     const mentionedAliases = extractMentionedAliases(args.userText, args.allowedAliases);
+    const strictMentionedAliases = new Set(
+      extractStrictInboxCommandAliases(args.userText).filter((alias) => args.allowedAliases.has(alias))
+    );
+    const hasAllowedNumberMention = mentionedAliases.size > 0;
     const mentionsAll = /\ball\b/i.test(args.userText);
 
     if (kind === "show") return { kind: "show" };
@@ -2491,18 +2702,31 @@ function parseAiInboxCommandObject(args: {
     if (kind === "approve" || kind === "reject") {
       const aliases = parseAliasNumbers(raw.aliases ?? raw.alias, args.allowedAliases);
       if (aliases.length === 0) return null;
+      if (hasAllowedNumberMention && strictMentionedAliases.size === 0 && !mentionsAll) return null;
+      if (strictMentionedAliases.size > 0 && !mentionsAll && aliases.some((alias) => !strictMentionedAliases.has(alias)))
+        return null;
       if (mentionedAliases.size > 0 && !mentionsAll && aliases.some((alias) => !mentionedAliases.has(alias))) return null;
       return { kind, aliases, all: false };
     }
     if (kind === "confirm_send") {
       const aliases = parseAliasNumbers(raw.aliases ?? raw.alias, args.allowedAliases);
       if (aliases.length === 0) return null;
+      if (hasAllowedNumberMention && strictMentionedAliases.size === 0 && !mentionsAll) return null;
+      if (strictMentionedAliases.size > 0 && !mentionsAll && aliases.some((alias) => !strictMentionedAliases.has(alias)))
+        return null;
       if (!mentionsAll && aliases.some((alias) => !mentionedAliases.has(alias))) return null;
       return { kind: "confirm_send", aliases };
     }
     if (kind === "batch") {
       const decisions = parseBatchDecisions(raw.decisions, args.allowedAliases);
       if (decisions.length === 0) return null;
+      if (hasAllowedNumberMention && strictMentionedAliases.size === 0 && !mentionsAll) return null;
+      if (
+        strictMentionedAliases.size > 0 &&
+        !mentionsAll &&
+        decisions.some((decision) => !strictMentionedAliases.has(decision.alias))
+      )
+        return null;
       if (mentionedAliases.size > 0 && !mentionsAll && decisions.some((decision) => !mentionedAliases.has(decision.alias)))
         return null;
       return { kind: "batch", decisions };
@@ -2594,9 +2818,19 @@ async function parseInboxCommandWithAi(args: {
     agentId: args.agentId,
   });
   const hasShowRequest = /\b(show|list|pending)\s+actions?\b/i.test(userText);
-  const looksLikeNumberedCommand =
-    /#?\d+/.test(userText) &&
-    /\b(approve|reject|edit|send|draft|why|show|list|pending)\b/i.test(userText);
+  const looksLikeScopedBulkCommand = messageLooksLikeScopedBulkInboxCommand(userText);
+  const explicitAliasTargets = extractStrictInboxCommandAliases(userText);
+  const looksLikeNumberedCommand = explicitAliasTargets.length > 0;
+  if (looksLikeNumberedCommand) {
+    aliasContext = await recoverExplicitAliasesForAgent({
+      supabase: args.supabase,
+      userId: args.userId,
+      agentId: args.agentId,
+      userText,
+      targetAliases: explicitAliasTargets,
+      aliasContext,
+    });
+  }
   if (aliasContext.length === 0) {
     // Best-effort: aliases can be missing/stale if a user issues commands before the action block was rendered.
     const pendingRes = await args.supabase
@@ -2624,7 +2858,7 @@ async function parseInboxCommandWithAi(args: {
       });
     }
   }
-  if (aliasContext.length === 0 && (hasShowRequest || looksLikeNumberedCommand)) {
+  if (aliasContext.length === 0 && (hasShowRequest || looksLikeNumberedCommand || looksLikeScopedBulkCommand)) {
     // Cross-agent recovery: if alias state is stale, recover from current pending actions.
     const crossPendingRes = await args.supabase
       .from("inbox_actions")
@@ -2652,7 +2886,7 @@ async function parseInboxCommandWithAi(args: {
     let adoptedActionIds: string[] = [];
     let adoptedFromAgentId = "";
     const uniquePendingIds = Array.from(new Set(allPendingIds));
-    const allowMultiAdopt = hasShowRequest;
+    const allowMultiAdopt = hasShowRequest || looksLikeScopedBulkCommand;
     if (uniquePendingIds.length === 1) {
       adoptedActionIds = uniquePendingIds;
       const oneAgent = Array.from(pendingByAgent.keys())[0];
@@ -2712,6 +2946,16 @@ async function parseInboxCommandWithAi(args: {
       }
     }
   }
+  if (looksLikeNumberedCommand) {
+    aliasContext = await recoverExplicitAliasesForAgent({
+      supabase: args.supabase,
+      userId: args.userId,
+      agentId: args.agentId,
+      userText,
+      targetAliases: explicitAliasTargets,
+      aliasContext,
+    });
+  }
   if (aliasContext.length === 0) {
     return {
       command: hasShowRequest ? { kind: "show" } : null,
@@ -2765,7 +3009,9 @@ Rules:
 - Never infer approvals/rejections/sends from context or sentiment.
 - Only use aliases from the allowed aliases list.
 - For send, use kind="confirm_send" and ONLY when user explicitly asks to send.
-- For approve/reject: if the user is explicit but does not name action numbers, you MAY select matching aliases from the alias context (e.g. "approve unsubscribes", "reject archives", "approve everything").
+- For approve/reject: when the user is explicit but does not name action numbers, select matching aliases from the alias context.
+- Map natural action words to Alias context action values: "drafts" / "draft replies" => action=draft_reply; "unsubscribe", "unsubscribes", "unsubs", and misspellings like "unsubcribes" => action=unsubscribe; "spam" / "junk" => action=mark_spam; "archive" / "keep in inbox" => action=archive; "label" / "label only" => action=label_only; "everything" / "all" => every allowed pending alias.
+- Example: if the user says "reject all drafts and approve all unsubcribes", return kind="batch" with reject decisions for all action=draft_reply aliases and approve decisions for all action=unsubscribe aliases.
 - confirm_send still requires explicit action numbers.
 - For mixed approve/reject in one message, use kind="batch" with explicit decisions.
 - For "show actions", use kind="show".
@@ -2863,6 +3109,14 @@ function messageMentionsInboxActions(text: string): boolean {
   if (/\b(actions?|drafts?|approve|reje(?:ct|ction)|unsubscribe|archive)\b/i.test(raw) && /#?\d+/.test(raw))
     return true;
   return false;
+}
+
+function messageLooksLikeScopedBulkInboxCommand(text: string): boolean {
+  const raw = normalizeInboxCommandText(text);
+  if (!raw) return false;
+  if (!/\b(?:approve|reject)\b/i.test(raw)) return false;
+  if (!/\ball\b/i.test(raw)) return false;
+  return /\b(?:drafts?|unsub(?:s|scribes?|scribe|scribed|criptions?|cribes?|cribe)?|spam|junk|archive|archives|labels?|rest|others?|everything)\b/i.test(raw);
 }
 
 export async function applyPendingInboxActionSilencePolicy(args: {
@@ -3194,12 +3448,28 @@ export async function executeInboxCommand(args: {
       parsed = { kind: "multi", commands: [...editCommands, parsed] };
     }
   }
+  if (!parsed && !followupText) {
+    const normalized = normalizeInboxCommandText(args.text);
+    const explicitNumbers = extractStrictInboxCommandAliases(normalized);
+    if (explicitNumbers.length > 0) {
+      const explicitNumberSet = new Set(explicitNumbers);
+      const unscopedDeterministic = parseDeterministicInboxCommand({
+        userText: normalized,
+        allowedAliases: explicitNumberSet,
+      });
+      if (unscopedDeterministic) {
+        parsed = unscopedDeterministic;
+      }
+    }
+  }
   if (!parsed) {
     const raw = toTrimmed(args.text);
+    const looksLikeScopedBulkCommand = messageLooksLikeScopedBulkInboxCommand(raw);
     const looksLikeInboxCommand =
-      /#?\d+/.test(raw) &&
-      /\b(approve|reject|edit|send|draft|why|show|list|pending)\b/i.test(raw) &&
-      messageMentionsInboxActions(raw);
+      looksLikeScopedBulkCommand ||
+      (/#?\d+/.test(raw) &&
+        /\b(approve|reject|edit|send|draft|why|show|list|pending)\b/i.test(raw) &&
+        messageMentionsInboxActions(raw));
     if (!looksLikeInboxCommand) return { handled: false, reply: "" };
     return {
       handled: true,
@@ -4106,6 +4376,7 @@ export async function runInboxTriageForHeartbeat(args: {
   const keyCache = new Map<string, string>();
   const affinityCache = new Map<string, SenderAffinity>();
   const intelCache = new Map<string, SenderIntel>();
+  const draftReplyScopeClaims = new Set<string>();
 
   const pendingActionIds: string[] = [];
   let autoExecutedCount = 0;
@@ -4319,50 +4590,45 @@ export async function runInboxTriageForHeartbeat(args: {
         }
         const replyBody = rawDraft ? appendGroovyEmailSendNotice(rawDraft) : "";
         if (decision.action === "draft_reply" && replyBody && draftTo.length > 0) {
-          const created = await createGmailDraft({
-            datagranApiKey: dgKey,
+          const draftScopeThreadId = targetThreadIdForDraft || item.threadId || "";
+          const draftScopeKey = `${item.connectionId}:${draftScopeThreadId || `message:${item.id}`}`;
+          if (draftReplyScopeClaims.has(draftScopeKey)) {
+            notes.push(
+              `${item.mailboxLabel}: draft_reply skipped for "${item.subject}" (draft already queued for this thread in this heartbeat)`
+            );
+            return;
+          }
+          draftReplyScopeClaims.add(draftScopeKey);
+
+          const existingDraftAction = await findExistingDraftReplyAction({
+            supabase: args.supabase,
+            userId: args.userId,
             connectionId: item.connectionId,
-            threadId: targetThreadIdForDraft,
-            to: draftTo.join(", "),
-            cc: draftCc.join(", "),
-            subject: draftSubject,
-            body: replyBody,
-            inReplyTo: targetMessageIdHeaderForDraft,
-            references: targetMessageIdHeaderForDraft,
+            messageId: item.id,
+            threadId: draftScopeThreadId,
           });
-          const createdDraftId = created.ok ? created.draftId || null : null;
+          if (existingDraftAction) {
+            if (existingDraftAction.status === "pending" && !pendingActionIds.includes(existingDraftAction.id)) {
+              pendingActionIds.push(existingDraftAction.id);
+            }
+            notes.push(
+              `${item.mailboxLabel}: draft_reply skipped for "${item.subject}" (draft action already exists for this thread)`
+            );
+            return;
+          }
+
           draftInfo = {
             to: draftTo,
             cc: draftCc,
             subject: draftSubject,
             body: replyBody,
-            gmailDraftId: createdDraftId,
+            gmailDraftId: null,
           };
-          if (createdDraftId) {
-            let labels = labelCache.get(item.connectionId);
-            if (!labels) {
-              labels = await ensureGroovyLabels({
-                datagranApiKey: dgKey,
-                connectionId: item.connectionId,
-              });
-              labelCache.set(item.connectionId, labels);
-            }
-            await modifyGmailMessageLabels({
-              datagranApiKey: dgKey,
-              connectionId: item.connectionId,
-              messageId: item.id,
-              addLabelIds: [labels[GROOVY_LABEL_DRAFTED]].filter(Boolean),
-            });
-          } else if (!created.ok) {
-            notes.push(
-              `${item.mailboxLabel}: draft pre-create failed for "${item.subject}" (${created.error || "unknown error"})`
-            );
-          }
         }
       }
     }
 
-    const actionRow = await insertInboxAction({
+    const actionWrite = await insertInboxAction({
       supabase: args.supabase,
       userId: args.userId,
       agentId: args.agentId || null,
@@ -4392,7 +4658,55 @@ export async function runInboxTriageForHeartbeat(args: {
       status: "pending",
     });
 
-    if (!actionRow) return;
+    if (!actionWrite) return;
+    let actionRow = actionWrite.row;
+    if (decision.action === "draft_reply" && draftInfo && actionWrite.inserted) {
+      const created = await createGmailDraft({
+        datagranApiKey: dgKey,
+        connectionId: item.connectionId,
+        threadId: targetThreadIdForDraft,
+        to: draftInfo.to.join(", "),
+        cc: (draftInfo.cc || []).join(", "),
+        subject: draftInfo.subject,
+        body: draftInfo.body,
+        inReplyTo: targetMessageIdHeaderForDraft,
+        references: targetMessageIdHeaderForDraft,
+      });
+      const createdDraftId = created.ok ? created.draftId || null : null;
+      if (createdDraftId) {
+        await args.supabase
+          .from("inbox_actions")
+          .update({
+            gmail_draft_id: createdDraftId,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", actionRow.id)
+          .eq("user_id", args.userId);
+        actionRow = {
+          ...actionRow,
+          gmail_draft_id: createdDraftId,
+        };
+        let labels = labelCache.get(item.connectionId);
+        if (!labels) {
+          labels = await ensureGroovyLabels({
+            datagranApiKey: dgKey,
+            connectionId: item.connectionId,
+          });
+          labelCache.set(item.connectionId, labels);
+        }
+        await modifyGmailMessageLabels({
+          datagranApiKey: dgKey,
+          connectionId: item.connectionId,
+          messageId: item.id,
+          addLabelIds: [labels[GROOVY_LABEL_DRAFTED]].filter(Boolean),
+        });
+      } else if (!created.ok) {
+        notes.push(
+          `${item.mailboxLabel}: draft pre-create failed for "${item.subject}" (${created.error || "unknown error"})`
+        );
+      }
+    }
+
     const auto = decision.autoExecute === true;
     if (!auto) {
       if (actionRow.status === "pending" && actionRow.run_id === runId) {
@@ -4553,4 +4867,3 @@ export async function buildHeartbeatActionBlock(args: {
     aliases: mappings,
   };
 }
-

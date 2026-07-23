@@ -7,23 +7,31 @@ Use three repositories:
 | Repository | Visibility | Purpose |
 | --- | --- | --- |
 | `Charlesmendez/groovy` | Private | Current production source, Vercel deployment, paid source snapshots, internal development. |
-| `Charlesmendez/groovy-public` | Public | Delayed source-available mirror, public issues, public pull requests, security review, evaluation. |
+| `Charlesmendez/groovy-public` | Public | Release-synchronized source-available mirror, public issues, public pull requests, security review, evaluation. |
 | `Charlesmendez/groovy-releases` | Private | Internal connector release artifact staging for signed installers, checksums, and headless tarballs. |
 
-`groovy` is the source of truth. `groovy-public` is a delayed mirror. Never automatically merge public mirror code back into private source.
+`groovy` is the source of truth. `groovy-public` mirrors reviewed source
+releases, not every private development commit. Never automatically merge
+public mirror code back into private source.
 
 ## Public Mirror Publishing
 
 The private repo contains `.github/workflows/publish-public-mirror.yml`.
 
-It publishes delayed source from private `groovy` to public `groovy-public`.
+Pushing a tag matching `source-v*` publishes that exact source snapshot from
+private `groovy` to public `groovy-public`. The public workflow normally starts
+within seconds of the tag push and finishes asynchronously; the repositories
+are synchronized at the release level, not by an atomic cross-repository
+transaction.
 
 Default behavior:
 
-- Weekly scheduled run.
-- Looks for the newest source tag matching `source-v*` that is older than `90` days.
-- Publishes that tag to `groovy-public`.
-- If no eligible tag exists during scheduled runs, it exits without publishing.
+- A `source-v*` tag push starts publication immediately.
+- A weekly reconciliation run republishes the newest `source-v*` tag if the
+  immediate run failed or was missed.
+- If no matching tag exists during reconciliation, the workflow exits without
+  publishing.
+- Public tags are named `public-source-v*` and are immutable.
 
 Manual behavior:
 
@@ -33,7 +41,6 @@ Manual behavior:
 4. Click **Run workflow**.
 5. Optional inputs:
    - `source_ref`: a release tag or commit SHA to publish.
-   - `delay_days`: default `90`.
    - `tag_pattern`: default `source-v*`.
    - `target_repo`: default `Charlesmendez/groovy-public`.
 
@@ -43,14 +50,22 @@ The workflow uses:
 - private repo secret `PUBLIC_MIRROR_SSH_KEY`
 - script `scripts/publish-public-mirror.mjs`
 
-The public mirror publisher excludes local/env/build/deployment-only files such as `.env*`, `.vercel`, `.next`, connector build output, and private release/deploy workflows.
+The public mirror publisher excludes local/env/build/deployment-only files such
+as `.env*`, `.vercel`, `.next`, connector build output, internal agent
+instructions, and private release/deploy workflows.
+
+Treat a `source-v*` tag as a public release approval. Review the exact tagged
+tree for secrets, customer data, private-only workflows, and unfinished
+licensed material before pushing it. If a published source tag is wrong, create
+a corrected release tag; the mirror publisher refuses to move an existing
+public release tag.
 
 ## Source Tags
 
 Use dedicated source snapshot tags in the private `groovy` repo:
 
 ```bash
-git tag -a source-v1.2.3 -m "Paid source snapshot v1.2.3"
+git tag -a source-v1.2.3 -m "Groovy source release v1.2.3"
 git push origin source-v1.2.3
 ```
 
@@ -66,7 +81,7 @@ Allowed public contribution types:
 - examples
 - SDKs
 - small bug fixes
-- tests that apply to the delayed source
+- tests that apply to the current public release
 - security reports through the security policy
 
 Do not use the public repo as the private development trunk.
@@ -79,11 +94,17 @@ To bring a public PR into private `groovy`:
 4. Resolve conflicts against current private source.
 5. Run tests.
 6. Merge into private `groovy` through the normal private PR flow.
-7. Let the change appear in `groovy-public` later through the delayed mirror workflow.
+7. Include the accepted change in the next `source-v*` release; that tag push
+   publishes it to `groovy-public`.
 
 ## Paid Customer Source Access
 
-Personal paid users should receive source through Groovy portal/CLI source snapshots, not private GitHub collaborator access.
+Public source visibility is not a usage license. Personal and enterprise users
+can inspect and clone the public release, while the Groovy license controls
+whether and how they may run, deploy, modify, host, or commercialize it.
+
+Personal paid users may receive convenient packaged source snapshots through
+the Groovy portal/CLI, but they do not need private GitHub collaborator access.
 
 Enterprise customers should also receive source through portal/CLI snapshots by default.
 
@@ -120,6 +141,8 @@ Public `groovy-public`:
 - Require PR review.
 - Require conversation resolution.
 - Disable force pushes and branch deletion.
+- Allow the configured mirror deploy key or bot to update `main` without
+  weakening contributor pull-request requirements.
 - Require first-time contributor approval for fork pull request workflows.
 - Enable secret scanning and Dependabot alerts.
 

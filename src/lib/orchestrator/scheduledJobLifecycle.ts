@@ -20,6 +20,31 @@ export async function rehomeScheduledJobsForDeletedAgent(args: {
   deletedAgentId: string;
 }): Promise<void> {
   const { supabase, userId, deletedAgentId } = args;
+
+  // Worker-targeted jobs: clear the target explicitly (don't rely on FK
+  // ordering) and leave an audit note so the UI can explain the retarget.
+  // The job then falls back to the orchestrator on its next tick.
+  const { data: targetedJobs } = await supabase
+    .from("scheduled_jobs")
+    .select("id,task")
+    .eq("user_id", userId)
+    .eq("target_agent_id", deletedAgentId);
+  for (const job of targetedJobs || []) {
+    const taskObj = { ...(asObject(job.task) || {}) };
+    const options = { ...(asObject(taskObj.options) || {}) };
+    options.retargeted_from = deletedAgentId;
+    taskObj.options = options;
+    await supabase
+      .from("scheduled_jobs")
+      .update({
+        target_agent_id: null,
+        task: taskObj,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job.id)
+      .eq("user_id", userId);
+  }
+
   const { data: jobs, error } = await supabase
     .from("scheduled_jobs")
     .select("id,kind,agent_id,task")

@@ -6,6 +6,8 @@ import { isWindows } from "../detect.mjs";
 import { killProcessTree } from "../process/index.mjs";
 import { prepareSpawnEnv } from "../shell/index.mjs";
 
+const DEFAULT_CODE_AGENT_TIMEOUT_MS = 20 * 60 * 1000;
+
 function quoteWindowsArg(arg) {
   const s = String(arg ?? "");
   if (!s) return '""';
@@ -80,6 +82,15 @@ function addCodexExecutionMode(args, options = {}) {
   args.push("--dangerously-bypass-approvals-and-sandbox");
 }
 
+function addCodexReasoningEffort(args, options = {}) {
+  const effort = String(options.reasoningEffort || "").trim();
+  if (!effort) return;
+  if (!["none", "low", "medium", "high", "xhigh", "max"].includes(effort)) {
+    throw new Error("invalid_reasoning_effort");
+  }
+  args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
+}
+
 // Track the previous turn's plan-mode state per Codex session so we can cue
 // the model when the user toggles plan mode off mid-conversation. Without
 // this hint, the planning instruction prepended on the prior turn lingers in
@@ -113,6 +124,7 @@ function buildCodexArgs(options) {
     // spawn cwd must match the original session's workspace.
     const args = ["exec", "resume", String(options.sessionId)];
     if (options.model) args.push("-m", String(options.model));
+    addCodexReasoningEffort(args, options);
     addCodexExecutionMode(args, options);
     args.push("--json");
     args.push("--skip-git-repo-check");
@@ -122,6 +134,7 @@ function buildCodexArgs(options) {
 
   const args = ["exec"];
   if (options.model) args.push("-m", String(options.model));
+  addCodexReasoningEffort(args, options);
   if (options.cwd) args.push("--cd", String(options.cwd));
   addCodexExecutionMode(args, options);
   args.push("--json");
@@ -949,7 +962,7 @@ function spawnOnce({
       timedOut = true;
       timeoutError = `codex_run timed out after ${timeoutMs}ms`;
       void stopChildAndRejectIfNeeded(timeoutError);
-    }, Math.max(1000, Number(timeoutMs) || 5 * 60 * 1000));
+    }, Math.max(1000, Number(timeoutMs) || DEFAULT_CODE_AGENT_TIMEOUT_MS));
   });
 }
 
@@ -961,7 +974,7 @@ export async function runHeadlessCodex(options = {}) {
 
   const codexBin = String(options.codexBin || "codex").trim() || "codex";
   const cwd = normalizeCwd(options.cwd);
-  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || 5 * 60 * 1000);
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_CODE_AGENT_TIMEOUT_MS);
   const env = prepareSpawnEnv({ ...process.env, ...(options.env || {}) });
 
   // With no explicit key, Codex CLI uses the connector machine's cached

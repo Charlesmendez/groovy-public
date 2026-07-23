@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { syncWorkspaceAddonSubscriptionBestEffort } from "@/lib/billing/addons";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type Body = {
   phone_e164?: string;
@@ -14,17 +15,29 @@ function normalizeE164(value: unknown): string | null {
 }
 
 export async function GET() {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   try {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
     const { data: membership } = await admin
       .from("workspace_members")
-      .select("workspace_id")
+      .select("workspace_id, role")
       .eq("user_id", user.id)
       .limit(1)
       .single();
     if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    }
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
     }
     const { data, error } = await admin
       .from("workspace_whatsapp_allowlist")
@@ -43,6 +56,12 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as Body | null;
@@ -109,6 +128,12 @@ export async function POST(req: Request) {
 }
 
 export async function DELETE(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Company WhatsApp is unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   try {
     const user = await getAuthedUser();
     const { searchParams } = new URL(req.url);

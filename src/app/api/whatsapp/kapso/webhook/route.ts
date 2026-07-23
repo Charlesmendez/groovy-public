@@ -7,9 +7,17 @@ import {
   resolveRuntimeScope,
 } from "@/lib/orchestrator/runtimeGraph";
 import { sendKapsoText } from "@/lib/whatsapp/kapso";
+import { resolveUserDeviceId } from "@/lib/devices/resolveUserDeviceId";
+import { getAppUrl } from "@/lib/config/appConfig";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+// The connector loop can drive long local tool runs (claude_run up to 10 min).
+export const maxDuration = 800;
 import { createHmac, timingSafeEqual } from "crypto";
 import { logError, logInfo, logWarn, safeTextPreview } from "@/lib/observability/log";
 import { syncWorkspaceAddonSubscriptionBestEffort } from "@/lib/billing/addons";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type KapsoWebhookBody = Record<string, unknown>;
 
@@ -128,6 +136,12 @@ async function getOrCreateSessionId(supabase: ReturnType<typeof createSupabaseAd
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Kapso webhooks are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   const webhookEvent = (req.headers.get("x-webhook-event") || "").trim() || null;
   const idempotencyKey = (req.headers.get("x-idempotency-key") || "").trim() || null;
@@ -324,6 +338,23 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, ignored: true });
     }
 
+    // Agent-task approval commands ("approve <task-id-prefix>") short-circuit
+    // before an orchestrator round.
+    {
+      const { executeAgentTaskCommand } = await import("@/lib/orchestrator/agentTasks");
+      const command = await executeAgentTaskCommand({
+        userId: allow.user_id,
+        text,
+        decidedBy: "whatsapp_kapso",
+      }).catch(() => ({ handled: false as const }));
+      if (command.handled) {
+        if (command.reply) {
+          await sendKapsoText({ phoneNumberId, to: from, body: command.reply }).catch(() => {});
+        }
+        return NextResponse.json({ ok: true, taskCommand: true });
+      }
+    }
+
     const threadKey = `${allow.user_id}:${from}`;
     const sessionId = await getOrCreateSessionId(supabase, {
       userId: allow.user_id,
@@ -395,17 +426,83 @@ export async function POST(req: Request) {
       user_id: allow.user_id,
       session_id: sessionId,
     });
-    const round = await runOrchestratorRound({
+    // Resolve the user's connector device so local tools work from WhatsApp
+    // (full remote control): preferred device from onboarding prefs, else the
+    // most recently seen device.
+    const deviceId = await resolveUserDeviceId(supabase, allow.user_id);
+
+    const roundArgs = {
       supabase,
       userId: allow.user_id,
-      appBaseUrl: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
-      history: [...history, { role: "user", content: text }],
-      message: text,
+      appBaseUrl: getAppUrl(),
       orchestratorAgentId: runtimeScope?.agentId || null,
       orchestratorSessionId: sessionId,
+      sourceProvider: "whatsapp_kapso",
+      sourceThreadKey: threadKey,
       branchCurrentTurnCount: runtimeScope?.branchTurnCount ?? null,
       branchActiveCount: runtimeScope?.activeBranchCount ?? null,
+      deviceId: deviceId || undefined,
+      taskNotifyTargets: {
+        whatsapp_kapso: { phoneNumberId, to: from },
+      },
+      taskRequestedChannel: "whatsapp_kapso",
+    };
+
+    let round = await runOrchestratorRound({
+      ...roundArgs,
+      history: [...history, { role: "user", content: text }],
+      message: text,
     });
+
+    // Bounded connector loop: previously `needs_connector` rounds were dropped
+    // (Kapso replies could never drive local tools). Execute them over the
+    // relay internal RPC and continue the round with the tool results.
+    const MAX_CONNECTOR_ROUNDS = 6;
+    let loopHistory = [...history, { role: "user" as const, content: text }];
+    for (
+      let i = 0;
+      round.kind === "needs_connector" && deviceId && i < MAX_CONNECTOR_ROUNDS;
+      i++
+    ) {
+      const { callConnectorRpcViaRelay } = await import("@/lib/relay/connectorRpc");
+      const toolResults: Array<{ toolCallId: string; toolName: string; result: string }> = [];
+      for (const execute of round.connectorExecutes) {
+        let rpcResult: Record<string, unknown>;
+        try {
+          rpcResult = await callConnectorRpcViaRelay({
+            userId: allow.user_id,
+            deviceId,
+            rpcType: execute.connectorType,
+            payload: execute.connectorParams,
+            timeoutMs: execute.connectorType === "claude_run" ? 10 * 60 * 1000 : 3 * 60 * 1000,
+          });
+        } catch (error) {
+          rpcResult = {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        toolResults.push({
+          toolCallId: execute.toolCallId,
+          toolName: execute.toolName,
+          result: JSON.stringify(rpcResult),
+        });
+      }
+      const resultsMessage = {
+        role: "user" as const,
+        content: `[SYSTEM: Tool execution results from the local connector]\n\n${toolResults
+          .map((tr) => `<tool_result name="${tr.toolName}" tool_call_id="${tr.toolCallId}">\n${tr.result.slice(0, 8000)}\n</tool_result>`)
+          .join("\n\n")}`,
+      };
+      loopHistory = [...loopHistory, resultsMessage];
+      round = await runOrchestratorRound({
+        ...roundArgs,
+        history: loopHistory,
+        message: "",
+        toolResults,
+        traceId: round.traceId,
+      });
+    }
     const runtimeScopeAfterRound = await resolveRuntimeScope({
       supabase,
       userId: allow.user_id,
@@ -438,6 +535,25 @@ export async function POST(req: Request) {
         to: from,
         body: round.text || "",
       });
+    } else {
+      // Never leave the user in silence: the round still needs local tools we
+      // couldn't reach (no device / offline / round budget exhausted).
+      const fallback =
+        (round.kind === "needs_connector" && round.partialText?.trim()) ||
+        (deviceId
+          ? "I started working on this but couldn't finish with your machine's tools right now — I'll need you to try again in a moment."
+          : "This needs your machine, but no connector device is online. Open Groovy Desktop (or start the connector) and try again.");
+      await supabase.from("orchestrator_messages").insert({
+        session_id: sessionId,
+        user_id: allow.user_id,
+        agent_id: runtimeScopeAfterRound?.agentId || runtimeScope?.agentId || null,
+        epoch_id: runtimeScopeAfterRound?.epochId || runtimeScope?.epochId || null,
+        branch_id: runtimeScopeAfterRound?.branchId || runtimeScope?.branchId || null,
+        role: "assistant",
+        content: fallback,
+        metadata: { provider: "whatsapp_kapso", threadKey, kind: "connector_fallback" },
+      });
+      await sendKapsoText({ phoneNumberId, to: from, body: fallback }).catch(() => {});
     }
 
     return NextResponse.json({ ok: true });

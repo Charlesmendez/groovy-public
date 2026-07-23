@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
@@ -547,7 +547,7 @@ Once installed, you can query your pixel data:
                 <BarChart3 className="w-5 h-5 text-emerald-400" />
               </div>
               <div>
-                <h2 className="text-lg font-semibold text-white">Data Integrations</h2>
+                <h2 className="text-lg font-semibold text-white">Groovy Integrations</h2>
                 <p className="text-xs text-zinc-500">
                   Connect your marketing platforms
                 </p>
@@ -1018,7 +1018,7 @@ Once installed, you can query your pixel data:
                           target="_blank"
                           rel="noopener noreferrer"
                           className="p-2 rounded-lg text-zinc-500 hover:text-white hover:bg-white/10 transition-all"
-                          title="Open in Datagran"
+                          title="Open integration dashboard"
                         >
                           <ExternalLink className="w-4 h-4" />
                         </a>
@@ -1134,7 +1134,7 @@ Once installed, you can query your pixel data:
           {/* Footer with info */}
           <div className="p-4 border-t border-white/10 bg-zinc-900/50 shrink-0">
             <p className="text-[10px] text-zinc-600 text-center">
-              Connections are managed via Datagran. Your data stays secure with OAuth authentication.
+              Groovy protects your connections with secure OAuth authentication.
             </p>
           </div>
         </motion.div>
@@ -1236,9 +1236,9 @@ Once installed, you can query your pixel data:
                     <Code className="w-5 h-5 text-violet-400" />
                   </div>
                   <div>
-                    <div className="text-white font-medium">Use existing Datagran connection</div>
+                    <div className="text-white font-medium">Use an existing connection</div>
                     <div className="text-xs text-zinc-500">
-                      Already have a connection in your Datagran account
+                      Enter the details from your existing integration account
                     </div>
                   </div>
                 </div>
@@ -1263,7 +1263,7 @@ Once installed, you can query your pixel data:
                     type="password"
                     value={manualApiKey}
                     onChange={(e) => setManualApiKey(e.target.value)}
-                    placeholder="Datagran API Key"
+                    placeholder="Integration API key"
                     className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-white placeholder-zinc-600 text-sm outline-none focus:border-violet-500/50"
                     disabled={connecting !== null || savingConnectionId}
                   />

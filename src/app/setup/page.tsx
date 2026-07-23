@@ -25,6 +25,7 @@ import { getConnectorInstallGuide } from "@/lib/connector/catalog";
 import { AllowBodyScroll } from "@/components/marketing/AllowBodyScroll";
 import { MarketingFooter } from "@/components/marketing/MarketingFooter";
 import { MarketingHeader } from "@/components/marketing/MarketingHeader";
+import { getAppUrl, getBrandName } from "@/lib/config/appConfig";
 
 export const metadata: Metadata = {
   title: "Setting Up Groovy | Complete Setup Guide",
@@ -63,7 +64,7 @@ const SETUP_STEPS: SetupStep[] = [
     number: 1,
     title: "Choose Your Hosting",
     description:
-      "Groovy is very powerful and we recommend you install it on your own computer — but that comes at your own risk. Groovy has the power to control your machine entirely, including deleting files if you give it that task. Alternatively, you can use a Groovy-hosted Mac. Note: Groovy cannot be self-hosted on a cloud provider.",
+      "Groovy is very powerful and we recommend you install it on your own computer — but that comes at your own risk. Groovy has the power to control your machine entirely, including deleting files if you give it that task. Cloud edition users can alternatively use a Groovy-hosted Mac, while self-hosted deployments can run on infrastructure they control.",
     icon: Laptop,
     iconColor: "text-cyan-400",
     bgColor: "bg-cyan-500/10",
@@ -199,11 +200,13 @@ const SETUP_STEPS: SetupStep[] = [
 export default function SetupGuidePage() {
   const macGuide = getConnectorInstallGuide("macos");
   const windowsGuide = getConnectorInstallGuide("windows");
+  const appUrl = getAppUrl();
+  const brandName = getBrandName();
 
   const howToJsonLd = {
     "@context": "https://schema.org",
     "@type": "HowTo",
-    name: "Setting Up Groovy",
+    name: `Setting Up ${brandName}`,
     description:
       "A step-by-step guide to setting up Groovy AI agent: hosting, WhatsApp, Claude CLI, integrations, and more.",
     totalTime: "PT30M",
@@ -219,11 +222,11 @@ export default function SetupGuidePage() {
   const softwareJsonLd = {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    name: "Groovy",
+    name: brandName,
     applicationCategory: "BusinessApplication",
     operatingSystem: "macOS, Windows",
     description: "AI Agent Command Center that runs locally on your computer.",
-    url: "https://gogroovy.ai/setup",
+    url: `${appUrl}/setup`,
   };
 
   return (

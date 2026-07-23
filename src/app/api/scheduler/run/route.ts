@@ -3,6 +3,7 @@ import type { ModelMessage } from "ai";
 import { verifyRelayDeviceToken } from "@/lib/relay/deviceToken";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { runOrchestratorRound } from "@/lib/orchestrator/runOrchestratorRound";
+import { resolveHarnessProfile } from "@/lib/orchestrator/harnessProfiles";
 import { getOrCreateRuntimeSessionForAgent } from "@/lib/orchestrator/runtimeGraph";
 import {
   createOrchestratorRuntimeAgentId,
@@ -10,9 +11,16 @@ import {
   resolveOwnedAgentId,
 } from "@/lib/orchestrator/runtimeAgents";
 import { runHeartbeat, type HeartbeatTaskConfig } from "@/lib/heartbeat/runHeartbeat";
+import { reconcileStaleAgentTasks, runScheduledWorkerJob } from "@/lib/orchestrator/agentTasks";
 import { normalizeConnectorPlatform, type ConnectorClientPlatform } from "@/lib/connector/platform";
 import { sendTelegramText } from "@/lib/telegram/client";
 import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
+import { inferScheduledWhatsAppDeliveryIntent } from "@/lib/scheduler/delivery";
+import { inferProviderForModelId } from "@/lib/ai/modelCatalog";
+import { isSchedulerCronAuthorized } from "@/lib/scheduler/cronAuth";
+import { runCloudSchedulerTick } from "@/lib/scheduler/cloudRunner";
+import { cloudScheduledJobEligibility } from "@/lib/scheduler/cloud";
+import { getAppUrl } from "@/lib/config/appConfig";
 
 // Ensure long-running scheduled jobs don't get cut off by Edge defaults.
 export const runtime = "nodejs";
@@ -36,8 +44,12 @@ const SCHEDULER_DATA_QUERY_TIMEOUT_MS = (() => {
 })();
 
 type Body = {
+  /** Cron/relay coordinator request. Never accepted through device auth. */
+  cronTick?: boolean;
   jobId?: string;
   traceId?: string;
+  /** Stable id for one logical schedule occurrence across transport retries. */
+  runId?: string;
   toolResults?: Array<{
     toolCallId: string;
     toolName: string;
@@ -190,42 +202,7 @@ function scheduledTaskRequiresWhatsAppDelivery(taskObj: Record<string, unknown> 
     return options.requires_whatsapp_delivery;
   }
 
-  const messageText = requireString(safeTask.message) || "";
-  const normalized = messageText
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!normalized) return false;
-  if (
-    normalized.includes("whatsapp") ||
-    normalized.includes("whats app") ||
-    normalized.includes("whatsapp_send_text") ||
-    normalized.includes("whatsapp_send_media") ||
-    normalized.includes("whatsapp_send_default_group") ||
-    normalized.includes("whatsapp_resolve_recipient")
-  ) {
-    return true;
-  }
-  if (
-    normalized.includes("email") ||
-    normalized.includes("gmail") ||
-    normalized.includes("slack") ||
-    normalized.includes("discord") ||
-    normalized.includes("telegram") ||
-    normalized.includes("twilio") ||
-    normalized.includes("sms") ||
-    normalized.includes("phone call") ||
-    normalized.includes(" call ") ||
-    normalized.includes("signal") ||
-    normalized.includes("imessage") ||
-    normalized.includes("microsoft teams") ||
-    normalized.includes("teams")
-  ) {
-    return false;
-  }
-  const hasSendVerb = /\b(send|text|message|deliver|post|notify|share)\b/.test(normalized);
-  const hasChatTarget = /\b(group|chat|team|recipient|thread|channel)\b/.test(normalized);
-  return hasSendVerb && hasChatTarget;
+  return inferScheduledWhatsAppDeliveryIntent(safeTask.message);
 }
 
 async function resolveExistingOrchestratorSessionId(args: {
@@ -329,12 +306,27 @@ async function selfHealScheduledRuntimeScope(args: {
 export async function POST(req: Request) {
   const deviceToken = req.headers.get("x-device-token") || "";
   const relaySecret = process.env.RELAY_JWT_SECRET || "";
-  const verified = verifyRelayDeviceToken(deviceToken, relaySecret);
-  if (!verified) {
+  let verified = verifyRelayDeviceToken(deviceToken, relaySecret);
+  const cronAuthorized = isSchedulerCronAuthorized(req);
+  if (!verified && !cronAuthorized) {
     return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
 
   const body = (await req.json().catch(() => null)) as Body | null;
+  if (body?.cronTick === true) {
+    if (!cronAuthorized) {
+      return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+    }
+    try {
+      return NextResponse.json(await runCloudSchedulerTick(req));
+    } catch (error) {
+      console.error("[scheduler-run] cloud tick failed", error);
+      return NextResponse.json(
+        { ok: false, error: "cloud_scheduler_tick_failed" },
+        { status: 500 }
+      );
+    }
+  }
   const jobId = requireString(body?.jobId);
   const connectorPlatform = normalizeConnectorPlatform(body?.connectorPlatform);
   if (!jobId) {
@@ -343,14 +335,18 @@ export async function POST(req: Request) {
 
   const supabase = createSupabaseAdminClient();
 
-  // Load job (must belong to this device)
-  const { data: job, error: jobErr } = await supabase
+  // Device-authenticated calls remain bound to that device. Cron-authenticated
+  // dispatches resolve the owner/device from the job and are separately
+  // restricted to connector-independent jobs below.
+  let jobQuery = supabase
     .from("scheduled_jobs")
-    .select("id,user_id,name,agent_id,device_id,kind,task,enabled")
+    .select(
+      "id,user_id,name,agent_id,device_id,kind,task,schedule,enabled,target_agent_id,last_run_at,skip_next_run"
+    )
     .eq("id", jobId)
-    .eq("device_id", verified.deviceId)
-    .limit(1)
-    .maybeSingle();
+    .limit(1);
+  if (verified) jobQuery = jobQuery.eq("device_id", verified.deviceId);
+  const { data: job, error: jobErr } = await jobQuery.maybeSingle();
 
   if (jobErr) {
     return NextResponse.json({ ok: false, error: jobErr.message }, { status: 500 });
@@ -358,9 +354,20 @@ export async function POST(req: Request) {
   if (!job) {
     return NextResponse.json({ ok: false, error: "job_not_found" }, { status: 404 });
   }
-  if (job.user_id !== verified.userId) {
+  if (verified && job.user_id !== verified.userId) {
     return NextResponse.json({ ok: false, error: "forbidden" }, { status: 403 });
   }
+  if (!verified) {
+    verified = { userId: String(job.user_id), deviceId: String(job.device_id) };
+  }
+  // From this point both auth paths have a concrete owner/device identity.
+  const actor = verified;
+  if (!actor) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Piggyback the agent-task reconciler on scheduler activity.
+  void reconcileStaleAgentTasks(actor.userId).catch(() => {});
   if (job.enabled === false) {
     return NextResponse.json({ ok: false, error: "job_disabled" }, { status: 409 });
   }
@@ -368,13 +375,57 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "job_kind_not_orchestrator" }, { status: 400 });
   }
 
+  // A pinned profile is an authorization boundary. Do not silently widen the
+  // job to the default all-tools profile when the profile column cannot be
+  // loaded (for example, during an incomplete migration rollout).
+  const { data: jobProfileRow, error: jobProfileError } = await supabase
+    .from("scheduled_jobs")
+    .select("profile_id")
+    .eq("id", jobId)
+    .maybeSingle();
+  if (jobProfileError) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "scheduled_profile_resolution_failed",
+        detail: jobProfileError.message,
+      },
+      { status: 500 },
+    );
+  }
+  const jobProfileId = (jobProfileRow?.profile_id as string | null) ?? null;
+
   const task = job.task as unknown;
   let taskObj =
     task && typeof task === "object" ? (task as Record<string, unknown>) : null;
+  if (cronAuthorized) {
+    const eligibility = cloudScheduledJobEligibility({
+      ...(job as unknown as Parameters<typeof cloudScheduledJobEligibility>[0]),
+      task: taskObj,
+    });
+    if (!eligibility.eligible) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "cloud_scheduler_job_requires_connector",
+          reason: eligibility.reason,
+        },
+        { status: 409 }
+      );
+    }
+  }
   const taskOptions =
     taskObj && typeof taskObj.options === "object" && taskObj.options
       ? (taskObj.options as Record<string, unknown>)
       : null;
+  const scheduledModel = requireString(taskOptions?.model_name);
+  const scheduledProviderRaw = requireString(taskOptions?.model_provider);
+  const scheduledProvider = scheduledModel
+    ? scheduledProviderRaw === "anthropic" || scheduledProviderRaw === "openai"
+      ? scheduledProviderRaw
+      : inferProviderForModelId(scheduledModel)
+    : null;
+  const scheduledReasoningEffort = requireString(taskOptions?.reasoning_effort);
   const requiresWhatsAppDelivery = scheduledTaskRequiresWhatsAppDelivery(taskObj);
 
   // ── Heartbeat branch ──────────────────────────────────────────────────
@@ -421,7 +472,7 @@ export async function POST(req: Request) {
 
     let userEmail: string | null = null;
     try {
-      const { data: u } = await supabase.auth.admin.getUserById(verified.userId);
+      const { data: u } = await supabase.auth.admin.getUserById(actor.userId);
       userEmail = u.user?.email || null;
     } catch { userEmail = null; }
 
@@ -452,7 +503,7 @@ export async function POST(req: Request) {
     return createKeepaliveJsonResponse(async () => {
       const hbResult = await runHeartbeat({
         supabase,
-        userId: verified.userId,
+        userId: actor.userId,
         userEmail,
         agentId: currentTaskAgentId,
         taskConfig: effectiveTaskConfig,
@@ -462,7 +513,7 @@ export async function POST(req: Request) {
 
       console.log("[scheduler-run] heartbeat result", {
         jobId,
-        userId: verified.userId,
+        userId: actor.userId,
         ok: hbResult.ok,
         textLen: hbResult.text?.length || 0,
         sendWhatsApp: hbResult.sendWhatsApp,
@@ -527,12 +578,12 @@ export async function POST(req: Request) {
             supabase
               .from("telegram_bot_configs")
               .select("bot_token_encrypted")
-              .eq("user_id", verified.userId)
+              .eq("user_id", actor.userId)
               .maybeSingle(),
             supabase
               .from("telegram_groups")
               .select("telegram_chat_id")
-              .eq("user_id", verified.userId)
+              .eq("user_id", actor.userId)
               .order("registered_at", { ascending: false })
               .limit(1)
               .maybeSingle(),
@@ -551,7 +602,7 @@ export async function POST(req: Request) {
               });
               console.log("[scheduler-run] heartbeat telegram sent", {
                 jobId,
-                userId: verified.userId,
+                userId: actor.userId,
                 chatId: tgChatId,
                 textLen: tgText.length,
               });
@@ -560,7 +611,7 @@ export async function POST(req: Request) {
         } catch (tgErr) {
           console.error("[scheduler-run] heartbeat telegram send error", {
             jobId,
-            userId: verified.userId,
+            userId: actor.userId,
             error: tgErr instanceof Error ? tgErr.message : String(tgErr),
           });
         }
@@ -613,7 +664,7 @@ export async function POST(req: Request) {
 
       console.log("[scheduler-run] heartbeat final without connector send", {
         jobId,
-        userId: verified.userId,
+        userId: actor.userId,
         textLen: hbResult.text?.length || 0,
         sendWhatsApp: hbResult.sendWhatsApp,
         sendTelegram: hbResult.sendTelegram,
@@ -627,7 +678,7 @@ export async function POST(req: Request) {
   const healedRuntimeScope = await selfHealScheduledRuntimeScope({
     supabase,
     jobId,
-    userId: verified.userId,
+    userId: actor.userId,
     jobName: requireString((job as { name?: unknown }).name),
     jobAgentId: requireString((job as { agent_id?: unknown }).agent_id),
     taskObj,
@@ -648,12 +699,30 @@ export async function POST(req: Request) {
   // The `message` arg is used mainly for routing and file attachment logic, but is NOT
   // automatically appended to the model messages. For scheduled jobs, we treat the job's
   // task message as the single user message.
-  const history: ModelMessage[] = [{ role: "user", content: message }];
+  const currentTaskOptions =
+    taskObj && typeof taskObj.options === "object" && taskObj.options
+      ? (taskObj.options as Record<string, unknown>)
+      : null;
+  const scheduledWhatsAppChatId = requireString(currentTaskOptions?.whatsapp_chat_id);
+  const scheduledWhatsAppRecipientQuery = requireString(
+    currentTaskOptions?.whatsapp_recipient_query
+  );
+  const history: ModelMessage[] = [];
+  if (requiresWhatsAppDelivery && scheduledWhatsAppChatId) {
+    history.push({
+      role: "system",
+      content:
+        `This scheduled task already has an exact WhatsApp delivery target bound to chat ID ${scheduledWhatsAppChatId}` +
+        `${scheduledWhatsAppRecipientQuery ? ` (${scheduledWhatsAppRecipientQuery})` : ""}. ` +
+        "Do not resolve the recipient by name. Complete and validate the requested task first, then send the final result directly to that exact chat ID.",
+    });
+  }
+  history.push({ role: "user", content: message });
 
   // Resolve email (best-effort; used only for memory connection selection)
   let userEmail: string | null = null;
   try {
-    const { data: u } = await supabase.auth.admin.getUserById(verified.userId);
+    const { data: u } = await supabase.auth.admin.getUserById(actor.userId);
     userEmail = u.user?.email || null;
   } catch {
     userEmail = null;
@@ -744,21 +813,185 @@ export async function POST(req: Request) {
     );
   }
 
+  // ── Worker-agent branch (Part B) ────────────────────────────────────────
+  // When the schedule targets a specific worker agent, execute via the agent
+  // task runner (headless claude_run on the worker's device) instead of an
+  // orchestrator round. The job stays bound to the TICKING device; execution
+  // routes cross-device over the relay internal RPC.
+  const targetAgentId =
+    typeof (job as { target_agent_id?: unknown }).target_agent_id === "string" &&
+    (job as { target_agent_id: string }).target_agent_id.trim()
+      ? (job as { target_agent_id: string }).target_agent_id.trim()
+      : null;
+  if (targetAgentId) {
+    // A worker delivery is a two-round exchange: first run the worker and ask
+    // the connector to send, then consume that connector result here. Without
+    // this continuation guard, a successful WhatsApp send would run through
+    // the worker branch again and request the same send on every round.
+    const workerToolResults = Array.isArray(body?.toolResults) ? body.toolResults : [];
+    const workerWhatsAppResult = workerToolResults.find(
+      (result) =>
+        result &&
+        typeof result === "object" &&
+        (result.toolName === "whatsapp_send_default_group" ||
+          result.toolName === "whatsapp_send_text")
+    );
+    if (workerWhatsAppResult) {
+      const rawResult = workerWhatsAppResult.result;
+      const parsedResult =
+        typeof rawResult === "string"
+          ? parseJson(rawResult)
+          : rawResult && typeof rawResult === "object"
+            ? rawResult
+            : null;
+      const resultObj =
+        parsedResult && typeof parsedResult === "object"
+          ? (parsedResult as Record<string, unknown>)
+          : null;
+      if (resultObj?.ok === true) {
+        return NextResponse.json({
+          ok: true,
+          kind: "final",
+          traceId: requireString(body?.traceId),
+          text: "Scheduled worker result delivered.",
+        });
+      }
+      const deliveryError = requireString(resultObj?.error) || "whatsapp_send_failed";
+      const retryable = isRetryableWhatsAppSendError(deliveryError);
+      return NextResponse.json(
+        { ok: false, error: deliveryError, retryable },
+        { status: retryable ? 503 : 502 }
+      );
+    }
+
+    const explicitDelivery =
+      taskObj && typeof taskObj.delivery === "object" && taskObj.delivery
+        ? (taskObj.delivery as { dashboard?: boolean; whatsapp?: boolean; telegram?: boolean })
+        : null;
+    const delivery = {
+      dashboard: explicitDelivery?.dashboard !== false,
+      whatsapp: explicitDelivery?.whatsapp === true || requiresWhatsAppDelivery,
+      telegram: explicitDelivery?.telegram === true,
+    };
+    const workerTimeoutRaw = taskOptions ? Number(taskOptions.worker_timeout_ms) : NaN;
+    const maxCharsRaw = taskOptions ? Number(taskOptions.max_chars) : NaN;
+    const incomingWhatsAppThreadKey = requireString(body?.whatsappThreadKey);
+    const scheduledWhatsAppChatId = requireString(taskOptions?.whatsapp_chat_id);
+    const scheduledWhatsAppRecipientQuery = requireString(
+      taskOptions?.whatsapp_recipient_query
+    );
+
+    console.log("[scheduler-run] worker-target start", {
+      jobId,
+      userId: actor.userId,
+      targetAgentId,
+      deliverWhatsApp: delivery.whatsapp,
+    });
+
+    return createKeepaliveJsonResponse(async () => {
+      const outcome = await runScheduledWorkerJob({
+        jobId,
+        jobName: requireString((job as { name?: unknown }).name),
+        userId: actor.userId,
+        userEmail,
+        targetAgentId,
+        message,
+        delivery,
+        maxChars: Number.isFinite(maxCharsRaw) ? maxCharsRaw : null,
+        workerTimeoutMs: Number.isFinite(workerTimeoutRaw) ? workerTimeoutRaw : null,
+        incomingWhatsAppThreadKey: incomingWhatsAppThreadKey || null,
+        scheduledWhatsAppChatId: scheduledWhatsAppChatId || null,
+        scheduledWhatsAppRecipientQuery: scheduledWhatsAppRecipientQuery || null,
+        scheduledRunId: requireString(body?.runId),
+        model: scheduledModel,
+        reasoningEffort: scheduledReasoningEffort,
+      });
+
+      // Server-side Telegram delivery (same path as heartbeat digests).
+      if (outcome.ok && outcome.deliverTelegram && outcome.text) {
+        try {
+          const [{ data: tgConfig }, { data: defaultGroup }] = await Promise.all([
+            supabase
+              .from("telegram_bot_configs")
+              .select("bot_token_encrypted")
+              .eq("user_id", actor.userId)
+              .maybeSingle(),
+            supabase
+              .from("telegram_groups")
+              .select("telegram_chat_id")
+              .eq("user_id", actor.userId)
+              .order("registered_at", { ascending: false })
+              .limit(1)
+              .maybeSingle(),
+          ]);
+          if (tgConfig?.bot_token_encrypted && defaultGroup?.telegram_chat_id) {
+            const tgText =
+              outcome.text.length > 4096
+                ? `${outcome.text.slice(0, 4076).trimEnd()}\n...(truncated)`
+                : outcome.text;
+            await sendTelegramText({
+              botToken: decryptTelegramBotToken(tgConfig.bot_token_encrypted),
+              chatId: Number(defaultGroup.telegram_chat_id),
+              text: tgText,
+            });
+          }
+        } catch (tgErr) {
+          console.error("[scheduler-run] worker-target telegram send error", {
+            jobId,
+            error: tgErr instanceof Error ? tgErr.message : String(tgErr),
+          });
+        }
+      }
+
+      if (!outcome.ok) {
+        return { ok: false, error: outcome.error, retryable: outcome.retryable };
+      }
+      if (outcome.kind === "needs_connector") {
+        return {
+          ok: true,
+          kind: "needs_connector",
+          traceId: outcome.traceId,
+          partialText: outcome.partialText,
+          connectorExecutes: outcome.connectorExecutes,
+        };
+      }
+      return { ok: true, kind: "final", traceId: outcome.traceId, text: outcome.text };
+    });
+  }
+  // ── End worker-agent branch ─────────────────────────────────────────────
+
   console.log("[scheduler-run] start", {
     jobId,
-    userId: verified.userId,
-    deviceId: verified.deviceId,
+    userId: actor.userId,
+    deviceId: actor.deviceId,
     traceId: incomingTraceId || null,
     toolResultsCount: toolResults.length,
     messagePreview: message.slice(0, 140),
   });
+
+  const jobProfile = jobProfileId
+    ? await resolveHarnessProfile(supabase, {
+        userId: actor.userId,
+        explicitProfileId: jobProfileId,
+      })
+    : undefined;
+  if (jobProfileId && !jobProfile) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "scheduled_profile_unavailable",
+        detail: "The profile pinned to this job no longer exists or is unavailable.",
+      },
+      { status: 409 },
+    );
+  }
 
   // IMPORTANT:
   // For long-running scheduled jobs (e.g. multiple Firecrawl queries), the response body can be
   // silent for minutes. Some HTTP stacks/CDNs enforce idle body timeouts. To keep the connection
   // alive without changing the client contract (still JSON), we stream *whitespace* heartbeats
   // and then emit a single JSON object at the end. Leading whitespace is valid JSON.
-  const origin = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+  const origin = getAppUrl();
   const encoder = new TextEncoder();
   const KEEPALIVE_MS = 10_000;
   const KEEPALIVE_CHUNK = " ".repeat(1024) + "\n";
@@ -795,12 +1028,15 @@ export async function POST(req: Request) {
 
         const round = await runOrchestratorRound({
           supabase,
-          userId: verified.userId,
+          userId: actor.userId,
           userEmail,
+          // Job-pinned mind wins; otherwise session-sticky/default resolution
+          // happens inside runOrchestratorRound.
+          profile: jobProfile,
           orchestratorAgentId: resolvedTaskAgentId,
           orchestratorSessionId: resolvedTaskSessionId,
           appBaseUrl: origin,
-          deviceId: verified.deviceId,
+          deviceId: cronAuthorized ? null : actor.deviceId,
           connectorPlatform,
           turnId: incomingTraceId,
           history,
@@ -808,7 +1044,8 @@ export async function POST(req: Request) {
           memoryEnabled: false,
           cookies: undefined,
           // Pass device token so internal API calls (data_query -> /api/datagran/chat) can authenticate
-          deviceToken,
+          deviceToken: cronAuthorized ? undefined : deviceToken,
+          sourceProvider: cronAuthorized ? "scheduler_cloud" : "scheduler",
           traceId: incomingTraceId,
           toolResults: toolResults.length ? toolResults : undefined,
           // Scheduled jobs need all tools, even if task text contains "weekly" or schedule keywords
@@ -821,6 +1058,14 @@ export async function POST(req: Request) {
           localTimezone: typeof body?.timezone === "string" ? body.timezone : undefined,
           // Explicitly cap steps in scheduled mode to avoid hitting maxDuration.
           maxSteps: maxStepsForJob,
+          modelOverride:
+            scheduledModel && scheduledProvider
+              ? {
+                  provider: scheduledProvider,
+                  model: scheduledModel,
+                  reasoningEffort: scheduledReasoningEffort || null,
+                }
+              : null,
         });
 
         console.log("[scheduler-run] done", {
@@ -893,7 +1138,7 @@ export async function POST(req: Request) {
                 const { data: row, error: rowErr } = await supabase
                   .from("chat_attachments")
                   .select("storage_path, created_at")
-                  .eq("user_id", verified.userId)
+                  .eq("user_id", actor.userId)
                   .eq("anthropic_file_id", fileId)
                   .order("created_at", { ascending: false })
                   .limit(1)
@@ -911,7 +1156,7 @@ export async function POST(req: Request) {
                 );
               }
 
-              if (!storagePath || !storagePath.startsWith(`${verified.userId}/`)) {
+              if (!storagePath || !storagePath.startsWith(`${actor.userId}/`)) {
                 console.warn("[scheduler-run] media_resolve_missing_storage_path", {
                   jobId,
                   traceId: round.traceId,
@@ -1008,4 +1253,24 @@ export async function POST(req: Request) {
       "Cache-Control": "no-store",
     },
   });
+}
+
+/**
+ * Vercel Cron invokes configured paths with GET. Keep the JSON POST
+ * `cronTick` path for the self-hosted relay, but expose the same authenticated
+ * coordinator through GET for the hosted cron transport.
+ */
+export async function GET(req: Request) {
+  if (!isSchedulerCronAuthorized(req)) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+  try {
+    return NextResponse.json(await runCloudSchedulerTick(req));
+  } catch (error) {
+    console.error("[scheduler-run] cloud GET tick failed", error);
+    return NextResponse.json(
+      { ok: false, error: "cloud_scheduler_tick_failed" },
+      { status: 500 },
+    );
+  }
 }

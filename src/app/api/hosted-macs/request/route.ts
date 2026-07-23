@@ -3,6 +3,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
 import { syncWorkspaceAddonSubscription } from "@/lib/billing/addons";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type RequestBody = {
   requested_provider?: string;
@@ -22,6 +23,12 @@ async function getWorkspaceMembership(admin: ReturnType<typeof createSupabaseAdm
 }
 
 export async function GET() {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Groovy-hosted Macs are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const user = await getAuthedUser();
@@ -30,6 +37,12 @@ export async function GET() {
     if (!membership) {
       logWarn("hosted_mac.request.get.no_workspace", { user_id: user.id });
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
+    }
+    if (membership.role === "guest") {
+      return NextResponse.json(
+        { error: "Workspace settings are not available to channel guests" },
+        { status: 403 },
+      );
     }
 
     const { data: reqs, error } = await admin
@@ -88,6 +101,12 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Groovy-hosted Macs are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const user = await getAuthedUser();

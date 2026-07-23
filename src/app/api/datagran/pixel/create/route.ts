@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { encryptLlmApiKey } from "@/lib/crypto/llmKey";
+import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 import crypto from "crypto";
 
 const DATAGRAN_API_KEY = process.env.DATAGRAN_API_KEY;
@@ -35,6 +37,15 @@ export async function POST(req: Request) {
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  const workspace = await getOrCreateWorkspaceForUser();
+  if (workspace.role !== "admin") {
+    return NextResponse.json(
+      { error: "Only workspace admins can manage integrations" },
+      { status: 403 },
+    );
+  }
+  const ownerUserId = workspace.billing_admin_user_id;
+  const admin = createSupabaseAdminClient();
 
   if (!DATAGRAN_API_KEY) {
     return NextResponse.json(
@@ -88,10 +99,10 @@ export async function POST(req: Request) {
   // Response: { id, name, write_key, write_key_prefix, allowed_origins, status }
 
   // Create an agent entry in our database to track this pixel
-  const { data: agent, error: agentError } = await supabase
+  const { data: agent, error: agentError } = await admin
     .from("agents")
     .insert({
-      user_id: user.id,
+      user_id: ownerUserId,
       name: `Pixel: ${name}`,
       type: "datagran",
       status: "ready",
@@ -112,22 +123,22 @@ export async function POST(req: Request) {
   const sha256Hex = (input: string) =>
     crypto.createHash("sha256").update(input, "utf8").digest("hex");
 
-  const { error: configError } = await supabase
+  const { error: configError } = await admin
     .from("datagran_agent_configs")
     .insert({
       agent_id: agent.id,
-      user_id: user.id,
+      user_id: ownerUserId,
       datagran_api_key_enc: encryptLlmApiKey(DATAGRAN_API_KEY),
       datagran_api_key_hash: sha256Hex(DATAGRAN_API_KEY),
       provider: "web_pixel",
       connection_id: pixelData.id, // site_id
-      end_user_external_id: `flow_${user.id}`,
+      end_user_external_id: `flow_${ownerUserId}`,
     });
 
   if (configError) {
     console.error("[Pixel Create] Failed to create config:", configError);
     // Prevent a "looks connected but isn't" state.
-    await supabase.from("agents").delete().eq("id", agent.id).eq("user_id", user.id);
+    await admin.from("agents").delete().eq("id", agent.id).eq("user_id", ownerUserId);
     return NextResponse.json(
       {
         error:

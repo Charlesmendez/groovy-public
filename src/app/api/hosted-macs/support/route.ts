@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn, safeTextPreview } from "@/lib/observability/log";
+import { isSelfHosted } from "@/lib/config/edition";
 
 type Action = "restart" | "update";
 
@@ -34,6 +35,12 @@ async function getWorkspaceMembership(
 }
 
 export async function POST(req: Request) {
+  if (isSelfHosted()) {
+    return NextResponse.json(
+      { error: "Groovy-hosted Macs are unavailable in the self-hosted edition" },
+      { status: 404 },
+    );
+  }
   const startedAt = Date.now();
   try {
     const user = await getAuthedUser();
@@ -154,4 +161,3 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: message }, { status });
   }
 }
-

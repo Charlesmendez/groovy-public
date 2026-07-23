@@ -12,7 +12,7 @@ Do not copy real secret values into documentation. Use placeholders and ask the 
 - Connector: `apps/connector`, local Mac/Windows/headless runtime.
 - Stripe: Groovy Personal yearly subscription and billing portal.
 - Portal/CLI downloads: target system for licensed installers and source snapshots.
-- GitHub: delayed source-available mirror, contribution surface, and legacy connector release automation during transition.
+- GitHub: release-synchronized source-available mirror, contribution surface, and legacy connector release automation during transition.
 - npm: Groovy CLI publishing under `@gogroovy/cli`.
 
 ## Required Environment Names
@@ -38,6 +38,14 @@ Do not copy real secret values into documentation. Use placeholders and ask the 
 
 Customers should bring their own provider credentials by default.
 
+Hosted Groovy is BYOK-only. A self-hosted deployment may expose server-managed
+provider keys in onboarding and Settings only by explicitly setting:
+
+- `GROOVY_ALLOW_SERVER_PROVIDER_KEYS=1`
+
+The default is disabled. Leaving this unset keeps the UI and server runtime in
+BYOK mode even if provider keys happen to exist in the deployment environment.
+
 Common provider env names:
 
 - `OPENAI_API_KEY`
@@ -50,9 +58,11 @@ Common provider env names:
 - `MISTRAL_API_KEY`
 - `XAI_API_KEY`
 
-## Datagran Memory and Data Integrations
+## Datagran Memory, Private Wiki, and Data Integrations
 
-Datagran is used for durable memory and data integrations. Developers and enterprise customers need a Datagran account when enabling Groovy Memory or Datagran-backed Data Integrations.
+Datagran is used for fuzzy semantic memory and data integrations. Developers and enterprise customers need a Datagran account when enabling semantic Groovy Memory or Datagran-backed Data Integrations.
+
+The private Wiki is a complementary structured knowledge layer stored in the Supabase Storage `wiki` bucket. The orchestrator can search and read Wiki pages directly, file Wiki-only learnings, or use `remember` to store a durable learning in Datagran and file it into the Wiki. Wiki filing is append-oriented, deduplicated, path-restricted, and serialized per user. Hybrid `remember` rejects secret-like material before writing to either backend.
 
 Required or strongly recommended:
 
@@ -61,7 +71,7 @@ Required or strongly recommended:
 
 Supported data integrations include Google Ads, Facebook Ads, Facebook Leads, Instagram, LinkedIn Ads, TikTok, Google Drive, Google Calendar, Gmail, Postgres/Supabase, Firecrawl, Salesforce, and Web Pixel.
 
-If `DATAGRAN_API_KEY` is missing, memory should be treated as disabled and Datagran integrations should be treated as unavailable until configured.
+If `DATAGRAN_API_KEY` is missing, semantic `remember`/`recall` should be treated as disabled and Datagran integrations should be treated as unavailable until configured. The private Wiki remains a separate Supabase-backed capability.
 
 ## Optional Integrations
 

@@ -39,8 +39,17 @@ async function writeWindowsShim({ nodeExe, connectorScript, relayUrl, extraArgs 
 
   const lines = [
     "@echo off",
+    "setlocal",
     `if not exist ${quoteCmdArg(groovyDir)} mkdir ${quoteCmdArg(groovyDir)} >nul 2>&1`,
+    "set GROOVY_CONNECTOR_SUPERVISED=1",
+    ":restart",
+    `echo [startup] %date% %time% starting connector >> ${quoteCmdArg(logPath)}`,
     `${args.join(" ")} >> ${quoteCmdArg(logPath)} 2>&1`,
+    "set EXIT_CODE=%ERRORLEVEL%",
+    `echo [startup] %date% %time% connector exited with code %EXIT_CODE% >> ${quoteCmdArg(logPath)}`,
+    "if \"%GROOVY_CONNECTOR_NO_SUPERVISE%\"==\"1\" exit /b %EXIT_CODE%",
+    "timeout /t 5 /nobreak >nul",
+    "goto restart",
     "",
   ];
   await fsp.writeFile(shimPath, lines.join("\r\n"), "utf8");

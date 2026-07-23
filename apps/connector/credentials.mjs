@@ -25,6 +25,9 @@ try {
 const KEYCHAIN_SERVICE = "groovy-connector";
 const MASTER_KEY_ACCOUNT = "credentials-master-key-v1";
 
+let cachedMasterKeyBytes = null;
+let cachedMasterKeyPromise = null;
+
 // Prevent duplicate macOS dialogs if multiple parts of the connector request
 // credentials for the same domain at the same time.
 const inFlightCredentialRequests = new Map();
@@ -73,15 +76,31 @@ function openDb() {
 }
 
 async function getOrCreateMasterKeyBytes() {
-  if (!keytar) throw new Error("keytar_unavailable");
-  const existing = await keytar.getPassword(KEYCHAIN_SERVICE, MASTER_KEY_ACCOUNT);
-  if (existing) {
-    const b = Buffer.from(existing, "base64");
-    if (b.length === 32) return b;
+  if (cachedMasterKeyBytes) return cachedMasterKeyBytes;
+  if (cachedMasterKeyPromise) return await cachedMasterKeyPromise;
+
+  cachedMasterKeyPromise = (async () => {
+    if (!keytar) throw new Error("keytar_unavailable");
+    const existing = await keytar.getPassword(KEYCHAIN_SERVICE, MASTER_KEY_ACCOUNT);
+    if (existing) {
+      const b = Buffer.from(existing, "base64");
+      if (b.length === 32) {
+        cachedMasterKeyBytes = b;
+        return b;
+      }
+    }
+
+    const key = crypto.randomBytes(32);
+    await keytar.setPassword(KEYCHAIN_SERVICE, MASTER_KEY_ACCOUNT, key.toString("base64"));
+    cachedMasterKeyBytes = key;
+    return key;
+  })();
+
+  try {
+    return await cachedMasterKeyPromise;
+  } finally {
+    cachedMasterKeyPromise = null;
   }
-  const key = crypto.randomBytes(32);
-  await keytar.setPassword(KEYCHAIN_SERVICE, MASTER_KEY_ACCOUNT, key.toString("base64"));
-  return key;
 }
 
 function encryptSecret({ masterKey, plaintext }) {

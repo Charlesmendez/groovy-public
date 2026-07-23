@@ -1,4 +1,5 @@
 import { buildInternalRouteAuthHeaders } from "@/lib/internalRouteAuth";
+import { getRelayUrl } from "@/lib/config/appConfig";
 
 export const RELAY_CONNECTOR_RPC_SCOPE = "relay_connector_rpc";
 
@@ -9,7 +10,7 @@ function trimmed(value: unknown): string {
 function resolveRelayHttpBaseUrl(): string {
   const raw =
     trimmed(process.env.INTERNAL_RELAY_HTTP_URL) ||
-    trimmed(process.env.NEXT_PUBLIC_RELAY_URL);
+    trimmed(getRelayUrl());
   if (!raw) {
     throw new Error("Missing relay URL");
   }
@@ -27,13 +28,17 @@ function resolveRelayHttpBaseUrl(): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-export async function callConnectorRpcViaRelay(args: {
+async function postConnectorRpc(args: {
   userId: string;
   deviceId: string;
   rpcType: string;
   payload?: Record<string, unknown>;
   timeoutMs?: number;
-}): Promise<Record<string, unknown>> {
+  requestId?: string;
+  completionUrl?: string;
+  taskId?: string;
+  taskMeta?: Record<string, unknown>;
+}): Promise<{ response: Response; json: Record<string, unknown> }> {
   const userId = trimmed(args.userId);
   const deviceId = trimmed(args.deviceId);
   const rpcType = trimmed(args.rpcType);
@@ -60,6 +65,15 @@ export async function callConnectorRpcViaRelay(args: {
       rpcType,
       payload: args.payload || {},
       timeoutMs: args.timeoutMs,
+      ...(trimmed(args.requestId) ? { requestId: trimmed(args.requestId) } : {}),
+      ...(trimmed(args.completionUrl)
+        ? {
+            delivery: "callback",
+            completionUrl: trimmed(args.completionUrl),
+            taskId: trimmed(args.taskId),
+            taskMeta: args.taskMeta || {},
+          }
+        : {}),
     }),
   });
 
@@ -87,5 +101,43 @@ export async function callConnectorRpcViaRelay(args: {
     throw new Error("Relay connector RPC returned an invalid payload");
   }
 
-  return json as Record<string, unknown>;
+  return { response, json: json as Record<string, unknown> };
+}
+
+export async function callConnectorRpcViaRelay(args: {
+  userId: string;
+  deviceId: string;
+  rpcType: string;
+  payload?: Record<string, unknown>;
+  timeoutMs?: number;
+  requestId?: string;
+}): Promise<Record<string, unknown>> {
+  const { json } = await postConnectorRpc(args);
+  return json;
+}
+
+export async function startConnectorRpcViaRelay(args: {
+  userId: string;
+  deviceId: string;
+  rpcType: string;
+  payload?: Record<string, unknown>;
+  timeoutMs?: number;
+  requestId: string;
+  taskId: string;
+  taskMeta: Record<string, unknown>;
+  completionUrl: string;
+}): Promise<{ requestId: string }> {
+  const { response, json } = await postConnectorRpc(args);
+  if (response.status !== 202 || json.accepted !== true) {
+    throw new Error(
+      typeof json.error === "string" && json.error.trim()
+        ? json.error.trim()
+        : "Relay did not accept the background connector RPC"
+    );
+  }
+  const requestId = trimmed(json.requestId);
+  if (!requestId) {
+    throw new Error("Relay accepted the background connector RPC without a request id");
+  }
+  return { requestId };
 }
