@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import test from "node:test";
 import {
+  createChatChannelInRlsOrder,
   mentionsHandle,
   parseTeamChatControlRequest,
   shouldRunChannelOrchestrator,
@@ -101,4 +102,36 @@ test("team chat control requests require explicit targets and redirect text", ()
       },
     },
   );
+});
+
+test("DM creation adds membership before reading the RLS-protected channel", async () => {
+  const operations: string[] = [];
+  const result = await createChatChannelInRlsOrder({
+    insertChannelWithoutReturning: async () => {
+      operations.push("insert channel without returning");
+      return null;
+    },
+    insertMembers: async () => {
+      operations.push("insert members");
+      return null;
+    },
+    readChannel: async () => {
+      operations.push("read channel");
+      return { data: { id: "dm-1" }, error: null };
+    },
+    rollbackChannel: async () => {
+      operations.push("rollback channel");
+    },
+  });
+
+  assert.deepEqual(operations, [
+    "insert channel without returning",
+    "insert members",
+    "read channel",
+  ]);
+  assert.deepEqual(result, {
+    data: { id: "dm-1" },
+    error: null,
+    stage: null,
+  });
 });

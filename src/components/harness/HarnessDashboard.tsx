@@ -124,6 +124,7 @@ export default function HarnessDashboard() {
   const [showSettings, setShowSettings] = useState(false);
   const [showSchedules, setShowSchedules] = useState(false);
   const [showPlans, setShowPlans] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [pendingPlan, setPendingPlan] = useState<ClaudePlan | null>(null);
   const [runningScheduledJobs, setRunningScheduledJobs] = useState<Set<string>>(new Set());
   const scheduledJobRequestIdsRef = useRef<Map<string, string>>(new Map());
@@ -634,6 +635,8 @@ export default function HarnessDashboard() {
           <DesktopUpdateBadge />
 
           <div className="ml-auto flex items-center gap-1">
+            {/* Full toolbar from sm up; on phones these collapse into the ⋯ sheet */}
+            <div className="hidden items-center gap-1 sm:flex">
             <button
               type="button"
               onClick={() => setShowPlans(true)}
@@ -681,6 +684,16 @@ export default function HarnessDashboard() {
             >
               <Settings className="w-4 h-4" />
             </a>
+            </div>
+            <button
+              type="button"
+              onClick={() => setMobileMenuOpen(true)}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white sm:hidden"
+              title="More"
+              aria-label="More options"
+            >
+              ⋯
+            </button>
             <button
               onClick={() => setRailOpen((v) => !v)}
               className="w-8 h-8 rounded-lg hidden md:flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
@@ -702,6 +715,81 @@ export default function HarnessDashboard() {
           </div>
         </div>
       </header>
+
+      {/* Mobile overflow sheet: everything the phone header can't fit */}
+      {mobileMenuOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end bg-black/60 sm:hidden"
+          onClick={() => setMobileMenuOpen(false)}
+        >
+          <div
+            className="animate-slide-up w-full rounded-t-2xl border-t border-white/10 bg-[var(--bg-secondary)] p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-white/15" />
+            {device.connectorOutdated && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  if (device.supportsInPlaceUpdate) device.updateConnector();
+                  else window.location.href = connectorGuide.downloadUrl;
+                }}
+                className="mb-3 flex w-full items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+              >
+                <AlertTriangle className="h-4 w-4" />
+                Update connector to v{MIN_CONNECTOR_VERSION}
+              </button>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  setShowPlans(true);
+                }}
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <FileText className="h-4 w-4 text-zinc-500" /> Plans
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  setShowSchedules(true);
+                }}
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <CalendarClock className="h-4 w-4 text-zinc-500" /> Schedules
+              </button>
+              <a
+                href="/settings/skills"
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <BookOpen className="h-4 w-4 text-zinc-500" /> Skills &amp; Docs
+              </a>
+              <a
+                href="/settings/integrations"
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <Plug className="h-4 w-4 text-zinc-500" /> Integrations
+              </a>
+              <a
+                href="/settings/usage"
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <BarChart3 className="h-4 w-4 text-zinc-500" /> Usage &amp; cost
+              </a>
+              <a
+                href="/settings"
+                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
+              >
+                <Settings className="h-4 w-4 text-zinc-500" /> Settings
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
 
       {onboarding.loaded && onboarding.onboardingCompleted === true && (
         <LicenseAccessGate

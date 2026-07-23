@@ -22,6 +22,52 @@ export type TeamChatControlRequest = {
   direction: string | null;
 };
 
+type ChatChannelMutationError = {
+  message: string;
+  code?: string | null;
+};
+
+export type ChatChannelCreationResult<T> =
+  | { data: T; error: null; stage: null }
+  | {
+      data: null;
+      error: ChatChannelMutationError;
+      stage: "channel" | "members" | "read";
+    };
+
+export async function createChatChannelInRlsOrder<T>(operations: {
+  insertChannelWithoutReturning: () => Promise<ChatChannelMutationError | null>;
+  insertMembers: () => Promise<ChatChannelMutationError | null>;
+  readChannel: () => Promise<{
+    data: T | null;
+    error: ChatChannelMutationError | null;
+  }>;
+  rollbackChannel: () => Promise<void>;
+}): Promise<ChatChannelCreationResult<T>> {
+  const channelError = await operations.insertChannelWithoutReturning();
+  if (channelError) {
+    return { data: null, error: channelError, stage: "channel" };
+  }
+
+  const membersError = await operations.insertMembers();
+  if (membersError) {
+    await operations.rollbackChannel();
+    return { data: null, error: membersError, stage: "members" };
+  }
+
+  const channelResult = await operations.readChannel();
+  if (channelResult.error || !channelResult.data) {
+    await operations.rollbackChannel();
+    return {
+      data: null,
+      error: channelResult.error || { message: "Could not load the new channel" },
+      stage: "read",
+    };
+  }
+
+  return { data: channelResult.data, error: null, stage: null };
+}
+
 export function parseTeamChatControlRequest(
   input: unknown,
 ):

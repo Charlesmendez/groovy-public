@@ -540,10 +540,13 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
       >
         <div className="border-b border-[var(--glass-border)] px-4 py-4">
           <div className="font-display text-sm tracking-wider">{workspaceName}</div>
-          <div className="mt-2 flex items-center gap-3 text-xs">
+          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 text-xs">
             <AppNav compact />
             {workspaceRole !== "guest" ? (
-              <button onClick={createChannel} className="text-[var(--text-secondary)] hover:text-white">
+              <button
+                onClick={createChannel}
+                className="whitespace-nowrap text-[var(--text-secondary)] hover:text-white"
+              >
                 + Channel
               </button>
             ) : null}

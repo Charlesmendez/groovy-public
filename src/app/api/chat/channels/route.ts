@@ -1,9 +1,13 @@
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
 import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
-import { slugifyChatChannel } from "@/lib/teamChat";
+import {
+  createChatChannelInRlsOrder,
+  slugifyChatChannel,
+} from "@/lib/teamChat";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -126,31 +130,12 @@ export async function POST(req: Request) {
   const visibility =
     kind === "dm" || body?.visibility === "private" ? "private" : "workspace";
 
-  const { data: channel, error } = await supabase
-    .from("chat_channels")
-    .insert({
-      workspace_id: workspace.id,
-      kind,
-      name,
-      slug,
-      topic:
-        typeof body?.topic === "string" && body.topic.trim()
-          ? body.topic.trim().slice(0, 500)
-          : null,
-      profile_id: profileId,
-      visibility,
-      orchestrator_mode: orchestratorMode,
-      created_by: user.id,
-    })
-    .select("*")
-    .single();
-  if (error) {
-    return NextResponse.json(
-      { error: error.message },
-      { status: error.code === "23505" ? 409 : error.code === "42501" ? 403 : 500 },
-    );
-  }
-
+  // DMs are readable only by channel members. Asking PostgREST to return the
+  // inserted row here would evaluate the SELECT policy before the creator's
+  // member row exists and reject an otherwise valid insert. Assign the id up
+  // front, insert with return=minimal, add members, and read the channel only
+  // after it is visible to the creator.
+  const channelId = randomUUID();
   const requestedUserIds = Array.isArray(body?.userIds)
     ? body.userIds.map(String)
     : [];
@@ -163,34 +148,80 @@ export async function POST(req: Request) {
     : [];
   const memberRows = [
     ...userIds.map((userId) => ({
-      channel_id: channel.id,
+      channel_id: channelId,
       member_type: "user",
       user_id: userId,
       agent_id: null,
       added_by: user.id,
     })),
     ...agentIds.map((agentId) => ({
-      channel_id: channel.id,
+      channel_id: channelId,
       member_type: "agent",
       user_id: null,
       agent_id: agentId,
       added_by: user.id,
     })),
     {
-      channel_id: channel.id,
+      channel_id: channelId,
       member_type: "orchestrator",
       user_id: null,
       agent_id: null,
       added_by: user.id,
     },
   ];
-  const { error: membersError } = await supabase
-    .from("chat_channel_members")
-    .insert(memberRows);
-  if (membersError) {
-    await supabase.from("chat_channels").delete().eq("id", channel.id);
-    return NextResponse.json({ error: membersError.message }, { status: 400 });
+  const result = await createChatChannelInRlsOrder({
+    insertChannelWithoutReturning: async () => {
+      const { error } = await supabase.from("chat_channels").insert({
+        id: channelId,
+        workspace_id: workspace.id,
+        kind,
+        name,
+        slug,
+        topic:
+          typeof body?.topic === "string" && body.topic.trim()
+            ? body.topic.trim().slice(0, 500)
+            : null,
+        profile_id: profileId,
+        visibility,
+        orchestrator_mode: orchestratorMode,
+        created_by: user.id,
+      });
+      return error;
+    },
+    insertMembers: async () => {
+      const { error } = await supabase
+        .from("chat_channel_members")
+        .insert(memberRows);
+      return error;
+    },
+    readChannel: async () => {
+      const { data, error } = await supabase
+        .from("chat_channels")
+        .select("*")
+        .eq("id", channelId)
+        .single();
+      return { data, error };
+    },
+    rollbackChannel: async () => {
+      await supabase.from("chat_channels").delete().eq("id", channelId);
+    },
+  });
+  if (result.error) {
+    const status =
+      result.stage === "channel"
+        ? result.error.code === "23505"
+          ? 409
+          : result.error.code === "42501"
+            ? 403
+            : 500
+        : result.stage === "members"
+          ? 400
+          : 500;
+    return NextResponse.json(
+      { error: result.error.message },
+      { status },
+    );
   }
 
-  return NextResponse.json({ channel }, { status: 201 });
+  return NextResponse.json({ channel: result.data }, { status: 201 });
 }

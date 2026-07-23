@@ -6,18 +6,17 @@ import { getBrandName } from "@/lib/config/appConfig";
 
 export function AppNav({ compact = false }: { compact?: boolean }) {
   const pathname = usePathname();
+  // Surface switcher only (Command Center | Chat). Settings deliberately
+  // lives once — behind the gear in the Command Center header (/settings) —
+  // instead of being duplicated here.
   const items = [
     {
       href: "/dashboard",
       label: "Command Center",
+      shortLabel: "Ops",
       active: pathname.startsWith("/dashboard"),
     },
-    { href: "/chat", label: "Chat", active: pathname.startsWith("/chat") },
-    {
-      href: "/settings",
-      label: "Settings",
-      active: pathname.startsWith("/settings"),
-    },
+    { href: "/chat", label: "Chat", shortLabel: "Chat", active: pathname.startsWith("/chat") },
   ];
   return (
     <nav
@@ -34,7 +33,8 @@ export function AppNav({ compact = false }: { compact?: boolean }) {
               : "text-zinc-500 hover:text-zinc-200"
           } ${compact ? "px-2" : ""}`}
         >
-          {item.label}
+          <span className="hidden sm:inline">{item.label}</span>
+          <span className="sm:hidden">{item.shortLabel}</span>
         </Link>
       ))}
     </nav>
