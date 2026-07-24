@@ -23,6 +23,7 @@ import {
   inferProviderForModelId,
   reasoningEffortsForModel,
 } from "@/lib/ai/modelCatalog";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type ScheduledJob = {
   id: string;
@@ -746,34 +747,44 @@ export function SchedulePanel({
                             <div className="mt-1.5 space-y-1.5">
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="w-10 shrink-0 text-[10px] text-zinc-500">Runs on</span>
-                                <select
+                                <CustomSelect
                                   value={j.target_agent_id || ""}
                                   disabled={retargetingJobId === j.id || loading || savingEdit}
-                                  onChange={(e) =>
-                                    void retargetJob(j, e.target.value || null)
+                                  onChange={(nextValue) =>
+                                    void retargetJob(j, nextValue || null)
                                   }
-                                  className="min-w-0 max-w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
-                                >
-                                  <option value="">Orchestrator (default)</option>
-                                  {workerOptions.map((worker) => (
-                                    <option
-                                      key={worker.id}
-                                      value={worker.id}
-                                      disabled={!worker.configured && j.target_agent_id !== worker.id}
-                                    >
-                                      {worker.name} ({worker.harness === "codex" ? "Codex" : "Claude Code"})
-                                      {!worker.configured ? " — setup needed" : ""}
-                                    </option>
-                                  ))}
-                                </select>
+                                  options={[
+                                    {
+                                      value: "",
+                                      label: "Orchestrator (default)",
+                                    },
+                                    ...workerOptions.map((worker) => ({
+                                      value: worker.id,
+                                      label: `${worker.name} (${
+                                        worker.harness === "codex"
+                                          ? "Codex"
+                                          : "Claude Code"
+                                      })${
+                                        !worker.configured
+                                          ? " — setup needed"
+                                          : ""
+                                      }`,
+                                      disabled:
+                                        !worker.configured &&
+                                        j.target_agent_id !== worker.id,
+                                    })),
+                                  ]}
+                                  className="min-w-0 max-w-full flex-1"
+                                  ariaLabel="Scheduled task executor"
+                                  size="xs"
+                                />
                               </div>
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="w-10 shrink-0 text-[10px] text-zinc-500">Model</span>
-                                <select
+                                <CustomSelect
                                   value={scheduledModel?.model || ""}
                                   disabled={updatingModelJobId === j.id || loading || savingEdit}
-                                  onChange={(event) => {
-                                    const model = event.target.value;
+                                  onChange={(model) => {
                                     void updateScheduledModel(
                                       j,
                                       model
@@ -785,49 +796,65 @@ export function SchedulePanel({
                                         : null
                                     );
                                   }}
-                                  className="min-w-0 max-w-full rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
-                                  title="Model used only by this scheduled task"
-                                >
-                                  <option value="">
-                                    {j.target_agent_id ? "Agent default" : "Orchestrator default"}
-                                  </option>
-                                  {scheduledModel && !modelIsInCatalog && (
-                                    <option value={scheduledModel.model}>
-                                      {catalogModelLabel(scheduledModel.model)} (custom)
-                                    </option>
-                                  )}
-                                  {modelGroups.map((group) => (
-                                    <optgroup key={group.provider} label={group.group}>
-                                      {group.models.map((model) => (
-                                        <option key={model.id} value={model.id}>
-                                          {model.label}{model.hint ? ` — ${model.hint}` : ""}
-                                        </option>
-                                      ))}
-                                    </optgroup>
-                                  ))}
-                                </select>
+                                  options={[
+                                    {
+                                      value: "",
+                                      label: j.target_agent_id
+                                        ? "Agent default"
+                                        : "Orchestrator default",
+                                    },
+                                    ...(scheduledModel && !modelIsInCatalog
+                                      ? [
+                                          {
+                                            value: scheduledModel.model,
+                                            label: `${catalogModelLabel(
+                                              scheduledModel.model,
+                                            )} (custom)`,
+                                          },
+                                        ]
+                                      : []),
+                                    ...modelGroups.flatMap((group) =>
+                                      group.models.map((model) => ({
+                                        value: model.id,
+                                        label: model.label,
+                                        description: [
+                                          group.group,
+                                          model.hint,
+                                        ]
+                                          .filter(Boolean)
+                                          .join(" · "),
+                                      })),
+                                    ),
+                                  ]}
+                                  className="min-w-0 max-w-full flex-1"
+                                  ariaLabel="Scheduled task model"
+                                  size="xs"
+                                />
                                 {scheduledModel && scheduledEfforts.length > 0 && (
-                                  <select
+                                  <CustomSelect
                                     value={scheduledModel.reasoningEffort || ""}
                                     disabled={updatingModelJobId === j.id || loading || savingEdit}
-                                    onChange={(event) =>
+                                    onChange={(nextValue) =>
                                       void updateScheduledModel(j, {
                                         ...scheduledModel,
-                                        reasoningEffort: event.target.value || null,
+                                        reasoningEffort: nextValue || null,
                                       })
                                     }
-                                    className="min-w-0 rounded-md border border-white/10 bg-black/30 px-1.5 py-1 text-[10px] text-zinc-300 outline-none focus:border-cyan-400/40 disabled:opacity-50"
-                                    title="Reasoning effort for this scheduled task"
-                                  >
-                                    <option value="">Default effort</option>
-                                    {scheduledEfforts.map((effort) => (
-                                      <option key={effort} value={effort}>
-                                        {effort === "xhigh"
-                                          ? "Extra high"
-                                          : effort.charAt(0).toUpperCase() + effort.slice(1)}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    options={[
+                                      { value: "", label: "Default effort" },
+                                      ...scheduledEfforts.map((effort) => ({
+                                        value: effort,
+                                        label:
+                                          effort === "xhigh"
+                                            ? "Extra high"
+                                            : effort.charAt(0).toUpperCase() +
+                                              effort.slice(1),
+                                      })),
+                                    ]}
+                                    className="min-w-0 w-28"
+                                    ariaLabel="Scheduled task reasoning effort"
+                                    size="xs"
+                                  />
                                 )}
                               </div>
                             </div>

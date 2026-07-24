@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type WorkspaceMember = {
   user_id: string;
@@ -198,16 +199,17 @@ export function TeamAccessSettings() {
               type="email"
               className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-cyan-400/40"
             />
-            <select
+            <CustomSelect
               value={inviteRole}
-              onChange={(event) =>
-                setInviteRole(event.target.value === "guest" ? "guest" : "member")
+              onChange={(nextValue) =>
+                setInviteRole(nextValue === "guest" ? "guest" : "member")
               }
-              className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm"
-            >
-              <option value="member">Full workspace member</option>
-              <option value="guest">Channel guest</option>
-            </select>
+              options={[
+                { value: "member", label: "Full workspace member" },
+                { value: "guest", label: "Channel guest" },
+              ]}
+              ariaLabel="Invitation access"
+            />
           </div>
 
           <div className="mt-4">

@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { AgentUsageBreakdown } from "@/components/usage/AgentUsageBreakdown";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import {
   Loader2,
   Zap,
@@ -420,18 +421,22 @@ export function UsageDashboardContent() {
         {teamMembers.length > 1 && (
           <div className="flex items-center gap-2">
             <Users className="w-4 h-4 text-zinc-500" />
-            <select
+            <CustomSelect
               value={selectedTeamMemberId}
-              onChange={(e) => handleTeamMemberChange(e.target.value)}
-              className="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm text-zinc-300 outline-none hover:bg-white/10 focus:border-cyan-500/50 [color-scheme:dark]"
-            >
-              <option value="all">All team members</option>
-              {teamMembers.map((member) => (
-                <option key={member.userId} value={member.userId}>
-                  {member.label}{member.isCurrentUser ? " (you)" : ""}
-                </option>
-              ))}
-            </select>
+              onChange={handleTeamMemberChange}
+              options={[
+                { value: "all", label: "All team members" },
+                ...teamMembers.map((member) => ({
+                  value: member.userId,
+                  label: `${member.label}${
+                    member.isCurrentUser ? " (you)" : ""
+                  }`,
+                })),
+              ]}
+              className="w-52"
+              ariaLabel="Team member usage"
+              size="sm"
+            />
           </div>
         )}
       </div>

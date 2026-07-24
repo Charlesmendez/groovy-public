@@ -6,6 +6,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { AppNav } from "@/components/AppNav";
 import { ChannelAccessModal } from "@/components/chat/ChannelAccessModal";
 import { PeopleInviteModal } from "@/components/chat/PeopleInviteModal";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type Channel = {
   id: string;
@@ -692,20 +693,30 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                   disabled={creatingChannel}
                 />
               </div>
-              <select
+              <CustomSelect
                 value={newChannelVisibility}
-                onChange={(event) =>
+                onChange={(nextValue) =>
                   setNewChannelVisibility(
-                    event.target.value === "private" ? "private" : "workspace",
+                    nextValue === "private" ? "private" : "workspace",
                   )
                 }
-                className="mt-2 w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2.5 py-2 text-xs text-[var(--text-secondary)] outline-none"
-                aria-label="Channel visibility"
+                options={[
+                  {
+                    value: "workspace",
+                    label: "Workspace",
+                    description: "Everyone can find it",
+                  },
+                  {
+                    value: "private",
+                    label: "Private",
+                    description: "Invited members only",
+                  },
+                ]}
+                className="mt-2"
+                ariaLabel="Channel visibility"
                 disabled={creatingChannel}
-              >
-                <option value="workspace">Workspace — everyone can find it</option>
-                <option value="private">Private — invited members only</option>
-              </select>
+                size="sm"
+              />
               {channelCreateError ? (
                 <p className="mt-2 text-xs leading-relaxed text-red-300">
                   {channelCreateError}
@@ -884,35 +895,38 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
               </div>
               {/* Room controls: inline on md+, collapsed into a bottom sheet on mobile */}
               <div className="hidden items-center gap-3 md:flex">
-                <select
+                <CustomSelect
                   value={active.profile_id || ""}
-                  onChange={(event) =>
-                    void patchChannel({ profileId: event.target.value || null })
+                  onChange={(nextValue) =>
+                    void patchChannel({ profileId: nextValue || null })
                   }
-                  className="rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-2 py-1.5 text-xs"
-                  aria-label="Channel harness profile"
+                  options={[
+                    { value: "", label: "Groovy default" },
+                    ...profiles.map((profile) => ({
+                      value: profile.id,
+                      label: profile.name,
+                    })),
+                  ]}
+                  className="w-48"
+                  ariaLabel="Channel Mind"
                   disabled={!canManageActive}
-                >
-                  <option value="">Groovy default</option>
-                  {profiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.name}
-                    </option>
-                  ))}
-                </select>
-                <select
+                  size="sm"
+                />
+                <CustomSelect
                   value={active.orchestrator_mode}
-                  onChange={(event) =>
-                    void patchChannel({ orchestratorMode: event.target.value })
+                  onChange={(nextValue) =>
+                    void patchChannel({ orchestratorMode: nextValue })
                   }
-                  className="rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-2 py-1.5 text-xs"
-                  aria-label="Orchestrator attention mode"
+                  options={[
+                    { value: "mention", label: "@mention only" },
+                    { value: "always", label: "Always listening" },
+                    { value: "off", label: "Off — humans only" },
+                  ]}
+                  className="w-44"
+                  ariaLabel="Orchestrator attention"
                   disabled={!canManageActive}
-                >
-                  <option value="mention">@mention</option>
-                  <option value="always">always</option>
-                  <option value="off">off</option>
-                </select>
+                  size="sm"
+                />
                 {active.kind === "channel" && canManageActive ? (
                   <button
                     type="button"
@@ -1208,32 +1222,39 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
             <label className="mb-1 block text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
               Mind
             </label>
-            <select
+            <CustomSelect
               value={active.profile_id || ""}
-              onChange={(event) => void patchChannel({ profileId: event.target.value || null })}
-              className="mb-4 w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-3 py-2.5 text-sm"
+              onChange={(nextValue) =>
+                void patchChannel({ profileId: nextValue || null })
+              }
+              options={[
+                { value: "", label: "Groovy default" },
+                ...profiles.map((profile) => ({
+                  value: profile.id,
+                  label: profile.name,
+                })),
+              ]}
+              className="mb-4"
+              ariaLabel="Channel Mind"
               disabled={!canManageActive}
-            >
-              <option value="">Groovy default</option>
-              {profiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profile.name}
-                </option>
-              ))}
-            </select>
+            />
             <label className="mb-1 block text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
               Orchestrator attention
             </label>
-            <select
+            <CustomSelect
               value={active.orchestrator_mode}
-              onChange={(event) => void patchChannel({ orchestratorMode: event.target.value })}
-              className="mb-4 w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-3 py-2.5 text-sm"
+              onChange={(nextValue) =>
+                void patchChannel({ orchestratorMode: nextValue })
+              }
+              options={[
+                { value: "mention", label: "@mention only" },
+                { value: "always", label: "Always listening" },
+                { value: "off", label: "Off — humans only" },
+              ]}
+              className="mb-4"
+              ariaLabel="Orchestrator attention"
               disabled={!canManageActive}
-            >
-              <option value="mention">@mention only</option>
-              <option value="always">always listening</option>
-              <option value="off">off — humans only</option>
-            </select>
+            />
             <div className="flex gap-2">
               {active.kind === "channel" && canManageActive ? (
                 <button

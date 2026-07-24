@@ -37,6 +37,7 @@ import {
 import { UsageDashboardContent } from "@/components/usage/UsageDashboardContent";
 import { BillingCardSetupForm } from "@/components/billing/BillingCardSetupForm";
 import { IntegrationSettingsSection } from "@/components/command-center/IntegrationSettingsSection";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useConnectorInstallGuide } from "@/lib/connector/installGuide";
 import {
   readConnectorPlatformOverride,
@@ -2934,10 +2935,9 @@ export function SettingsModal({
               {aiyraDevicesLoading ? "Loading..." : "Refresh"}
             </button>
           </div>
-          <select
+          <CustomSelect
             value={selectedAiyraMicValue}
-            onChange={(e) => {
-              const value = e.target.value;
+            onChange={(value) => {
               if (value === "computer_default") {
                 setAiyraMicMode("computer_default");
                 setAiyraMicName("");
@@ -2957,21 +2957,29 @@ export function SettingsModal({
                 setAiyraResolvedMicName(nextMicName);
               }
             }}
-            className="w-full px-3 py-2.5 rounded-lg bg-black/40 border border-white/10 text-white outline-none focus:border-cyan-500/50 transition-colors text-sm appearance-none"
-          >
-            <option value="computer_default">Computer microphone (recommended)</option>
-            <option value="system_default">System default</option>
-            {aiyraMicMode === "specific" && aiyraMicName && !selectedSpecificMicAvailable ? (
-              <option value={`specific:${encodeURIComponent(aiyraMicName)}`}>
-                {aiyraMicName} (currently unavailable)
-              </option>
-            ) : null}
-            {aiyraAudioDevices.map((d) => (
-              <option key={`${d.index}-${d.name}`} value={`specific:${encodeURIComponent(d.name)}`}>
-                Use {d.name}
-              </option>
-            ))}
-          </select>
+            options={[
+              {
+                value: "computer_default",
+                label: "Computer microphone (recommended)",
+              },
+              { value: "system_default", label: "System default" },
+              ...(aiyraMicMode === "specific" &&
+              aiyraMicName &&
+              !selectedSpecificMicAvailable
+                ? [
+                    {
+                      value: `specific:${encodeURIComponent(aiyraMicName)}`,
+                      label: `${aiyraMicName} (currently unavailable)`,
+                    },
+                  ]
+                : []),
+              ...aiyraAudioDevices.map((device) => ({
+                value: `specific:${encodeURIComponent(device.name)}`,
+                label: `Use ${device.name}`,
+              })),
+            ]}
+            ariaLabel="Microphone"
+          />
           <div className="text-[11px] text-zinc-600">{aiyraMicStatusText}</div>
           {aiyraAudioDevices.length === 0 && !aiyraDevicesLoading && (
             <div className="text-[11px] text-zinc-600">
@@ -4301,17 +4309,24 @@ export function SettingsModal({
                 className="w-16 text-center text-sm rounded-lg bg-white/5 border border-white/10 text-white px-2 py-1.5 outline-none"
               />
             </label>
-            <label className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-4">
               <span className="text-sm text-zinc-300">Branch mode</span>
-              <select
+              <CustomSelect
                 value={agentRuntimeBranchMode}
-                onChange={(e) => setAgentRuntimeBranchMode(e.target.value as "read_write" | "read_only")}
-                className="text-sm rounded-lg bg-white/5 border border-white/10 text-white px-2 py-1.5 outline-none"
-              >
-                <option value="read_write">Read &amp; Write</option>
-                <option value="read_only">Read Only</option>
-              </select>
-            </label>
+                onChange={(nextValue) =>
+                  setAgentRuntimeBranchMode(
+                    nextValue as "read_write" | "read_only",
+                  )
+                }
+                options={[
+                  { value: "read_write", label: "Read & Write" },
+                  { value: "read_only", label: "Read Only" },
+                ]}
+                className="w-40"
+                ariaLabel="Branch mode"
+                size="sm"
+              />
+            </div>
           </div>
         </div>
       </div>

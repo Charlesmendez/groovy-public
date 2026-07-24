@@ -11,6 +11,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { INITIAL_MINDS, MODEL_OPTIONS } from "@/components/chat/chatMockData";
 import { MindAvatar } from "@/components/chat/ChatAvatars";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type Path = "join" | "start" | "solo";
 
@@ -145,6 +146,7 @@ export default function WelcomePage() {
   const [name, setName] = useState("");
   const [wsName, setWsName] = useState("");
   const [mindTemplate, setMindTemplate] = useState("groovy");
+  const [model, setModel] = useState(MODEL_OPTIONS[0] ?? "");
   const [hosting, setHosting] = useState<"skip" | "this" | "server" | null>(null);
 
   const reset = () => {
@@ -325,16 +327,17 @@ export default function WelcomePage() {
           <Title sub="Bring your own key — Groovy doesn't mark up tokens. Teammates never need their own keys.">
             Connect a brain
           </Title>
-          <label className="mb-3 block">
+          <div className="mb-3 block">
             <span className="mb-1 block text-[11px] font-medium uppercase tracking-widest text-[var(--text-secondary)]">
               Model
             </span>
-            <select className="w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-3 py-2.5 text-sm outline-none">
-              {MODEL_OPTIONS.map((m) => (
-                <option key={m}>{m}</option>
-              ))}
-            </select>
-          </label>
+            <CustomSelect
+              ariaLabel="Model"
+              value={model}
+              onChange={setModel}
+              options={MODEL_OPTIONS.map((option) => ({ value: option, label: option }))}
+            />
+          </div>
           <Input label="API key" placeholder="sk-ant-…" type="password" value={""} onChange={() => {}} />
           <CTA onClick={() => setStep(3)}>Continue →</CTA>
         </Shell>

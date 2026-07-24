@@ -18,6 +18,7 @@ import {
 } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ProfileSwitcher } from "@/components/harness/ProfileSwitcher";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import {
   ArrowUp,
   Brain,
@@ -349,31 +350,45 @@ export function OrchestratorBar({
           <div className="flex min-w-0 items-center gap-2 border-b border-violet-400/10 px-3 py-2">
             <ListChecks className="h-3.5 w-3.5 shrink-0 text-violet-300" />
             <span className="hidden text-[11px] font-medium text-violet-200 sm:inline">Plan with</span>
-            <select
+            <CustomSelect
               value={planAgent?.id || ""}
-              onChange={(event) => setPlanAgentId(event.target.value)}
-              className="min-w-0 flex-1 rounded-lg border border-violet-400/20 bg-violet-500/10 px-2 py-1 text-xs text-violet-100 outline-none focus:border-violet-300/50 sm:max-w-44 sm:flex-none"
-              aria-label="Worker agent to explore the repository for this plan"
-            >
-              {agents.length === 0 && <option value="">No configured agents</option>}
-              {agents.map((agent) => (
-                <option key={agent.id} value={agent.id} className="bg-zinc-900 text-white">
-                  {agent.name} · {agent.harness === "codex" ? "Codex" : "Claude"}
-                </option>
-              ))}
-            </select>
-            <select
-              value={planDepth}
-              onChange={(event) =>
-                setPlanDepth(event.target.value as "quick" | "standard" | "thorough")
+              onChange={setPlanAgentId}
+              options={
+                agents.length === 0
+                  ? [
+                      {
+                        value: "",
+                        label: "No configured agents",
+                        disabled: true,
+                      },
+                    ]
+                  : agents.map((agent) => ({
+                      value: agent.id,
+                      label: `${agent.name} · ${
+                        agent.harness === "codex" ? "Codex" : "Claude"
+                      }`,
+                    }))
               }
-              className="rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-zinc-300 outline-none focus:border-violet-300/50"
-              aria-label="Repository exploration depth"
-            >
-              <option value="quick" className="bg-zinc-900">Quick</option>
-              <option value="standard" className="bg-zinc-900">Standard</option>
-              <option value="thorough" className="bg-zinc-900">Thorough</option>
-            </select>
+              className="min-w-0 flex-1 sm:max-w-44 sm:flex-none"
+              triggerClassName="border-violet-400/20 bg-violet-500/10"
+              ariaLabel="Worker agent to explore the repository for this plan"
+              disabled={agents.length === 0}
+              size="xs"
+            />
+            <CustomSelect
+              value={planDepth}
+              onChange={(nextValue) =>
+                setPlanDepth(nextValue as "quick" | "standard" | "thorough")
+              }
+              options={[
+                { value: "quick", label: "Quick" },
+                { value: "standard", label: "Standard" },
+                { value: "thorough", label: "Thorough" },
+              ]}
+              className="w-24"
+              ariaLabel="Repository exploration depth"
+              size="xs"
+            />
             <span className="hidden min-w-0 truncate text-[10px] text-zinc-500 md:inline">
               {planAgent?.workspaceRootPath || "Choose an agent with a workspace"}
             </span>

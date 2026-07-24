@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useRelay, type RelayMessage } from "@/hooks/useRelay";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type Target = "all" | "flow" | "claude" | "codex";
 type ArtifactType = "skill" | "instruction_doc";
@@ -751,17 +752,17 @@ export function SkillsManagerContent() {
                 {activeDeviceId ? `Device ${activeDeviceId.slice(0, 8)}` : "Start Groovy Connector to sync private repos."}
               </div>
               {onlineDevices.size > 1 && (
-                <select
+                <CustomSelect
+                  ariaLabel="Active connector"
+                  size="sm"
+                  className="mt-3 w-full"
                   value={activeDeviceId || ""}
-                  onChange={(e) => setActiveDeviceId(e.target.value || null)}
-                  className="mt-3 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-xs text-zinc-200 outline-none"
-                >
-                  {Array.from(onlineDevices.keys()).map((deviceId) => (
-                    <option key={deviceId} value={deviceId}>
-                      {deviceId.slice(0, 8)}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(value) => setActiveDeviceId(value || null)}
+                  options={Array.from(onlineDevices.keys()).map((deviceId) => ({
+                    value: deviceId,
+                    label: `Device ${deviceId.slice(0, 8)}`,
+                  }))}
+                />
               )}
             </div>
           </div>
@@ -1092,21 +1093,20 @@ export function SkillsManagerContent() {
                   className="w-full rounded-lg border border-white/10 bg-black/30 py-2 pl-9 pr-3 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-cyan-400/40"
                 />
               </div>
-              <select
+              <CustomSelect
+                ariaLabel="Selected agent"
                 value={selectedAgentId}
-                onChange={(e) => {
-                  const next = agents.find((agent) => agent.id === e.target.value) || null;
-                  setSelectedAgentId(e.target.value);
+                onChange={(value) => {
+                  const next = agents.find((agent) => agent.id === value) || null;
+                  setSelectedAgentId(value);
                   if (next) setAgentTarget(next.target);
                 }}
-                className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white outline-none"
-              >
-                {agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name} · {agent.target}
-                  </option>
-                ))}
-              </select>
+                options={agents.map((agent) => ({
+                  value: agent.id,
+                  label: agent.name,
+                  description: agent.target,
+                }))}
+              />
             </div>
           </div>
 
@@ -1266,10 +1266,11 @@ export function SkillsManagerContent() {
                               <Check className="h-3.5 w-3.5" />
                               {selectedAgentAssignment ? "Assigned only to this agent" : "Assign only to this agent"}
                             </button>
-                            <select
+                            <CustomSelect
+                              ariaLabel={selectedAgentAssignment ? "Move this skill to another agent" : "Assign this skill to an agent"}
+                              size="sm"
                               value=""
-                              onChange={(e) => {
-                                const toAgentId = e.target.value;
+                              onChange={(toAgentId) => {
                                 const toAgent = agents.find((agent) => agent.id === toAgentId) || null;
                                 if (!toAgentId || !toAgent) return;
                                 if (selectedAgentAssignment) {
@@ -1277,7 +1278,6 @@ export function SkillsManagerContent() {
                                 } else {
                                   void toggleAssignment(artifact, toAgent.target, toAgentId);
                                 }
-                                e.currentTarget.value = "";
                               }}
                               disabled={
                                 !isAdmin ||
@@ -1286,22 +1286,19 @@ export function SkillsManagerContent() {
                                   ? busyKey === `reassign:${selectedAgentAssignment.id}`
                                   : busyKey !== null)
                               }
-                              title={selectedAgentAssignment ? "Move this skill to another agent" : "Assign this skill to an agent"}
-                              className="rounded-lg border border-white/10 bg-black/40 px-2 py-2 text-xs text-zinc-200 outline-none disabled:opacity-50"
-                            >
-                              <option value="">
-                                {selectedAgentAssignment && busyKey === `reassign:${selectedAgentAssignment.id}`
+                              placeholder={
+                                selectedAgentAssignment && busyKey === `reassign:${selectedAgentAssignment.id}`
                                   ? "Moving..."
                                   : selectedAgentAssignment
                                     ? "Move to..."
-                                    : "Assign to..."}
-                              </option>
-                              {selectedAgentMoveTargets.map((agent) => (
-                                <option key={agent.id} value={agent.id}>
-                                  {agent.name} · {agent.target}
-                                </option>
-                              ))}
-                            </select>
+                                    : "Assign to..."
+                              }
+                              options={selectedAgentMoveTargets.map((agent) => ({
+                                value: agent.id,
+                                label: agent.name,
+                                description: agent.target,
+                              }))}
+                            />
                           </div>
                         </>
                       )}
@@ -1331,32 +1328,26 @@ export function SkillsManagerContent() {
                                       {assignment.target}
                                     </div>
                                   </div>
-                                  <select
+                                  <CustomSelect
+                                    ariaLabel={`Move ${currentAgent?.name || "assigned agent"}`}
+                                    size="sm"
                                     value=""
-                                    onChange={(e) => {
-                                      const toAgentId = e.target.value;
+                                    onChange={(toAgentId) => {
                                       if (!toAgentId) return;
                                       void reassignAssignment(assignment, artifact, toAgentId);
-                                      e.currentTarget.value = "";
                                     }}
                                     disabled={
                                       !isAdmin ||
                                       compatibleAgents.length === 0 ||
                                       busyKey === `reassign:${assignment.id}`
                                     }
-                                    className="rounded-lg border border-white/10 bg-black/40 px-2 py-1.5 text-xs text-zinc-200 outline-none disabled:opacity-50"
-                                  >
-                                    <option value="">
-                                      {busyKey === `reassign:${assignment.id}`
-                                        ? "Moving..."
-                                        : "Move to..."}
-                                    </option>
-                                    {compatibleAgents.map((agent) => (
-                                      <option key={agent.id} value={agent.id}>
-                                        {agent.name} · {agent.target}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    placeholder={busyKey === `reassign:${assignment.id}` ? "Moving..." : "Move to..."}
+                                    options={compatibleAgents.map((agent) => ({
+                                      value: agent.id,
+                                      label: agent.name,
+                                      description: agent.target,
+                                    }))}
+                                  />
                                 </div>
                               );
                             })}
@@ -1459,17 +1450,15 @@ export function SkillsManagerContent() {
 
             <div className="mt-5 grid gap-4 lg:grid-cols-[300px_1fr]">
               <div className="space-y-3">
-                <select
+                <CustomSelect
+                  ariaLabel="Repository"
                   value={selectedRepoId}
-                  onChange={(e) => setSelectedRepoId(e.target.value)}
-                  className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white outline-none"
-                >
-                  {repositories.map((repo) => (
-                    <option key={repo.id} value={repo.id}>
-                      {repo.label}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setSelectedRepoId}
+                  options={repositories.map((repo) => ({
+                    value: repo.id,
+                    label: repo.label,
+                  }))}
+                />
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     type="button"

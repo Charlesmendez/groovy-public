@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type InviteChannel = {
   id: string;
@@ -174,26 +175,33 @@ export function PeopleInviteModal({
             className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2.5 text-sm outline-none placeholder:text-zinc-600 focus:border-cyan-400/40"
           />
 
-          <label
-            htmlFor="invite-person-role"
+          <div
             className="mb-1.5 mt-4 block text-[11px] font-medium uppercase tracking-widest text-zinc-500"
           >
             Access
-          </label>
-          <select
-            id="invite-person-role"
+          </div>
+          <CustomSelect
             value={role}
-            onChange={(event) => {
-              setRole(event.target.value === "guest" ? "guest" : "member");
+            onChange={(nextValue) => {
+              setRole(nextValue === "guest" ? "guest" : "member");
               setError(null);
               setResult(null);
             }}
+            options={[
+              {
+                value: "member",
+                label: "Full workspace member",
+                description: "Workspace settings and visible channels",
+              },
+              {
+                value: "guest",
+                label: "Channel guest",
+                description: "Only the channels selected below",
+              },
+            ]}
+            ariaLabel="Invitation access"
             disabled={busy}
-            className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2.5 text-sm outline-none"
-          >
-            <option value="member">Full workspace member</option>
-            <option value="guest">Channel guest</option>
-          </select>
+          />
 
           <div className="mt-5">
             <div className="flex items-center justify-between gap-3">

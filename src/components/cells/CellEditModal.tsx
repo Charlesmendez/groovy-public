@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Loader2, Plus, RefreshCw, Save, Target, Trash2, Users, X } from "lucide-react";
 import type { CellDetail } from "@/lib/cells/types";
 import type { CellWorkspaceMemberOption } from "@/components/cells/CellCreateModal";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type CellEditModalProps = {
   isOpen: boolean;
@@ -165,15 +166,20 @@ export function CellEditModal({ isOpen, cell, members, onClose, onSaved }: CellE
                   className="w-full px-4 py-3 rounded-2xl bg-black/40 border border-white/10 text-white text-sm outline-none focus:border-cyan-500/45 transition-colors"
                 />
 
-                <select
+                <CustomSelect
                   value={status}
-                  onChange={(e) => setStatus(e.target.value as typeof status)}
-                  className="px-4 py-3 rounded-2xl bg-black/40 border border-white/10 text-white text-sm outline-none focus:border-cyan-500/45 transition-colors"
-                >
-                  <option value="active">Active</option>
-                  <option value="paused">Paused</option>
-                  <option value="archived">Archived</option>
-                </select>
+                  onChange={(nextValue) =>
+                    setStatus(nextValue as typeof status)
+                  }
+                  options={[
+                    { value: "active", label: "Active" },
+                    { value: "paused", label: "Paused" },
+                    { value: "archived", label: "Archived" },
+                  ]}
+                  className="sm:w-36"
+                  ariaLabel="Cell status"
+                  size="lg"
+                />
               </div>
 
               <textarea
@@ -289,36 +295,42 @@ export function CellEditModal({ isOpen, cell, members, onClose, onSaved }: CellE
                       />
 
                       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                        <select
+                        <CustomSelect
                           value={kr.measurementMode}
-                          onChange={(e) =>
+                          onChange={(nextValue) =>
                             updateKeyResult(index, {
-                              measurementMode: e.target.value as EditableKeyResult["measurementMode"],
+                              measurementMode:
+                                nextValue as EditableKeyResult["measurementMode"],
                             })
                           }
                           disabled={regenerateFramework}
-                          className="px-4 py-3 rounded-2xl bg-black/40 border border-white/10 text-white text-sm outline-none focus:border-cyan-500/45 transition-colors disabled:cursor-not-allowed"
-                        >
-                          <option value="computed">Computed</option>
-                          <option value="hybrid">Hybrid</option>
-                          <option value="manual">Manual</option>
-                        </select>
+                          options={[
+                            { value: "computed", label: "Computed" },
+                            { value: "hybrid", label: "Hybrid" },
+                            { value: "manual", label: "Manual" },
+                          ]}
+                          ariaLabel={`Key result ${index + 1} measurement mode`}
+                          size="lg"
+                        />
 
-                        <select
+                        <CustomSelect
                           value={kr.direction}
-                          onChange={(e) =>
+                          onChange={(nextValue) =>
                             updateKeyResult(index, {
-                              direction: e.target.value as EditableKeyResult["direction"],
+                              direction:
+                                nextValue as EditableKeyResult["direction"],
                             })
                           }
                           disabled={regenerateFramework}
-                          className="px-4 py-3 rounded-2xl bg-black/40 border border-white/10 text-white text-sm outline-none focus:border-cyan-500/45 transition-colors disabled:cursor-not-allowed"
-                        >
-                          <option value="increase">Increase</option>
-                          <option value="decrease">Decrease</option>
-                          <option value="maintain">Maintain</option>
-                          <option value="binary">Binary</option>
-                        </select>
+                          options={[
+                            { value: "increase", label: "Increase" },
+                            { value: "decrease", label: "Decrease" },
+                            { value: "maintain", label: "Maintain" },
+                            { value: "binary", label: "Binary" },
+                          ]}
+                          ariaLabel={`Key result ${index + 1} direction`}
+                          size="lg"
+                        />
 
                         <input
                           value={kr.targetValue}

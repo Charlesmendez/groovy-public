@@ -26,6 +26,7 @@ import {
 import type { OrchestratorMessage } from "@/hooks/useOrchestrator";
 import type { AgentTask, AgentTaskStatus } from "@/hooks/useAgentTasks";
 import type { WorkerAgentInfo } from "@/hooks/useWorkerAgents";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 function StatusIcon({ status }: { status: AgentTaskStatus }) {
   switch (status) {
@@ -422,21 +423,30 @@ export function OrchestratorRail({
                           </div>
                         )}
                         <div className="flex gap-1.5">
-                          <select
+                          <CustomSelect
                             value={selectedExecutorId}
-                            onChange={(e) =>
-                              setPlanExecAgent((prev) => ({ ...prev, [task.id]: e.target.value }))
+                            onChange={(nextValue) =>
+                              setPlanExecAgent((prev) => ({
+                                ...prev,
+                                [task.id]: nextValue,
+                              }))
                             }
-                            className="flex-1 min-w-0 text-[11px] rounded-lg bg-black/30 border border-white/10 px-2 py-1.5 text-zinc-300 outline-none focus:border-violet-400/40"
-                          >
-                            <option value="">Save without running</option>
-                            {eligiblePlanAgents.map((agent) => (
-                              <option key={agent.id} value={agent.id}>
-                                Run with {agent.name} (
-                                {agent.harness === "codex" ? "Codex" : "Claude Code"})
-                              </option>
-                            ))}
-                          </select>
+                            options={[
+                              { value: "", label: "Save without running" },
+                              ...eligiblePlanAgents.map((agent) => ({
+                                value: agent.id,
+                                label: `Run with ${agent.name} (${
+                                  agent.harness === "codex"
+                                    ? "Codex"
+                                    : "Claude Code"
+                                })`,
+                              })),
+                            ]}
+                            className="min-w-0 flex-1"
+                            triggerClassName="border-violet-400/20"
+                            ariaLabel="Plan executor"
+                            size="xs"
+                          />
                           <button
                             disabled={planBusyTaskId === task.id}
                             onClick={async () => {

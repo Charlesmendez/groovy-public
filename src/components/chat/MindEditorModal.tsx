@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import {
   AGENTS,
   MODEL_OPTIONS,
@@ -104,15 +105,15 @@ export function MindEditorModal({
       <div className="mt-1 grid grid-cols-2 gap-4">
         <div>
           <FieldLabel>Brain</FieldLabel>
-          <select
+          <CustomSelect
             value={draft.model}
-            onChange={(e) => patch({ model: e.target.value })}
-            className="w-full rounded-lg border border-[var(--glass-border)] bg-[var(--bg-primary)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none"
-          >
-            {MODEL_OPTIONS.map((m) => (
-              <option key={m}>{m}</option>
-            ))}
-          </select>
+            onChange={(nextValue) => patch({ model: nextValue })}
+            options={MODEL_OPTIONS.map((model) => ({
+              value: model,
+              label: model,
+            }))}
+            ariaLabel="Brain model"
+          />
         </div>
         <div>
           <FieldLabel>Reasoning effort</FieldLabel>

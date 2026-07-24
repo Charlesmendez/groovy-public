@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { HARNESS_PROFILE_TEMPLATES } from "@/lib/orchestrator/profileTemplates";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type ProfileRow = {
   id: string;
@@ -604,32 +605,36 @@ reply = requests.post(
               <div className="grid gap-4 sm:grid-cols-3">
                 <div>
                   <label className={labelCls}>Authorization</label>
-                  <select
-                    className={inputCls}
+                  <CustomSelect
+                    ariaLabel="Authorization"
+                    triggerClassName={inputCls}
                     value={draft.authorization_stance ?? "operator"}
-                    onChange={(e) =>
+                    onChange={(value) =>
                       setDraft((d) => ({
                         ...d,
-                        authorization_stance: e.target.value as "operator" | "restricted",
+                        authorization_stance: value as "operator" | "restricted",
                       }))
                     }
-                  >
-                    <option value="operator">Operator — full trust</option>
-                    <option value="restricted">Restricted — boundary + approvals</option>
-                  </select>
+                    options={[
+                      { value: "operator", label: "Operator", description: "Full trust" },
+                      { value: "restricted", label: "Restricted", description: "Boundaries and approvals" },
+                    ]}
+                  />
                 </div>
                 <div>
                   <label className={labelCls}>Memory</label>
-                  <select
-                    className={inputCls}
+                  <CustomSelect
+                    ariaLabel="Memory"
+                    triggerClassName={inputCls}
                     value={draft.memory_scope ?? "shared"}
-                    onChange={(e) =>
-                      setDraft((d) => ({ ...d, memory_scope: e.target.value as "shared" | "profile" }))
+                    onChange={(value) =>
+                      setDraft((d) => ({ ...d, memory_scope: value as "shared" | "profile" }))
                     }
-                  >
-                    <option value="shared">Shared workspace memory</option>
-                    <option value="profile">Own memory only</option>
-                  </select>
+                    options={[
+                      { value: "shared", label: "Shared workspace memory" },
+                      { value: "profile", label: "Own memory only" },
+                    ]}
+                  />
                 </div>
                 <div>
                   <label className={labelCls}>Brain (model id)</label>
@@ -656,11 +661,12 @@ reply = requests.post(
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
                   <label className={labelCls}>Surface</label>
-                  <select
-                    className={inputCls}
+                  <CustomSelect
+                    ariaLabel="Surface"
+                    triggerClassName={inputCls}
                     value={draft.surface ?? "internal"}
-                    onChange={(e) => {
-                      const surface = e.target.value as "internal" | "external";
+                    onChange={(value) => {
+                      const surface = value as "internal" | "external";
                       setDraft((current) => ({
                         ...current,
                         surface,
@@ -689,31 +695,34 @@ reply = requests.post(
                           : {}),
                       }));
                     }}
-                  >
-                    <option value="internal">Internal — teammates/operators</option>
-                    <option value="external">External — API and widget</option>
-                  </select>
+                    options={[
+                      { value: "internal", label: "Internal", description: "Teammates and operators" },
+                      { value: "external", label: "External", description: "API and widget" },
+                    ]}
+                  />
                 </div>
                 <div>
                   <label className={labelCls}>Model provider</label>
-                  <select
-                    className={inputCls}
+                  <CustomSelect
+                    ariaLabel="Model provider"
+                    triggerClassName={inputCls}
                     value={draft.model?.provider ?? "anthropic"}
-                    onChange={(e) =>
+                    onChange={(value) =>
                       setDraft((current) => ({
                         ...current,
                         model: current.model
                           ? {
                               ...current.model,
-                              provider: e.target.value as "anthropic" | "openai",
+                              provider: value as "anthropic" | "openai",
                             }
                           : null,
                       }))
                     }
-                  >
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
-                  </select>
+                    options={[
+                      { value: "anthropic", label: "Anthropic" },
+                      { value: "openai", label: "OpenAI" },
+                    ]}
+                  />
                 </div>
               </div>
 

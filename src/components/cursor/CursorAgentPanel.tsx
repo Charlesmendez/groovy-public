@@ -829,18 +829,19 @@ export function CursorAgentPanel({
                     Loading repos...
                   </div>
                 ) : repositories.length > 0 ? (
-                  <select
+                  <CustomSelect
                     value={newTaskRepo}
-                    onChange={(e) => setNewTaskRepo(e.target.value)}
-                    className="w-full px-3 py-2 rounded-lg bg-black/30 border border-white/10 text-white text-sm outline-none focus:border-emerald-500/50"
-                  >
-                    <option value="">Select repository...</option>
-                    {repositories.map((r) => (
-                      <option key={r.repository} value={r.repository}>
-                        {r.owner}/{r.name}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setNewTaskRepo}
+                    options={[
+                      { value: "", label: "Select repository…" },
+                      ...repositories.map((repository) => ({
+                        value: repository.repository,
+                        label: `${repository.owner}/${repository.name}`,
+                      })),
+                    ]}
+                    ariaLabel="Repository"
+                    size="sm"
+                  />
                 ) : (
                   <input
                     type="text"
