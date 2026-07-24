@@ -155,6 +155,11 @@ cloud-scheduler, shared-settings/invite-scope, and run-control tables are live.
 
 ### Future migration operations
 
+`20260723006000_chat_channel_skills.sql` is the next pending production
+migration. Team Chat continues to load before it is applied, but channel-level
+skill assignment is intentionally unavailable until the table and RLS policies
+exist.
+
 The local Supabase CLI session is not authenticated. Before the next migration,
 authenticate it with a scoped Supabase access token and the production database
 password, then run:

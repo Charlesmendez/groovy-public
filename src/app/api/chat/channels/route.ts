@@ -73,6 +73,59 @@ export async function GET() {
         .eq("workspace_id", workspace.id)
         .in("id", profileIds)
     : { data: [] };
+  const skillArtifactsResult =
+    workspace.role === "guest"
+      ? { data: [] }
+      : await supabase
+          .from("workspace_skill_artifacts")
+          .select(
+            "id,artifact_type,name,description,relative_path,targets,lifecycle",
+          )
+          .eq("workspace_id", workspace.id)
+          .eq("lifecycle", "active")
+          .order("name", { ascending: true });
+  if ("error" in skillArtifactsResult && skillArtifactsResult.error) {
+    return NextResponse.json(
+      { error: skillArtifactsResult.error.message },
+      { status: 500 },
+    );
+  }
+  const skillArtifacts = skillArtifactsResult.data;
+  const flowSkillArtifacts = (skillArtifacts || []).filter((artifact) => {
+    const targets = Array.isArray(artifact.targets)
+      ? artifact.targets.map(String)
+      : [];
+    return (
+      targets.length === 0 ||
+      targets.includes("all") ||
+      targets.includes("flow")
+    );
+  });
+  const skillAssignmentsResult =
+    workspace.role === "guest" || channelIds.length === 0
+      ? { data: [] }
+      : await supabase
+          .from("chat_channel_skill_assignments")
+          .select("id,channel_id,artifact_id,created_at")
+          .in("channel_id", channelIds);
+  if ("error" in skillAssignmentsResult && skillAssignmentsResult.error) {
+    const migrationPending =
+      skillAssignmentsResult.error.code === "PGRST205" ||
+      skillAssignmentsResult.error.code === "42P01" ||
+      skillAssignmentsResult.error.message.includes(
+        "chat_channel_skill_assignments",
+      );
+    if (!migrationPending) {
+      return NextResponse.json(
+        { error: skillAssignmentsResult.error.message },
+        { status: 500 },
+      );
+    }
+    console.warn(
+      "[team-chat] channel skills migration is pending; loading chat without channel capability assignments",
+    );
+  }
+  const skillAssignments = skillAssignmentsResult.data;
 
   return NextResponse.json({
     workspace: {
@@ -92,6 +145,8 @@ export async function GET() {
       model: agent.model,
       deviceOnline: agent.deviceOnline,
     })),
+    skills: flowSkillArtifacts,
+    skillAssignments: skillAssignments || [],
   });
 }
 
@@ -140,12 +195,102 @@ export async function POST(req: Request) {
     ? body.userIds.map(String)
     : [];
   const workspaceUserIds = new Set(workspace.members.map((member) => member.user_id));
+  if (requestedUserIds.some((id) => !workspaceUserIds.has(id))) {
+    return NextResponse.json(
+      { error: "One or more people are no longer in this workspace" },
+      { status: 400 },
+    );
+  }
   const userIds = Array.from(
     new Set([user.id, ...requestedUserIds.filter((id) => workspaceUserIds.has(id))]),
   );
   const agentIds = Array.isArray(body?.agentIds)
     ? Array.from(new Set(body.agentIds.map(String).filter(Boolean)))
     : [];
+  const skillArtifactIds =
+    kind === "channel" && Array.isArray(body?.skillArtifactIds)
+      ? Array.from(
+          new Set(body.skillArtifactIds.map(String).filter(Boolean)),
+        )
+      : [];
+  if (
+    kind === "dm" &&
+    Array.isArray(body?.skillArtifactIds) &&
+    body.skillArtifactIds.length > 0
+  ) {
+    return NextResponse.json(
+      { error: "Direct messages cannot have channel skills" },
+      { status: 400 },
+    );
+  }
+
+  if (agentIds.length > 0) {
+    const admin = createSupabaseAdminClient();
+    const availableAgents = await listWorkerAgents(
+      workspace.billing_admin_user_id,
+      { supabase: admin },
+    ).catch(() => []);
+    const availableAgentIds = new Set(
+      availableAgents.map((agent) => agent.id),
+    );
+    if (agentIds.some((agentId) => !availableAgentIds.has(agentId))) {
+      return NextResponse.json(
+        { error: "One or more agents are unavailable in this workspace" },
+        { status: 400 },
+      );
+    }
+  }
+
+  if (skillArtifactIds.length > 0) {
+    const requestedGuestIds = new Set(
+      workspace.members
+        .filter((member) => member.role === "guest")
+        .map((member) => member.user_id),
+    );
+    if (userIds.some((userId) => requestedGuestIds.has(userId))) {
+      return NextResponse.json(
+        {
+          error:
+            "Channel skills cannot be assigned while a channel guest participates",
+        },
+        { status: 400 },
+      );
+    }
+    const { data: availableSkills, error: skillsError } = await supabase
+      .from("workspace_skill_artifacts")
+      .select("id,targets")
+      .eq("workspace_id", workspace.id)
+      .eq("lifecycle", "active")
+      .in("id", skillArtifactIds);
+    if (skillsError) {
+      return NextResponse.json(
+        { error: skillsError.message },
+        { status: skillsError.code === "42501" ? 403 : 500 },
+      );
+    }
+    const validSkillIds = new Set(
+      (availableSkills || [])
+        .filter((artifact) => {
+          const targets = Array.isArray(artifact.targets)
+            ? artifact.targets.map(String)
+            : [];
+          return (
+            targets.length === 0 ||
+            targets.includes("all") ||
+            targets.includes("flow")
+          );
+        })
+        .map((artifact) => String(artifact.id)),
+    );
+    if (
+      skillArtifactIds.some((artifactId) => !validSkillIds.has(artifactId))
+    ) {
+      return NextResponse.json(
+        { error: "One or more skills are unavailable for Team Chat" },
+        { status: 400 },
+      );
+    }
+  }
   const memberRows = [
     ...userIds.map((userId) => ({
       channel_id: channelId,
@@ -194,6 +339,22 @@ export async function POST(req: Request) {
         .insert(memberRows);
       return error;
     },
+    insertCapabilities:
+      skillArtifactIds.length > 0
+        ? async () => {
+            const { error } = await supabase
+              .from("chat_channel_skill_assignments")
+              .insert(
+                skillArtifactIds.map((artifactId) => ({
+                  channel_id: channelId,
+                  workspace_id: workspace.id,
+                  artifact_id: artifactId,
+                  added_by: user.id,
+                })),
+              );
+            return error;
+          }
+        : undefined,
     readChannel: async () => {
       const { data, error } = await supabase
         .from("chat_channels")
@@ -216,6 +377,12 @@ export async function POST(req: Request) {
             : 500
         : result.stage === "members"
           ? 400
+          : result.stage === "capabilities"
+            ? result.error.code === "23505"
+              ? 409
+              : result.error.code === "42501"
+                ? 403
+                : 400
           : 500;
     return NextResponse.json(
       { error: result.error.message },

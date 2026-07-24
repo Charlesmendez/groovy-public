@@ -1,0 +1,33 @@
+# Local source-control and build state
+.git/
+.next/
+.vercel/
+node_modules/
+apps/**/node_modules/
+apps/**/dist/
+apps/desktop/dist-app/
+apps/desktop/resources/connector/
+apps/desktop/resources/runtime-config.json
+apps/connector/native/rnnoise-addon/build/
+
+# Local runtimes, caches, and generated artifacts
+.pnpm-store/
+.playwright-mcp/
+apps/connector/.wwebjs_cache/
+coverage/
+dist/
+out/
+build/
+__pycache__/
+*.pyc
+*.log
+
+# Local configuration and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# OS/editor metadata
+.DS_Store
+*.tsbuildinfo

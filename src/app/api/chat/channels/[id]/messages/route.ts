@@ -314,6 +314,22 @@ export async function POST(req: Request, { params }: Params) {
     );
   }
   const shouldReply = requestedOrchestratorReply;
+  const { data: channelSkillAssignments, error: channelSkillsError } =
+    shouldReply && !channelHasGuests
+      ? await admin
+          .from("chat_channel_skill_assignments")
+          .select("artifact_id")
+          .eq("channel_id", id)
+      : { data: [], error: null };
+  if (channelSkillsError) {
+    console.error("[team-chat] channel_skills_unavailable", {
+      channelId: id,
+      error: channelSkillsError.message,
+    });
+  }
+  const channelSkillArtifactIds = channelSkillsError
+    ? []
+    : (channelSkillAssignments || []).map((row) => String(row.artifact_id));
 
   let external: Awaited<ReturnType<typeof getOrCreateExternalSession>>;
   try {
@@ -565,6 +581,7 @@ export async function POST(req: Request, { params }: Params) {
           profile,
           sourceProvider: teamChatProvider,
           memoryScopeId: channelHasGuests ? id : undefined,
+          additionalSkillArtifactIds: channelSkillArtifactIds,
           deviceId: null,
           traceId: activeTraceId,
           abortController: controller,

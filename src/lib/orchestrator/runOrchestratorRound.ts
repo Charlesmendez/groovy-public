@@ -213,6 +213,12 @@ export type RunOrchestratorRoundArgs = {
    * conversations while keeping the profile as the capability boundary.
    */
   memoryScopeId?: string | null;
+  /**
+   * Additive channel-scoped skill or instruction artifacts. Callers must
+   * enforce their own participant trust boundary before providing these ids;
+   * artifact workspace, lifecycle, and target are revalidated during loading.
+   */
+  additionalSkillArtifactIds?: string[];
   // Notification targets + channel recorded on agent tasks created this turn
   // (assign_task) so the task runner can ping the requesting channel.
   taskNotifyTargets?: import("@/lib/orchestrator/agentTasks").AgentTaskNotifyTargets;
@@ -1519,6 +1525,7 @@ The user has no worker agents yet. When they ask for workspace/coding work, sugg
     deviceId: deviceId || "",
     agentId: effectiveRuntimeAgentId,
     profileId: harnessProfile?.id || null,
+    additionalArtifactIds: args.additionalSkillArtifactIds,
     target: "flow",
   }).catch((error) => {
     console.warn(

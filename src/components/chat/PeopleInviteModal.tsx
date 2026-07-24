@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Lock } from "lucide-react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type InviteChannel = {
@@ -11,14 +12,22 @@ type InviteChannel = {
 
 export function PeopleInviteModal({
   channels,
+  initialEmail = "",
+  initialChannelIds = [],
+  initialRole = "member",
+  reason,
   onClose,
 }: {
   channels: InviteChannel[];
+  initialEmail?: string;
+  initialChannelIds?: string[];
+  initialRole?: "member" | "guest";
+  reason?: string;
   onClose: () => void;
 }) {
-  const [email, setEmail] = useState("");
-  const [role, setRole] = useState<"member" | "guest">("member");
-  const [channelIds, setChannelIds] = useState<string[]>([]);
+  const [email, setEmail] = useState(initialEmail);
+  const [role, setRole] = useState<"member" | "guest">(initialRole);
+  const [channelIds, setChannelIds] = useState<string[]>(initialChannelIds);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{
@@ -131,8 +140,8 @@ export function PeopleInviteModal({
               Invite a person
             </h2>
             <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-              Full members can use the workspace. Channel guests only see the
-              channels you choose.
+              {reason ||
+                "Full members can use the workspace. Channel guests only see the channels you choose."}
             </p>
           </div>
           <button
@@ -227,6 +236,9 @@ export function PeopleInviteModal({
                   <span className="min-w-0 flex-1 truncate text-sm text-zinc-300">
                     #{channel.name}
                   </span>
+                  {channel.visibility === "private" ? (
+                    <Lock className="h-3 w-3 shrink-0 text-zinc-500" />
+                  ) : null}
                   <span className="text-[9px] uppercase tracking-wider text-zinc-600">
                     {channel.visibility}
                   </span>

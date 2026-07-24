@@ -1210,6 +1210,7 @@ async function loadAssignedArtifactsForTarget(
   input: {
     agentId?: string | null;
     profileId?: string | null;
+    additionalArtifactIds?: string[];
     target: "flow" | "claude" | "codex";
   }
 ) {
@@ -1253,13 +1254,38 @@ async function loadAssignedArtifactsForTarget(
     if (!inheritWorkspaceSkills) return false;
     return !rowAgentId || (agentId && rowAgentId === agentId);
   });
-  const artifacts = selected
+  const assignedArtifacts = selected
     .map((row) => row.workspace_skill_artifacts)
     .filter((row): row is Record<string, unknown> => !!row && typeof row === "object" && !Array.isArray(row))
-    .filter(
-      (artifact, index, rows) =>
-        rows.findIndex((candidate) => asString(candidate.id) === asString(artifact.id)) === index,
-    );
+  const additionalArtifactIds = Array.from(
+    new Set(
+      (input.additionalArtifactIds || []).map(asString).filter(Boolean),
+    ),
+  );
+  const { data: additionalArtifacts, error: additionalError } =
+    additionalArtifactIds.length > 0
+      ? await ctx.admin
+          .from("workspace_skill_artifacts")
+          .select(
+            "id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,metadata,risk_flags,content_snapshot,content_snapshot_truncated,content_snapshot_updated_at",
+          )
+          .eq("workspace_id", ctx.workspace.id)
+          .eq("lifecycle", "active")
+          .in("id", additionalArtifactIds)
+      : { data: [], error: null };
+  if (additionalError) throw new Error(additionalError.message);
+  const explicitArtifacts = (
+    (additionalArtifacts || []) as Array<Record<string, unknown>>
+  ).filter((artifact) => {
+    const targets = normalizeTargets(artifact.targets);
+    return targets.includes("all") || targets.includes(target);
+  });
+  const artifacts = [...assignedArtifacts, ...explicitArtifacts].filter(
+    (artifact, index, rows) =>
+      rows.findIndex(
+        (candidate) => asString(candidate.id) === asString(artifact.id),
+      ) === index,
+  );
   return { target, agentId, artifacts };
 }
 
@@ -1269,6 +1295,7 @@ async function preflightAgentSkillsWithContext(
     deviceId: string;
     agentId?: string | null;
     profileId?: string | null;
+    additionalArtifactIds?: string[];
     target: "flow" | "claude" | "codex";
   }
 ) {
@@ -1482,6 +1509,7 @@ export async function buildAssignedSkillsPromptContext(input: {
   deviceId: string;
   agentId?: string | null;
   profileId?: string | null;
+  additionalArtifactIds?: string[];
   target: "flow" | "claude" | "codex";
 }): Promise<{ text: string; artifactCount: number }> {
   const ctx = await getContext(false);
@@ -1493,6 +1521,7 @@ export async function buildAssignedSkillsPromptContextForUser(input: {
   deviceId: string;
   agentId?: string | null;
   profileId?: string | null;
+  additionalArtifactIds?: string[];
   target: "flow" | "claude" | "codex";
 }): Promise<{ text: string; artifactCount: number }> {
   const ctx = await getContextForUser(input.userId, false);

@@ -9,10 +9,19 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { ChevronDown, Search, X } from "lucide-react";
+import { ChevronDown, Lock, Search, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { AppNav } from "@/components/AppNav";
 import { ChannelAccessModal } from "@/components/chat/ChannelAccessModal";
+import {
+  ChannelCreateModal,
+  type ChannelCreateInput,
+  type ChannelSkillOption,
+} from "@/components/chat/ChannelCreateModal";
+import {
+  ChatMentionMenu,
+  type ChatMentionOption,
+} from "@/components/chat/ChatMentionMenu";
 import { PeopleInviteModal } from "@/components/chat/PeopleInviteModal";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 
@@ -70,6 +79,13 @@ type ChannelMember = {
   member_type: "user" | "agent" | "orchestrator";
   user_id: string | null;
   agent_id: string | null;
+};
+
+type ChannelSkillAssignment = {
+  id: string;
+  channel_id: string;
+  artifact_id: string;
+  created_at?: string;
 };
 
 type ActiveOrchestratorRun = {
@@ -153,6 +169,14 @@ function displayTime(value: string): string {
     : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
+function mentionHandle(value: string, fallback: string): string {
+  const compact = value
+    .trim()
+    .replace(/^@/, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "");
+  return compact || fallback;
+}
+
 export function TeamChatClient({ initialChannelId }: { initialChannelId?: string }) {
   const router = useRouter();
   const [workspaceName, setWorkspaceName] = useState("Workspace");
@@ -169,19 +193,15 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
     agents: false,
   });
   const [channelComposerOpen, setChannelComposerOpen] = useState(false);
-  const [newChannelName, setNewChannelName] = useState("");
-  const [newChannelVisibility, setNewChannelVisibility] = useState<
-    "workspace" | "private"
-  >("workspace");
-  const [creatingChannel, setCreatingChannel] = useState(false);
-  const [channelCreateError, setChannelCreateError] = useState<string | null>(
-    null,
-  );
   const [channels, setChannels] = useState<Channel[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [people, setPeople] = useState<Person[]>([]);
   const [channelMembers, setChannelMembers] = useState<ChannelMember[]>([]);
+  const [skills, setSkills] = useState<ChannelSkillOption[]>([]);
+  const [channelSkillAssignments, setChannelSkillAssignments] = useState<
+    ChannelSkillAssignment[]
+  >([]);
   const [currentUserId, setCurrentUserId] = useState("");
   const [workspaceRole, setWorkspaceRole] = useState<
     "admin" | "member" | "guest"
@@ -200,11 +220,21 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   const [error, setError] = useState<string | null>(null);
   const [accessOpen, setAccessOpen] = useState(false);
   const [peopleInviteOpen, setPeopleInviteOpen] = useState(false);
+  const [inviteContext, setInviteContext] = useState<{
+    email: string;
+    channelId: string;
+    channelName: string;
+  } | null>(null);
   const [roomSheetOpen, setRoomSheetOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionStart, setMentionStart] = useState<number | null>(null);
+  const [mentionEnd, setMentionEnd] = useState<number | null>(null);
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
+  const [mentionBusyId, setMentionBusyId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const sidebarScrollRef = useRef<HTMLDivElement>(null);
   const sidebarSearchRef = useRef<HTMLInputElement>(null);
-  const channelNameRef = useRef<HTMLInputElement>(null);
+  const draftRef = useRef<HTMLTextAreaElement>(null);
 
   const loadSidebar = useCallback(async () => {
     const [channelsRes, profilesRes] = await Promise.all([
@@ -251,6 +281,14 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
     }
     setProfiles(Array.from(profileMap.values()));
     setAgents(Array.isArray(channelsPayload.agents) ? channelsPayload.agents : []);
+    setSkills(
+      Array.isArray(channelsPayload.skills) ? channelsPayload.skills : [],
+    );
+    setChannelSkillAssignments(
+      Array.isArray(channelsPayload.skillAssignments)
+        ? channelsPayload.skillAssignments
+        : [],
+    );
     setActiveId((current) => {
       if (current && nextChannels.some((channel: Channel) => channel.id === current)) {
         return current;
@@ -315,17 +353,6 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
       // Storage can be unavailable in hardened/private browser contexts.
     }
   }, []);
-
-  useEffect(() => {
-    if (!channelComposerOpen) return;
-    const onMobile = window.matchMedia("(max-width: 767px)").matches;
-    if (onMobile && !mobileNavOpen) return;
-    const frame = window.requestAnimationFrame(() => {
-      sidebarScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-      channelNameRef.current?.focus();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [channelComposerOpen, mobileNavOpen]);
 
   useEffect(() => {
     if (!mobileNavOpen) return;
@@ -472,10 +499,114 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   const canManageActive =
     Boolean(active) &&
     (workspaceRole === "admin" || active?.created_by === currentUserId);
+  const activeMembers = useMemo(
+    () =>
+      channelMembers.filter(
+        (member) => member.channel_id === active?.id,
+      ),
+    [active?.id, channelMembers],
+  );
+  const mentionOptions = useMemo<ChatMentionOption[]>(() => {
+    if (!active || active.kind !== "channel" || mentionQuery === null) {
+      return [];
+    }
+    const query = mentionQuery.trim().toLowerCase();
+    const mindName = activeProfile?.name || "Groovy";
+    const mindHandle = mentionHandle(activeProfile?.slug || "groovy", "groovy");
+    const options: ChatMentionOption[] = [
+      {
+        id: `mind:${activeProfile?.id || "default"}`,
+        kind: "mind",
+        handle: mindHandle,
+        label: mindName,
+        detail:
+          active.orchestrator_mode === "off"
+            ? "Mind replies are off in this channel"
+            : "Channel Mind",
+        included: true,
+      },
+      ...agents.map((agent) => ({
+        id: `agent:${agent.id}`,
+        kind: "agent" as const,
+        handle: mentionHandle(agent.name, "agent"),
+        label: agent.name,
+        detail: activeMembers.some(
+          (member) =>
+            member.member_type === "agent" && member.agent_id === agent.id,
+        )
+          ? `${agent.harness} · in this channel`
+          : `${agent.harness} · add to this channel`,
+        included: activeMembers.some(
+          (member) =>
+            member.member_type === "agent" && member.agent_id === agent.id,
+        ),
+      })),
+      ...teammates.map((person) => {
+        const included = activeMembers.some(
+          (member) =>
+            member.member_type === "user" &&
+            member.user_id === person.user_id,
+        );
+        const email = person.email || "";
+        return {
+          id: `person:${person.user_id}`,
+          kind: "person" as const,
+          handle: mentionHandle(email.split("@")[0] || "teammate", "teammate"),
+          label: email || "Workspace member",
+          detail: included
+            ? "In this channel"
+            : person.role === "guest"
+              ? "Channel guest · add to this channel"
+              : "Workspace member · add to this channel",
+          included,
+          email,
+        };
+      }),
+    ];
+    const filtered = options.filter((option) =>
+      [option.handle, option.label, option.detail].some((value) =>
+        value.toLowerCase().includes(query),
+      ),
+    );
+    const emailCandidate = mentionQuery.trim().toLowerCase();
+    const isExternalEmail =
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailCandidate) &&
+      !people.some(
+        (person) => person.email?.toLowerCase() === emailCandidate,
+      );
+    if (isExternalEmail && workspaceRole === "admin") {
+      filtered.unshift({
+        id: `invite:${emailCandidate}`,
+        kind: "invite",
+        handle: emailCandidate,
+        label: `Invite ${emailCandidate}`,
+        detail: `Invite as a channel guest to #${active.name}`,
+        included: false,
+        email: emailCandidate,
+      });
+    }
+    return filtered.slice(0, 10);
+  }, [
+    active,
+    activeMembers,
+    activeProfile,
+    agents,
+    mentionQuery,
+    people,
+    teammates,
+    workspaceRole,
+  ]);
+
+  useEffect(() => {
+    setMentionActiveIndex(0);
+  }, [mentionQuery]);
 
   const selectChannel = (id: string) => {
     setActiveId(id);
     setReplyTo(null);
+    setMentionQuery(null);
+    setMentionStart(null);
+    setMentionEnd(null);
     setMobileNavOpen(false);
     router.replace(`/chat/${id}`);
   };
@@ -511,7 +642,6 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
 
   const openChannelComposer = () => {
     if (workspaceRole === "guest") return;
-    setChannelCreateError(null);
     setCollapsedSections((current) => ({ ...current, channels: false }));
     setSidebarSearchOpen(false);
     setSidebarQuery("");
@@ -524,45 +654,25 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   };
 
   const closeChannelComposer = () => {
-    if (creatingChannel) return;
     setChannelComposerOpen(false);
-    setNewChannelName("");
-    setNewChannelVisibility("workspace");
-    setChannelCreateError(null);
   };
 
-  const createChannel = async () => {
-    const name = newChannelName.trim();
-    if (workspaceRole === "guest" || !name || creatingChannel) return;
-    setCreatingChannel(true);
-    setChannelCreateError(null);
-    try {
-      const res = await fetch("/api/chat/channels", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name,
-          profileId: profiles.find((profile) => profile.is_default)?.id || null,
-          orchestratorMode: "mention",
-          visibility: newChannelVisibility,
-        }),
-      });
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(payload.error || "Could not create channel.");
-      }
-      setChannelComposerOpen(false);
-      setNewChannelName("");
-      setNewChannelVisibility("workspace");
-      await loadSidebar();
-      selectChannel(payload.channel.id);
-    } catch (cause) {
-      setChannelCreateError(
-        cause instanceof Error ? cause.message : "Could not create channel.",
-      );
-    } finally {
-      setCreatingChannel(false);
+  const createChannel = async (input: ChannelCreateInput) => {
+    if (workspaceRole === "guest") {
+      throw new Error("Channel guests cannot create channels.");
     }
+    const res = await fetch("/api/chat/channels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(payload.error || "Could not create channel.");
+    }
+    setChannelComposerOpen(false);
+    await loadSidebar();
+    selectChannel(payload.channel.id);
   };
 
   const openAgentDm = async (agent: Agent) => {
@@ -657,11 +767,138 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
     );
   };
 
+  const updateMentionState = (value: string, cursor: number | null) => {
+    if (!active || active.kind !== "channel" || cursor === null) {
+      setMentionQuery(null);
+      setMentionStart(null);
+      setMentionEnd(null);
+      return;
+    }
+    const prefix = value.slice(0, cursor);
+    const match = prefix.match(/(?:^|\s)@([^\s]*)$/);
+    if (!match) {
+      setMentionQuery(null);
+      setMentionStart(null);
+      setMentionEnd(null);
+      return;
+    }
+    const start = prefix.lastIndexOf("@");
+    setMentionQuery(match[1] || "");
+    setMentionStart(start);
+    setMentionEnd(cursor);
+  };
+
+  const insertMention = (option: ChatMentionOption) => {
+    if (mentionStart === null || mentionEnd === null) return;
+    const before = draft.slice(0, mentionStart);
+    const after = draft.slice(mentionEnd);
+    const needsTrailingSpace = after.length === 0 || !/^\s/.test(after);
+    const token = `@${option.handle}${needsTrailingSpace ? " " : ""}`;
+    const nextDraft = `${before}${token}${after}`;
+    const cursor = before.length + token.length;
+    setDraft(nextDraft);
+    setMentionQuery(null);
+    setMentionStart(null);
+    setMentionEnd(null);
+    window.requestAnimationFrame(() => {
+      draftRef.current?.focus();
+      draftRef.current?.setSelectionRange(cursor, cursor);
+    });
+  };
+
+  const selectMention = async (option: ChatMentionOption) => {
+    if (!active || mentionBusyId) return;
+    if (option.kind === "mind" && active.orchestrator_mode === "off") {
+      setError(
+        "The channel Mind is turned off. A workspace admin or the channel creator can enable @mention replies in room settings.",
+      );
+      setMentionQuery(null);
+      setMentionStart(null);
+      setMentionEnd(null);
+      return;
+    }
+    if (option.kind === "invite") {
+      setInviteContext({
+        email: option.email || mentionQuery || "",
+        channelId: active.id,
+        channelName: active.name,
+      });
+      setPeopleInviteOpen(true);
+      setMentionQuery(null);
+      setMentionStart(null);
+      setMentionEnd(null);
+      return;
+    }
+    if (!option.included && option.kind !== "mind") {
+      if (!canManageActive) {
+        setError(
+          "Only a workspace admin or this channel’s creator can add participants.",
+        );
+        setMentionQuery(null);
+        return;
+      }
+      setMentionBusyId(option.id);
+      setError(null);
+      try {
+        const memberType = option.kind === "agent" ? "agent" : "user";
+        const memberId = option.id.slice(option.id.indexOf(":") + 1);
+        const addsGuest =
+          memberType === "user" &&
+          people.some(
+            (person) =>
+              person.user_id === memberId && person.role === "guest",
+          );
+        const activeSkillCount = channelSkillAssignments.filter(
+          (assignment) => assignment.channel_id === active.id,
+        ).length;
+        if (
+          addsGuest &&
+          activeSkillCount > 0 &&
+          !window.confirm(
+            `Add this channel guest? ${activeSkillCount} internal ${
+              activeSkillCount === 1 ? "capability" : "capabilities"
+            } will be paused while any guest participates.`,
+          )
+        ) {
+          setMentionBusyId(null);
+          return;
+        }
+        const res = await fetch(`/api/chat/channels/${active.id}/members`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            memberType === "agent"
+              ? { memberType, agentId: memberId }
+              : { memberType, userId: memberId },
+          ),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok && res.status !== 409) {
+          throw new Error(payload.error || "Could not add this participant.");
+        }
+        await loadSidebar();
+      } catch (cause) {
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Could not add this participant.",
+        );
+        setMentionBusyId(null);
+        return;
+      }
+      setMentionBusyId(null);
+    }
+    insertMention(option);
+  };
+
   const send = async () => {
     if (!active || !draft.trim() || busy) return;
     const content = draft.trim();
     setBusy(true);
     setDraft("");
+    setMentionQuery(null);
+    setMentionStart(null);
+    setMentionEnd(null);
     setError(null);
     try {
       const res = await fetch(`/api/chat/channels/${active.id}/messages`, {
@@ -918,84 +1155,6 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
             }
           />
           <div id="chat-sidebar-channels">
-            {!collapsedSections.channels && channelComposerOpen ? (
-              <form
-                className="mx-1 mb-2 rounded-xl border border-[var(--glass-border)] bg-[var(--bg-primary)] p-2.5"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void createChannel();
-                }}
-              >
-              <label
-                htmlFor="new-channel-name"
-                className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-[var(--text-secondary)]"
-              >
-                Channel name
-              </label>
-              <div className="flex items-center rounded-lg border border-[var(--glass-border)] bg-[var(--bg-secondary)] px-2.5">
-                <span className="text-sm text-[var(--text-secondary)]">#</span>
-                <input
-                  ref={channelNameRef}
-                  id="new-channel-name"
-                  value={newChannelName}
-                  onChange={(event) => {
-                    setNewChannelName(event.target.value);
-                    setChannelCreateError(null);
-                  }}
-                  maxLength={100}
-                  placeholder="project-updates"
-                  className="min-w-0 flex-1 bg-transparent px-2 py-2 text-sm outline-none placeholder:text-zinc-600"
-                  disabled={creatingChannel}
-                />
-              </div>
-              <CustomSelect
-                value={newChannelVisibility}
-                onChange={(nextValue) =>
-                  setNewChannelVisibility(
-                    nextValue === "private" ? "private" : "workspace",
-                  )
-                }
-                options={[
-                  {
-                    value: "workspace",
-                    label: "Workspace",
-                    description: "Everyone can find it",
-                  },
-                  {
-                    value: "private",
-                    label: "Private",
-                    description: "Invited members only",
-                  },
-                ]}
-                className="mt-2"
-                ariaLabel="Channel visibility"
-                disabled={creatingChannel}
-                size="sm"
-              />
-              {channelCreateError ? (
-                <p className="mt-2 text-xs leading-relaxed text-red-300">
-                  {channelCreateError}
-                </p>
-              ) : null}
-              <div className="mt-2 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={closeChannelComposer}
-                  disabled={creatingChannel}
-                  className="rounded-md px-2.5 py-1.5 text-xs text-[var(--text-secondary)] hover:text-white disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={creatingChannel || !newChannelName.trim()}
-                  className="rounded-md border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1.5 text-xs text-cyan-300 disabled:opacity-40"
-                >
-                  {creatingChannel ? "Creating…" : "Create"}
-                </button>
-              </div>
-              </form>
-            ) : null}
             {!collapsedSections.channels
               ? filteredWorkspaceChannels.map((channel) => (
                   <button
@@ -1007,10 +1166,14 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                         : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
                     }`}
                   >
-                    <span className="mr-2">#</span>
                     {channel.visibility === "private" ? (
-                      <span className="mr-1 text-[10px] text-zinc-500">●</span>
-                    ) : null}
+                      <Lock
+                        className="mr-2 h-3.5 w-3.5 shrink-0 text-zinc-500"
+                        aria-label="Private channel"
+                      />
+                    ) : (
+                      <span className="mr-2 text-zinc-500">#</span>
+                    )}
                     <span className="truncate">{channel.name}</span>
                   </button>
                 ))
@@ -1051,7 +1214,10 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
               workspaceRole === "admin" ? (
                 <button
                   type="button"
-                  onClick={() => setPeopleInviteOpen(true)}
+                  onClick={() => {
+                    setInviteContext(null);
+                    setPeopleInviteOpen(true);
+                  }}
                   className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
                   aria-label="Invite people"
                   title="Invite people"
@@ -1170,9 +1336,17 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                 </svg>
               </button>
               <div className="min-w-0 flex-1">
-                <h1 className="truncate text-sm font-semibold">
-                  {active.kind === "channel" ? "#" : ""}
-                  {active.name}
+                <h1 className="flex min-w-0 items-center gap-2 text-sm font-semibold">
+                  {active.kind === "channel" &&
+                  active.visibility === "private" ? (
+                    <Lock
+                      className="h-3.5 w-3.5 shrink-0 text-zinc-400"
+                      aria-label="Private channel"
+                    />
+                  ) : active.kind === "channel" ? (
+                    <span className="shrink-0 text-zinc-500">#</span>
+                  ) : null}
+                  <span className="truncate">{active.name}</span>
                 </h1>
                 {active.topic ? (
                   <p className="truncate text-xs text-[var(--text-secondary)]">{active.topic}</p>
@@ -1441,19 +1615,97 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                   <button onClick={() => setReplyTo(null)}>×</button>
                 </div>
               ) : null}
-              <div className="flex items-end gap-3 rounded-xl border border-[var(--glass-border)] bg-[var(--bg-primary)] px-4 py-3">
+              <div className="relative flex items-end gap-3 rounded-xl border border-[var(--glass-border)] bg-[var(--bg-primary)] px-4 py-3 focus-within:border-cyan-400/30">
+                {mentionQuery !== null ? (
+                  <ChatMentionMenu
+                    options={mentionOptions}
+                    activeIndex={Math.min(
+                      mentionActiveIndex,
+                      Math.max(0, mentionOptions.length - 1),
+                    )}
+                    busyId={mentionBusyId}
+                    onSelect={(option) => void selectMention(option)}
+                  />
+                ) : null}
                 <textarea
+                  ref={draftRef}
                   rows={1}
                   value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
+                  onChange={(event) => {
+                    setDraft(event.target.value);
+                    updateMentionState(
+                      event.target.value,
+                      event.target.selectionStart,
+                    );
+                  }}
                   onKeyDown={(event) => {
+                    if (
+                      mentionQuery !== null &&
+                      (event.key === "ArrowDown" || event.key === "ArrowUp")
+                    ) {
+                      event.preventDefault();
+                      setMentionActiveIndex((current) => {
+                        if (mentionOptions.length === 0) return 0;
+                        const delta = event.key === "ArrowDown" ? 1 : -1;
+                        return (
+                          (current + delta + mentionOptions.length) %
+                          mentionOptions.length
+                        );
+                      });
+                      return;
+                    }
+                    if (
+                      mentionQuery !== null &&
+                      !event.shiftKey &&
+                      (event.key === "Enter" || event.key === "Tab") &&
+                      mentionOptions.length > 0
+                    ) {
+                      event.preventDefault();
+                      const option =
+                        mentionOptions[
+                          Math.min(
+                            mentionActiveIndex,
+                            mentionOptions.length - 1,
+                          )
+                        ];
+                      if (option) void selectMention(option);
+                      return;
+                    }
+                    if (
+                      mentionQuery !== null &&
+                      event.key === "Escape"
+                    ) {
+                      event.preventDefault();
+                      setMentionQuery(null);
+                      setMentionStart(null);
+                      setMentionEnd(null);
+                      return;
+                    }
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
                       void send();
                     }
                   }}
+                  onClick={(event) =>
+                    updateMentionState(
+                      event.currentTarget.value,
+                      event.currentTarget.selectionStart,
+                    )
+                  }
+                  onBlur={() => {
+                    window.setTimeout(() => {
+                      if (document.activeElement !== draftRef.current) {
+                        setMentionQuery(null);
+                      }
+                    }, 120);
+                  }}
                   placeholder={`Message ${active.kind === "channel" ? "#" : ""}${active.name} — use @ to summon`}
                   className="max-h-40 flex-1 resize-none bg-transparent text-sm outline-none"
+                  aria-haspopup="listbox"
+                  aria-autocomplete="list"
+                  aria-controls={
+                    mentionQuery !== null ? "chat-mention-menu" : undefined
+                  }
                 />
                 <button
                   onClick={() => void send()}
@@ -1490,6 +1742,17 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
           </div>
         )}
       </main>
+      {channelComposerOpen && workspaceRole !== "guest" ? (
+        <ChannelCreateModal
+          profiles={profiles}
+          agents={agents}
+          people={people}
+          skills={skills}
+          currentUserId={currentUserId}
+          onClose={closeChannelComposer}
+          onCreate={createChannel}
+        />
+      ) : null}
       {roomSheetOpen && active ? (
         <div
           className="fixed inset-0 z-50 flex items-end bg-black/60 md:hidden"
@@ -1500,9 +1763,14 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
             onClick={(event) => event.stopPropagation()}
           >
             <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-white/15" />
-            <div className="mb-4 text-sm font-semibold">
-              {active.kind === "channel" ? "#" : ""}
-              {active.name}
+            <div className="mb-4 flex items-center gap-2 text-sm font-semibold">
+              {active.kind === "channel" &&
+              active.visibility === "private" ? (
+                <Lock className="h-3.5 w-3.5 text-zinc-400" />
+              ) : active.kind === "channel" ? (
+                <span className="text-zinc-500">#</span>
+              ) : null}
+              <span>{active.name}</span>
             </div>
             <label className="mb-1 block text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
               Mind
@@ -1568,9 +1836,23 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
         <ChannelAccessModal
           channel={active}
           people={people}
+          agents={agents}
+          skills={skills}
           members={channelMembers.filter(
             (member) => member.channel_id === active.id,
           )}
+          skillAssignments={channelSkillAssignments.filter(
+            (assignment) => assignment.channel_id === active.id,
+          )}
+          onInviteNew={() => {
+            setAccessOpen(false);
+            setInviteContext({
+              email: "",
+              channelId: active.id,
+              channelName: active.name,
+            });
+            setPeopleInviteOpen(true);
+          }}
           onClose={() => setAccessOpen(false)}
           onChanged={async () => {
             await loadSidebar();
@@ -1586,7 +1868,22 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
               name: channel.name,
               visibility: channel.visibility,
             }))}
-          onClose={() => setPeopleInviteOpen(false)}
+          initialEmail={inviteContext?.email || ""}
+          initialChannelIds={
+            inviteContext?.channelId ? [inviteContext.channelId] : []
+          }
+          initialRole={inviteContext?.channelId ? "guest" : "member"}
+          reason={
+            inviteContext?.channelId
+              ? inviteContext.email
+                ? `${inviteContext.email} is not in this workspace yet. Invite them as a guest with access to #${inviteContext.channelName}?`
+                : `Invite someone with scoped access to #${inviteContext.channelName}.`
+              : undefined
+          }
+          onClose={() => {
+            setPeopleInviteOpen(false);
+            setInviteContext(null);
+          }}
         />
       ) : null}
     </div>

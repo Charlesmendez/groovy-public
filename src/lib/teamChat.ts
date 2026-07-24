@@ -32,12 +32,13 @@ export type ChatChannelCreationResult<T> =
   | {
       data: null;
       error: ChatChannelMutationError;
-      stage: "channel" | "members" | "read";
+      stage: "channel" | "members" | "capabilities" | "read";
     };
 
 export async function createChatChannelInRlsOrder<T>(operations: {
   insertChannelWithoutReturning: () => Promise<ChatChannelMutationError | null>;
   insertMembers: () => Promise<ChatChannelMutationError | null>;
+  insertCapabilities?: () => Promise<ChatChannelMutationError | null>;
   readChannel: () => Promise<{
     data: T | null;
     error: ChatChannelMutationError | null;
@@ -53,6 +54,18 @@ export async function createChatChannelInRlsOrder<T>(operations: {
   if (membersError) {
     await operations.rollbackChannel();
     return { data: null, error: membersError, stage: "members" };
+  }
+
+  if (operations.insertCapabilities) {
+    const capabilitiesError = await operations.insertCapabilities();
+    if (capabilitiesError) {
+      await operations.rollbackChannel();
+      return {
+        data: null,
+        error: capabilitiesError,
+        stage: "capabilities",
+      };
+    }
   }
 
   const channelResult = await operations.readChannel();

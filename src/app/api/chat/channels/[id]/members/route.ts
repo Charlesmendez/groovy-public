@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -41,14 +42,18 @@ export async function POST(req: Request, { params }: Params) {
     return NextResponse.json({ error: "Missing member id" }, { status: 400 });
   }
 
+  const admin = createSupabaseAdminClient();
+  const { data: channel } = await admin
+    .from("chat_channels")
+    .select("workspace_id,workspaces!inner(billing_admin_user_id)")
+    .eq("id", id)
+    .maybeSingle();
+  if (!channel) {
+    return NextResponse.json({ error: "Channel not found" }, { status: 404 });
+  }
+
   // Ensure a user being added actually belongs to the channel workspace.
   if (userId) {
-    const admin = createSupabaseAdminClient();
-    const { data: channel } = await admin
-      .from("chat_channels")
-      .select("workspace_id")
-      .eq("id", id)
-      .maybeSingle();
     const { data: membership } = channel
       ? await admin
           .from("workspace_members")
@@ -73,6 +78,34 @@ export async function POST(req: Request, { params }: Params) {
           { status: 403 },
         );
       }
+    }
+  }
+  if (agentId) {
+    const workspaceRelation = Array.isArray(channel.workspaces)
+      ? channel.workspaces[0]
+      : channel.workspaces;
+    const billingAdminUserId =
+      workspaceRelation &&
+      typeof workspaceRelation === "object" &&
+      "billing_admin_user_id" in workspaceRelation
+        ? String(
+            (
+              workspaceRelation as {
+                billing_admin_user_id?: unknown;
+              }
+            ).billing_admin_user_id || "",
+          )
+        : "";
+    const availableAgents = billingAdminUserId
+      ? await listWorkerAgents(billingAdminUserId, { supabase: admin }).catch(
+          () => [],
+        )
+      : [];
+    if (!availableAgents.some((agent) => agent.id === agentId)) {
+      return NextResponse.json(
+        { error: "Agent is unavailable in this workspace" },
+        { status: 400 },
+      );
     }
   }
 

@@ -135,3 +135,66 @@ test("DM creation adds membership before reading the RLS-protected channel", asy
     stage: null,
   });
 });
+
+test("channel capabilities are added only after creator membership exists", async () => {
+  const operations: string[] = [];
+  const result = await createChatChannelInRlsOrder({
+    insertChannelWithoutReturning: async () => {
+      operations.push("insert channel");
+      return null;
+    },
+    insertMembers: async () => {
+      operations.push("insert members");
+      return null;
+    },
+    insertCapabilities: async () => {
+      operations.push("insert capabilities");
+      return null;
+    },
+    readChannel: async () => {
+      operations.push("read channel");
+      return { data: { id: "channel-1" }, error: null };
+    },
+    rollbackChannel: async () => {
+      operations.push("rollback channel");
+    },
+  });
+
+  assert.deepEqual(operations, [
+    "insert channel",
+    "insert members",
+    "insert capabilities",
+    "read channel",
+  ]);
+  assert.deepEqual(result, {
+    data: { id: "channel-1" },
+    error: null,
+    stage: null,
+  });
+});
+
+test("channel creation rolls back if capability assignment fails", async () => {
+  const operations: string[] = [];
+  const result = await createChatChannelInRlsOrder({
+    insertChannelWithoutReturning: async () => null,
+    insertMembers: async () => null,
+    insertCapabilities: async () => ({
+      message: "skill unavailable",
+      code: "42501",
+    }),
+    readChannel: async () => ({
+      data: { id: "unreachable" },
+      error: null,
+    }),
+    rollbackChannel: async () => {
+      operations.push("rollback channel");
+    },
+  });
+
+  assert.deepEqual(operations, ["rollback channel"]);
+  assert.deepEqual(result, {
+    data: null,
+    error: { message: "skill unavailable", code: "42501" },
+    stage: "capabilities",
+  });
+});
