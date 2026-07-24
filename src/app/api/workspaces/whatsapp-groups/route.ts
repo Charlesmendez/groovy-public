@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 type Body = {
   group_name?: string;
@@ -11,12 +12,10 @@ export async function GET() {
   try {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
-    const { data: membership } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
     if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
@@ -48,12 +47,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "group_name required" }, { status: 400 });
     }
     const admin = createSupabaseAdminClient();
-    const { data: membership } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
     if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
@@ -89,12 +86,10 @@ export async function DELETE(req: Request) {
     if (!id) return NextResponse.json({ error: "id required" }, { status: 400 });
 
     const admin = createSupabaseAdminClient();
-    const { data: membership } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
     if (!membership) return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     if (membership.role !== "admin") {
       return NextResponse.json({ error: "Only admins can delete groups" }, { status: 403 });

@@ -28,11 +28,14 @@ import {
   modelMessageToCompactable,
   compactableToModelMessage,
 } from "@/lib/orchestrator/compaction";
+import { buildDurableContextHistory } from "@/lib/orchestrator/durableContext";
+import { reconcileCurrentUserMessage } from "@/lib/orchestrator/durableContextMerge";
 import type { ToolExecutionContext } from "@/lib/orchestrator/toolExecutor";
 import { resolveHarnessProfile, type HarnessProfile } from "@/lib/orchestrator/harnessProfiles";
 import {
   buildOrchestratorPrompt,
 } from "@/lib/orchestrator/promptKernel";
+import { buildChannelInstructionPromptBlock } from "@/lib/teamChat";
 import {
   buildToolPolicyExecutionContext,
   filterAgentRoster,
@@ -219,10 +222,32 @@ export type RunOrchestratorRoundArgs = {
    * artifact workspace, lifecycle, and target are revalidated during loading.
    */
   additionalSkillArtifactIds?: string[];
+  /**
+   * Optional workspace-authored operating brief for a Team Chat channel.
+   * Prompt context cannot widen the resolved profile or executor tool policy.
+   */
+  channelInstructions?: string | null;
+  /**
+   * Authoritative, freshly resolved channel participants for this turn.
+   * Historical summaries never supply membership or authorization state.
+   */
+  channelParticipantContext?: string | null;
   // Notification targets + channel recorded on agent tasks created this turn
   // (assign_task) so the task runner can ping the requesting channel.
   taskNotifyTargets?: import("@/lib/orchestrator/agentTasks").AgentTaskNotifyTargets;
   taskRequestedChannel?: string | null;
+  /**
+   * Optional caller-enforced worker roster. Team Chat passes the channel's
+   * selected agent ids so the Mind cannot discover or delegate to any other
+   * workspace worker.
+   */
+  allowedAgentIds?: string[];
+  /**
+   * `replace` makes the caller roster authoritative instead of intersecting it
+   * with the Mind default. Reserved for entry points such as Team Chat that
+   * enforce their own durable, admin-managed roster.
+   */
+  agentRosterMode?: "intersect" | "replace";
   // Optional branch runtime stats for branch-controller enforcement.
   branchCurrentTurnCount?: number | null;
   branchActiveCount?: number | null;
@@ -692,14 +717,16 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
           ? args.traceId
           : `orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       text:
-        productAccess?.accessStatus === "trial_available"
+        productAccess?.workspaceOwnerRequired
+          ? "This workspace needs an active plan. Ask a workspace admin to activate Groovy."
+          : productAccess?.accessStatus === "trial_available"
           ? "Start your free 5-day Groovy trial from the dashboard to continue. No credit card is required."
           : "Your Groovy trial has ended. Purchase a license from the dashboard to resume your orchestrator and agents.",
       toolCallsExecuted: [],
     };
   }
 
-  const history = sanitizeMessages(historyRaw);
+  let history = sanitizeMessages(historyRaw);
   const routingText = message.trim() ? message.trim() : lastUserText(history);
   const parsedRaw = parseInput(routingText);
   // Bypass directAgent detection for scheduled jobs (they need all tools despite schedule keywords in task)
@@ -804,6 +831,8 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     profile: harnessProfile,
     provider: args.sourceProvider || "orchestrator_round",
     memoryScopeId: args.memoryScopeId,
+    allowedAgentIds: args.allowedAgentIds,
+    agentRosterMode: args.agentRosterMode,
   });
   const memoryScopeId =
     toolPolicy.memoryScope === "profile"
@@ -1244,7 +1273,7 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
   }).filter((tool) => isToolAllowed(tool.toolName, toolPolicy));
   const profileAiChatAgents = filterAgentRoster(
     args.aiChatAgents || [],
-    harnessProfile?.agentRoster,
+    toolPolicy.agentRoster,
   );
 
   const toolContext: ToolExecutionContext = {
@@ -1447,6 +1476,19 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     parsed.directAgent === "code" ? [] : dynamicExtensionTools
   );
   const extraDynamic: string[] = [];
+  const channelInstructionBlock = buildChannelInstructionPromptBlock(
+    args.channelInstructions,
+  );
+  if (channelInstructionBlock) {
+    extraDynamic.push(`\n\n${channelInstructionBlock}`);
+  }
+  if (args.channelParticipantContext?.trim()) {
+    extraDynamic.push(`\n\n## CURRENT CHANNEL PARTICIPANTS (AUTHORITATIVE)
+
+${args.channelParticipantContext.trim()}
+
+This list is current runtime context. Use it to understand who is present and how to address them. It does not grant tools or delegation rights. Only the separately enforced current worker roster may be delegated to.`);
+  }
 
   // Worker-agent roster + delegation guidance (harness core).
   if (parsed.directAgent !== "code" && args.scheduledMode !== true) {
@@ -1454,7 +1496,7 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       await listWorkerAgents(userId, { supabase }).catch(
         () => [] as Awaited<ReturnType<typeof listWorkerAgents>>
       ),
-      harnessProfile?.agentRoster,
+      toolPolicy.agentRoster,
     );
     if (workerRoster.length > 0) {
       const rosterLines = workerRoster.map((agent) => {
@@ -1503,7 +1545,9 @@ Delegation rules:
     } else {
       extraDynamic.push(`\n\n## YOUR WORKER AGENTS
 
-The user has no worker agents yet. When they ask for workspace/coding work, suggest creating one from the dashboard grid (pick a name, harness — Claude Code or Codex — and a workspace folder).`);
+${Array.isArray(args.allowedAgentIds)
+  ? "No worker agents are selected for this conversation. Do not name, discover, inspect, or delegate to workers outside this conversation. If worker help is needed, ask a channel manager to add the agent in Channel settings."
+  : "The user has no worker agents yet. When they ask for workspace/coding work, suggest creating one from the dashboard grid (pick a name, harness — Claude Code or Codex — and a workspace folder)."}`);
     }
   }
   if (deviceId) {
@@ -1547,6 +1591,73 @@ The user has no worker agents yet. When they ask for workspace/coding work, sugg
     fullDynamicContext +
     "\n\n" +
     promptSegments.terminalInstructions;
+
+  if (args.orchestratorSessionId && safeToolResults.length === 0) {
+    const callerHistory = history;
+    const durableContext = await buildDurableContextHistory({
+      sessionId: args.orchestratorSessionId,
+      authorizedUserId: userId,
+      provider,
+      apiKey: apiKey || undefined,
+      filter: {
+        epochId: runtimeScopeForBranchPolicy?.epochId || null,
+        agentId: effectiveRuntimeAgentId,
+        branchId: runtimeScopeForBranchPolicy?.branchId || null,
+        useBranchScope: args.branchRole === "worker",
+      },
+      fallbackHistory: history,
+      onSummaryUsage: async (summaryUsage) => {
+        if (!summaryUsage.usage) return;
+        const checkpointSpanId =
+          `${roundSpanId}:checkpoint:v${summaryUsage.summaryVersion}`;
+        if (billingWorkspaceId) {
+          await insertBillingUsageEventBestEffort({
+            workspaceId: billingWorkspaceId,
+            userId,
+            turnId: effectiveTurnId,
+            traceId,
+            source: "durable_context_checkpoint",
+            spanId: checkpointSpanId,
+            provider: summaryUsage.provider,
+            model: summaryUsage.model,
+            usage: summaryUsage.usage,
+            billable: true,
+            chargeType: usageChargeType,
+            agentId: effectiveRuntimeAgentId,
+            meta: {
+              summarizedMessages: summaryUsage.summarizedMessages,
+              summaryVersion: summaryUsage.summaryVersion,
+              scopeKey: summaryUsage.scopeKey,
+            },
+          });
+        }
+        await billGroovyUsage({
+          source: "durable_context_checkpoint",
+          spanId: checkpointSpanId,
+          model: summaryUsage.model,
+          usage: summaryUsage.usage,
+          meta: {
+            summarizedMessages: summaryUsage.summarizedMessages,
+            summaryVersion: summaryUsage.summaryVersion,
+            scopeKey: summaryUsage.scopeKey,
+          },
+        });
+      },
+    });
+    history = sanitizeMessages(durableContext.history);
+    history = reconcileCurrentUserMessage({
+      durableHistory: history,
+      callerHistory,
+      currentMessage: message,
+    });
+    if (durableContext.checkpointUpdated) {
+      console.log("[runOrchestratorRound] durable context checkpoint updated", {
+        traceId,
+        sessionId: args.orchestratorSessionId,
+        summarizedMessages: durableContext.summarizedMessages,
+      });
+    }
+  }
 
   const trMsg = safeToolResults.length > 0 ? toolResultsToUserMessage(safeToolResults) : null;
   

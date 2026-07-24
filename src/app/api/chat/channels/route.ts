@@ -6,11 +6,27 @@ import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
 import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 import {
   createChatChannelInRlsOrder,
+  parseChannelOrchestratorInstructions,
   slugifyChatChannel,
 } from "@/lib/teamChat";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+function unreadCountsMigrationPending(error: {
+  code?: string | null;
+  message?: string | null;
+}): boolean {
+  return (
+    error.code === "42883" ||
+    error.code === "PGRST202" ||
+    error.message?.includes("chat_channel_unread_counts") === true
+  );
+}
 
 export async function GET() {
   const supabase = await createSupabaseServerClient();
@@ -29,6 +45,35 @@ export async function GET() {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
   const channelIds = (channels || []).map((channel) => String(channel.id));
+  const unreadCounts = new Map<string, number>();
+  let unreadMigrationPending = false;
+  if (channelIds.length > 0) {
+    const { data: unreadRows, error: unreadError } = await supabase.rpc(
+      "chat_channel_unread_counts",
+      { p_channel_ids: channelIds },
+    );
+    if (unreadError) {
+      unreadMigrationPending = unreadCountsMigrationPending(unreadError);
+      if (!unreadMigrationPending) {
+        return NextResponse.json(
+          { error: unreadError.message },
+          { status: 500 },
+        );
+      }
+    } else {
+      for (const row of (unreadRows || []) as Array<{
+        channel_id?: unknown;
+        unread_count?: unknown;
+      }>) {
+        if (typeof row.channel_id !== "string") continue;
+        const count = Number(row.unread_count);
+        unreadCounts.set(
+          row.channel_id,
+          Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0,
+        );
+      }
+    }
+  }
   const { data: members } = channelIds.length
     ? await supabase
         .from("chat_channel_members")
@@ -69,7 +114,9 @@ export async function GET() {
   const { data: boundProfiles } = profileIds.length
     ? await admin
         .from("orchestrator_profiles")
-        .select("id,name,slug,is_default,workspace_id")
+        .select(
+          "id,name,slug,is_default,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+        )
         .eq("workspace_id", workspace.id)
         .in("id", profileIds)
     : { data: [] };
@@ -135,7 +182,11 @@ export async function GET() {
       currentUserId: user.id,
       members: visibleMembers,
     },
-    channels: channels || [],
+    channels: (channels || []).map((channel) => ({
+      ...channel,
+      unread_count: unreadCounts.get(String(channel.id)) || 0,
+    })),
+    unreadMigrationPending,
     members: members || [],
     profiles: boundProfiles || [],
     agents: agents.map((agent) => ({
@@ -184,6 +235,15 @@ export async function POST(req: Request) {
       : null;
   const visibility =
     kind === "dm" || body?.visibility === "private" ? "private" : "workspace";
+  const instructions = parseChannelOrchestratorInstructions(
+    body?.orchestratorInstructions,
+  );
+  if (!instructions.ok) {
+    return NextResponse.json(
+      { error: instructions.error },
+      { status: 400 },
+    );
+  }
 
   // DMs are readable only by channel members. Asking PostgREST to return the
   // inserted row here would evaluate the SELECT policy before the creator's
@@ -204,6 +264,47 @@ export async function POST(req: Request) {
   const userIds = Array.from(
     new Set([user.id, ...requestedUserIds.filter((id) => workspaceUserIds.has(id))]),
   );
+  const guestUserIds = new Set(
+    workspace.members
+      .filter((member) => member.role === "guest")
+      .map((member) => member.user_id),
+  );
+  const includesGuests = userIds.some((userId) => guestUserIds.has(userId));
+  const profileAdmin = createSupabaseAdminClient();
+  const { data: selectedProfile, error: selectedProfileError } = profileId
+    ? await profileAdmin
+        .from("orchestrator_profiles")
+        .select(
+          "id,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+        )
+        .eq("id", profileId)
+        .eq("workspace_id", workspace.id)
+        .maybeSingle()
+    : { data: null, error: null };
+  if (selectedProfileError) {
+    return NextResponse.json(
+      { error: selectedProfileError.message },
+      { status: 500 },
+    );
+  }
+  if (profileId && !selectedProfile) {
+    return NextResponse.json(
+      { error: "The selected Mind is unavailable in this workspace." },
+      { status: 400 },
+    );
+  }
+  if (
+    includesGuests &&
+    orchestratorMode !== "off" &&
+    !isGuestSafeMind(selectedProfile)
+  ) {
+    return NextResponse.json(
+      {
+        error: `${GUEST_SAFE_MIND_REQUIREMENT} Choose a guest-ready Mind or set attention to Humans only.`,
+      },
+      { status: 409 },
+    );
+  }
   const agentIds = Array.isArray(body?.agentIds)
     ? Array.from(new Set(body.agentIds.map(String).filter(Boolean)))
     : [];
@@ -225,6 +326,12 @@ export async function POST(req: Request) {
   }
 
   if (agentIds.length > 0) {
+    if (kind === "channel" && workspace.role !== "admin") {
+      return NextResponse.json(
+        { error: "Only workspace admins can add agents to channels" },
+        { status: 403 },
+      );
+    }
     const admin = createSupabaseAdminClient();
     const availableAgents = await listWorkerAgents(
       workspace.billing_admin_user_id,
@@ -242,12 +349,7 @@ export async function POST(req: Request) {
   }
 
   if (skillArtifactIds.length > 0) {
-    const requestedGuestIds = new Set(
-      workspace.members
-        .filter((member) => member.role === "guest")
-        .map((member) => member.user_id),
-    );
-    if (userIds.some((userId) => requestedGuestIds.has(userId))) {
+    if (includesGuests) {
       return NextResponse.json(
         {
           error:
@@ -316,7 +418,7 @@ export async function POST(req: Request) {
   ];
   const result = await createChatChannelInRlsOrder({
     insertChannelWithoutReturning: async () => {
-      const { error } = await supabase.from("chat_channels").insert({
+      const channelInsert: Record<string, unknown> = {
         id: channelId,
         workspace_id: workspace.id,
         kind,
@@ -330,7 +432,15 @@ export async function POST(req: Request) {
         visibility,
         orchestrator_mode: orchestratorMode,
         created_by: user.id,
-      });
+      };
+      // Keep ordinary channel creation available during a rolling deployment
+      // before the optional prompt column reaches PostgREST's schema cache.
+      if (kind === "channel" && instructions.value) {
+        channelInsert.orchestrator_instructions = instructions.value;
+      }
+      const { error } = await supabase
+        .from("chat_channels")
+        .insert(channelInsert);
       return error;
     },
     insertMembers: async () => {
@@ -368,6 +478,12 @@ export async function POST(req: Request) {
     },
   });
   if (result.error) {
+    const promptMigrationPending =
+      Boolean(instructions.value) &&
+      result.stage === "channel" &&
+      (result.error.code === "42703" ||
+        result.error.code === "PGRST204" ||
+        result.error.message.includes("orchestrator_instructions"));
     const status =
       result.stage === "channel"
         ? result.error.code === "23505"
@@ -385,10 +501,42 @@ export async function POST(req: Request) {
                 : 400
           : 500;
     return NextResponse.json(
-      { error: result.error.message },
+      {
+        error: promptMigrationPending
+          ? "Channel operating briefs are still being activated. Create the channel without a brief or try again shortly."
+          : result.error.message,
+      },
       { status },
     );
   }
 
-  return NextResponse.json({ channel: result.data }, { status: 201 });
+  const [createdMembersResult, createdSkillAssignmentsResult] =
+    await Promise.all([
+      supabase
+        .from("chat_channel_members")
+        .select("id,channel_id,member_type,user_id,agent_id")
+        .eq("channel_id", channelId),
+      skillArtifactIds.length > 0
+        ? supabase
+            .from("chat_channel_skill_assignments")
+            .select("id,channel_id,artifact_id,created_at")
+            .eq("channel_id", channelId)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+
+  return NextResponse.json(
+    {
+      channel: result.data,
+      // Return the authoritative roster with the channel so the first @ menu
+      // cannot briefly treat selected agents as outsiders while the sidebar
+      // refresh is still in flight.
+      members: createdMembersResult.error
+        ? memberRows
+        : createdMembersResult.data || memberRows,
+      skillAssignments: createdSkillAssignmentsResult.error
+        ? []
+        : createdSkillAssignmentsResult.data || [],
+    },
+    { status: 201 },
+  );
 }

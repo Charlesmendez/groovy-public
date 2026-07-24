@@ -3,6 +3,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn, safeTextPreview } from "@/lib/observability/log";
 import { isSelfHosted } from "@/lib/config/edition";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 type Action = "restart" | "update";
 
@@ -25,13 +26,7 @@ async function getWorkspaceMembership(
   admin: ReturnType<typeof createSupabaseAdminClient>,
   userId: string
 ) {
-  const { data } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role")
-    .eq("user_id", userId)
-    .limit(1)
-    .single();
-  return data || null;
+  return getWorkspaceMembershipForUser({ userId, admin });
 }
 
 export async function POST(req: Request) {

@@ -112,7 +112,10 @@ Production and development envs are set for:
 - `NEXT_PUBLIC_GROOVY_LICENSE_PUBLIC_KEY_PEM`
 - `GROOVY_ADMIN_EMAILS`
 - `ENTERPRISE_SALES_EMAIL=sales@gogroovy.ai`
-- `ENTERPRISE_SALES_FROM_NAME=Groovy Sales`
+- `RESEND_API_KEY` (Preview and Production)
+- Resend sending domain `hi.gogroovy.ai` (the application defaults to
+  `Groovy <notifications@hi.gogroovy.ai>` and
+  `Groovy Sales <sales@hi.gogroovy.ai>`)
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `GITHUB_SOURCE_REPO=Charlesmendez/groovy`
 
@@ -125,6 +128,20 @@ GITHUB_SOURCE_ACCESS_TOKEN
 ```
 
 This should be a fine-grained GitHub token, not a broad personal token.
+
+Browser and Home Screen push notifications require one stable VAPID key pair
+for the deployment:
+
+```text
+WEB_PUSH_VAPID_PUBLIC_KEY
+WEB_PUSH_VAPID_PRIVATE_KEY
+WEB_PUSH_CONTACT=mailto:support@gogroovy.ai
+```
+
+Generate the pair once with `npx web-push generate-vapid-keys --json`. Store the
+private key only in Vercel; never expose it through a `NEXT_PUBLIC_*` variable
+or commit it. Configure Production, Preview, and Development independently if
+all three environments should send notifications.
 
 ### Where to go
 
@@ -149,16 +166,38 @@ Private storage buckets exist:
 ### Already done
 
 The harness-platform migrations through
-`20260723005000_team_chat_run_controls.sql` are present in production.
+`20260723006000_chat_channel_skills.sql` are present in production.
 PostgREST schema checks confirm the profile, team-chat, public-API,
-cloud-scheduler, shared-settings/invite-scope, and run-control tables are live.
+cloud-scheduler, shared-settings/invite-scope, run-control, and channel-skill
+tables/functions are live.
+
+The channel/settings UX and multi-workspace membership flow add five pending
+additive migrations:
+
+```text
+20260724000000_chat_channel_orchestrator_instructions.sql
+20260724010000_chat_web_push_notifications.sql
+20260724020000_scheduled_jobs_chat_channel.sql
+20260724030000_chat_channel_image_attachments.sql
+20260724040000_multi_workspace_selection.sql
+```
+
+Apply them before enabling channel operating-brief writes and Web Push in
+production. The workspace-selection migration adds the normalized active
+workspace preference used by multi-workspace accounts; until it is applied,
+the app uses the existing protected onboarding preferences JSON as a
+backward-compatible fallback. The scheduler migration binds scheduled tasks to their originating
+Team Chat channel and backfills existing channel-session schedules; the image
+attachment migration adds channel-scoped authorization records for objects in
+the existing private `chat_uploads` bucket. The web
+deployment remains backward-compatible while they are pending: existing
+Chat/settings reads and channel creation without a brief continue to work,
+notification preferences remain safely off, and existing scheduler jobs keep
+running while the channel panel reports that activation is pending. Text-only
+channel messages also keep working; image sends report that activation is
+pending until the attachment migration is live.
 
 ### Future migration operations
-
-`20260723006000_chat_channel_skills.sql` is the next pending production
-migration. Team Chat continues to load before it is applied, but channel-level
-skill assignment is intentionally unavailable until the table and RLS policies
-exist.
 
 The local Supabase CLI session is not authenticated. Before the next migration,
 authenticate it with a scoped Supabase access token and the production database

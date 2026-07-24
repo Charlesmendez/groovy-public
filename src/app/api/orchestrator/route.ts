@@ -39,6 +39,8 @@ import {
   modelMessageToCompactable,
   compactableToModelMessage,
 } from "@/lib/orchestrator/compaction";
+import { buildDurableContextHistory } from "@/lib/orchestrator/durableContext";
+import { reconcileCurrentUserMessage } from "@/lib/orchestrator/durableContextMerge";
 import {
   parseInput,
   getToolsForRouting,
@@ -623,7 +625,9 @@ export async function POST(req: Request) {
       return NextResponse.json(
         {
           error:
-            access.accessStatus === "trial_available"
+            access.workspaceOwnerRequired
+              ? "This workspace needs an active plan. Ask a workspace admin to activate Groovy."
+              : access.accessStatus === "trial_available"
               ? "Start your free 5-day trial to use the orchestrator."
               : "Your free trial has ended. Purchase a Groovy license to continue.",
           code: access.accessStatus === "trial_available" ? "trial_not_started" : "license_required",
@@ -1810,22 +1814,97 @@ For browser work in this turn, use browser_task instead of the low-level browser
     });
   }
 
+  let effectiveHistory = history;
+  if (sessionId && clientToolResults.length === 0) {
+    const callerHistory = history;
+    const durableContext = await buildDurableContextHistory({
+      sessionId,
+      authorizedUserId: user.id,
+      provider,
+      apiKey: apiKey || undefined,
+      filter: {
+        epochId: effectiveRuntimeScope?.epochId || null,
+        agentId: effectiveAgentId,
+        branchId: effectiveRuntimeScope?.branchId || null,
+        useBranchScope: false,
+      },
+      fallbackHistory: history,
+      onSummaryUsage: async (summaryUsage) => {
+        if (!summaryUsage.usage) return;
+        const checkpointSpanId = `checkpoint:v${summaryUsage.summaryVersion}`;
+        if (billingWorkspaceId) {
+          await insertBillingUsageEventBestEffort({
+            workspaceId: billingWorkspaceId,
+            userId: user.id,
+            turnId: effectiveTurnId,
+            traceId,
+            source: "durable_context_checkpoint",
+            spanId: checkpointSpanId,
+            provider: summaryUsage.provider,
+            model: summaryUsage.model,
+            usage: summaryUsage.usage,
+            billable: true,
+            chargeType: usageChargeType,
+            agentId: effectiveAgentId,
+            meta: {
+              summarizedMessages: summaryUsage.summarizedMessages,
+              summaryVersion: summaryUsage.summaryVersion,
+              scopeKey: summaryUsage.scopeKey,
+            },
+          });
+        }
+        await billGroovyUsage({
+          source: "durable_context_checkpoint",
+          spanId: checkpointSpanId,
+          model: summaryUsage.model,
+          usage: summaryUsage.usage,
+          meta: {
+            summarizedMessages: summaryUsage.summarizedMessages,
+            summaryVersion: summaryUsage.summaryVersion,
+            scopeKey: summaryUsage.scopeKey,
+          },
+        });
+      },
+    });
+    effectiveHistory = sanitizeMessages(durableContext.history);
+    effectiveHistory = reconcileCurrentUserMessage({
+      durableHistory: effectiveHistory,
+      callerHistory,
+      currentMessage: rawMessage,
+      fallbackContent: parsed.message,
+    });
+    if (durableContext.checkpointUpdated) {
+      console.log("[orchestrator] durable context checkpoint updated", {
+        traceId,
+        sessionId,
+        summarizedMessages: durableContext.summarizedMessages,
+      });
+    }
+  }
+
   const rawMessageTrimmed = rawMessage.trim();
-  const lastHistoryMessage = history.length > 0 ? history[history.length - 1] : null;
+  const parsedMessageTrimmed = parsed.message.trim();
+  const lastHistoryMessage =
+    effectiveHistory.length > 0
+      ? effectiveHistory[effectiveHistory.length - 1]
+      : null;
   const lastHistoryMessageContent =
     lastHistoryMessage && typeof lastHistoryMessage === "object"
       ? (lastHistoryMessage as { content?: unknown }).content
       : null;
-  const historyAlreadyIncludesRawUserMessage =
+  const historyAlreadyIncludesCurrentUserMessage =
     !!rawMessageTrimmed &&
     !!lastHistoryMessage &&
     lastHistoryMessage.role === "user" &&
     typeof lastHistoryMessageContent === "string" &&
-    lastHistoryMessageContent.trim() === rawMessageTrimmed;
+    (
+      lastHistoryMessageContent.trim() === rawMessageTrimmed ||
+      lastHistoryMessageContent.trim() === parsedMessageTrimmed
+    );
 
   let messages: ModelMessage[] = sanitizeMessages([
-    ...history,
-    ...(rawMessageTrimmed && !historyAlreadyIncludesRawUserMessage
+    ...effectiveHistory,
+    ...(rawMessageTrimmed && !historyAlreadyIncludesCurrentUserMessage
       ? [{ role: "user" as const, content: parsed.message }]
       : []),
     ...toolResultMessages,

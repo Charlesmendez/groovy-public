@@ -8,8 +8,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import { HARNESS_PROFILE_TEMPLATES } from "@/lib/orchestrator/profileTemplates";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import {
+  MODEL_CATALOG,
+  inferProviderForModelId,
+  reasoningEffortsForModel,
+  type CatalogProvider,
+} from "@/lib/ai/modelCatalog";
 
 type ProfileRow = {
   id: string;
@@ -105,6 +112,15 @@ const EXTERNAL_TOOL_OPTIONS = new Set([
   "files_agent_request",
   "data_query",
 ]);
+const EXTERNAL_DEFAULT_TOOLS = [
+  "web_search",
+  "files_agent_request",
+  "remember",
+  "recall",
+  "wiki_search",
+  "wiki_read",
+  "wiki_file_learning",
+];
 
 const DATA_SOURCE_OPTIONS = [
   ["google_ads", "Google Ads"],
@@ -123,12 +139,57 @@ const DATA_SOURCE_OPTIONS = [
 ] as const;
 
 const inputCls =
-  "w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-cyan-400/40";
+  "w-full min-w-0 max-w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-cyan-400/40";
 const labelCls = "mb-1 mt-4 block text-[11px] font-medium uppercase tracking-widest text-zinc-500";
 
-export default function MindsPage() {
+function reasoningEffortLabel(effort: string): string {
+  return effort === "xhigh"
+    ? "Extra high"
+    : effort.charAt(0).toUpperCase() + effort.slice(1);
+}
+
+const REASONING_EFFORT_DESCRIPTIONS: Record<string, string> = {
+  none: "Fastest response without a deliberate reasoning budget.",
+  low: "Faster and more economical for focused work.",
+  medium: "Balanced speed and depth for everyday work.",
+  high: "More analysis for complex planning.",
+  xhigh: "Extended reasoning for difficult work.",
+  max: "Maximum available depth and token use.",
+};
+
+function profileDraft(profile: ProfileRow): ProfileRow {
+  if (profile.surface !== "external") return { ...profile };
+  const tools =
+    profile.tool_policy?.mode === "allowlist"
+      ? profile.tool_policy.tools.filter((tool) =>
+          EXTERNAL_TOOL_OPTIONS.has(tool),
+        )
+      : EXTERNAL_DEFAULT_TOOLS;
+  return {
+    ...profile,
+    authorization_stance: "restricted",
+    memory_scope: "profile",
+    inherit_workspace_skills: false,
+    inherit_workspace_integrations: false,
+    tool_policy: {
+      mode: "allowlist",
+      tools,
+      ...(profile.tool_policy?.mode === "allowlist" &&
+      profile.tool_policy.dataSources?.length
+        ? { dataSources: profile.tool_policy.dataSources }
+        : {}),
+    },
+  };
+}
+
+export function MindsManager({
+  embedded = false,
+}: {
+  embedded?: boolean;
+} = {}) {
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editorCollapsed, setEditorCollapsed] = useState(false);
   const [draft, setDraft] = useState<Partial<ProfileRow>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -142,6 +203,7 @@ export default function MindsPage() {
   const [workspaceRole, setWorkspaceRole] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<ProfileCapabilities | null>(null);
   const [capabilitiesBusy, setCapabilitiesBusy] = useState(false);
+  const [customModelDraft, setCustomModelDraft] = useState("");
 
   const load = useCallback(async () => {
     const res = await fetch("/api/harness/profiles", { cache: "no-store" });
@@ -170,6 +232,28 @@ export default function MindsPage() {
   }, [load]);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+  const selectedModelProvider = draft.model?.provider ?? "";
+  const selectedModelGroup =
+    MODEL_CATALOG.find(
+      (group) => group.provider === selectedModelProvider,
+    ) ?? null;
+  const selectedModelIsCatalogued =
+    !!draft.model?.model &&
+    !!selectedModelGroup?.models.some(
+      (model) => model.id === draft.model?.model,
+    );
+  const supportedReasoningEfforts = reasoningEffortsForModel(
+    draft.model?.model,
+  );
+  // Audience changes are edited locally before the profile is saved. Do not let
+  // a slower capabilities response restore inheritance and lock the lists while
+  // an external/guest Mind is being configured.
+  const inheritsWorkspaceSkills =
+    draft.surface !== "external" &&
+    Boolean(capabilities?.inheritWorkspaceSkills);
+  const inheritsWorkspaceIntegrations =
+    draft.surface !== "external" &&
+    Boolean(capabilities?.inheritWorkspaceIntegrations);
 
   const loadKeys = useCallback(async (profileId: string) => {
     const res = await fetch(`/api/harness/profiles/${profileId}/keys`, {
@@ -196,10 +280,16 @@ export default function MindsPage() {
   }, []);
 
   const openProfile = (p: ProfileRow) => {
+    if (selectedId === p.id) {
+      setEditorCollapsed((collapsed) => !collapsed);
+      return;
+    }
     setSelectedId(p.id);
-    setDraft({ ...p });
+    setEditorCollapsed(false);
+    setDraft(profileDraft(p));
     setError(null);
     setPlaintextKey(null);
+    setCustomModelDraft("");
     void loadKeys(p.id);
     void loadCapabilities(p.id);
   };
@@ -213,11 +303,80 @@ export default function MindsPage() {
     const profile = profiles.find((candidate) => candidate.id === requestedId);
     if (!profile) return;
     setSelectedId(profile.id);
-    setDraft({ ...profile });
+    setEditorCollapsed(false);
+    setDraft(profileDraft(profile));
     setPlaintextKey(null);
+    setCustomModelDraft("");
     void loadKeys(profile.id);
     void loadCapabilities(profile.id);
   }, [loadCapabilities, loadKeys, profiles, selectedId]);
+
+  const selectModelProvider = (value: string) => {
+    if (!value) {
+      setDraft((current) => ({ ...current, model: null }));
+      setCustomModelDraft("");
+      return;
+    }
+
+    const provider = value as CatalogProvider;
+    const group = MODEL_CATALOG.find(
+      (candidate) => candidate.provider === provider,
+    );
+    const fallbackModel = group?.models[0]?.id;
+    if (!fallbackModel) return;
+
+    setDraft((current) => {
+      const currentModel =
+        current.model?.provider === provider
+          ? current.model.model
+          : fallbackModel;
+      const supportedEfforts = reasoningEffortsForModel(currentModel);
+      const reasoningEffort =
+        current.model?.provider === provider &&
+        current.model.reasoningEffort &&
+        supportedEfforts.includes(
+          current.model.reasoningEffort as (typeof supportedEfforts)[number],
+        )
+          ? current.model.reasoningEffort
+          : null;
+      return {
+        ...current,
+        model: {
+          provider,
+          model: currentModel,
+          reasoningEffort,
+        },
+      };
+    });
+    setCustomModelDraft("");
+  };
+
+  const selectCatalogModel = (model: string) => {
+    if (!model) return;
+    setDraft((current) => ({
+      ...current,
+      model: {
+        provider: inferProviderForModelId(model),
+        model,
+        reasoningEffort: null,
+      },
+    }));
+    setCustomModelDraft("");
+  };
+
+  const applyCustomModel = () => {
+    const model = customModelDraft.trim();
+    if (!model) return;
+    setDraft((current) => ({
+      ...current,
+      model: {
+        provider: inferProviderForModelId(model),
+        model,
+        reasoningEffort: null,
+      },
+    }));
+    setCustomModelDraft("");
+  };
 
   const call = async (fn: () => Promise<Response>) => {
     setBusy(true);
@@ -274,7 +433,10 @@ export default function MindsPage() {
   const remove = async (id: string) => {
     if (!window.confirm("Delete this mind? Conversations keep their history.")) return;
     await call(() => fetch(`/api/harness/profiles/${id}`, { method: "DELETE" }));
-    if (selectedId === id) setSelectedId(null);
+    if (selectedId === id) {
+      setSelectedId(null);
+      setEditorCollapsed(false);
+    }
   };
 
   const setDefault = (id: string) =>
@@ -379,9 +541,9 @@ export default function MindsPage() {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            inheritWorkspaceSkills: capabilities.inheritWorkspaceSkills,
+            inheritWorkspaceSkills: inheritsWorkspaceSkills,
             inheritWorkspaceIntegrations:
-              capabilities.inheritWorkspaceIntegrations,
+              inheritsWorkspaceIntegrations,
             skillArtifactIds: capabilities.skills
               .filter((skill) => skill.granted)
               .map((skill) => skill.id),
@@ -473,19 +635,25 @@ reply = requests.post(
 ).json()`;
 
   return (
-    <div className="app-scroll-page bg-[var(--bg-primary)] text-white">
-      <div className="mx-auto max-w-5xl px-6 py-8">
-        <div className="mb-6 flex items-center justify-between">
-          <div>
+    <div
+      className={`min-w-0 max-w-full bg-[var(--bg-primary)] text-white ${
+        embedded ? "min-h-0" : "app-scroll-page"
+      }`}
+    >
+      <div className="mx-auto w-full min-w-0 max-w-5xl px-4 py-7 pb-[calc(2rem+env(safe-area-inset-bottom))] sm:px-6 sm:py-8 sm:pb-10">
+        <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
             <h1 className="text-xl font-semibold">Minds</h1>
             <p className="mt-1 text-sm text-zinc-400">
               Harness profiles — who your orchestrator is. The engine is shared; the soul is yours.
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <Link href="/dashboard" className="text-sm text-zinc-400 hover:text-white">
-              ← Dashboard
-            </Link>
+            {!embedded ? (
+              <Link href="/dashboard" className="text-sm text-zinc-400 hover:text-white">
+                ← Dashboard
+              </Link>
+            ) : null}
             <button
               onClick={() => setShowTemplates((v) => !v)}
               className="rounded-lg border border-cyan-400/40 bg-cyan-400/10 px-3 py-1.5 text-sm text-cyan-300 hover:bg-cyan-400/20"
@@ -496,13 +664,13 @@ reply = requests.post(
         </div>
 
         {showTemplates && (
-          <div className="mb-6 grid gap-2 sm:grid-cols-3">
+          <div className="mb-6 grid min-w-0 gap-2 sm:grid-cols-3">
             {HARNESS_PROFILE_TEMPLATES.map((tpl) => (
               <button
                 key={tpl.key}
                 disabled={busy}
                 onClick={() => void createFromTemplate(tpl)}
-                className="rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left transition-colors hover:border-cyan-400/40"
+                className="min-w-0 max-w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left transition-colors hover:border-cyan-400/40"
               >
                 <div className="text-sm font-medium">{tpl.name}</div>
                 <div className="mt-1 text-xs leading-relaxed text-zinc-400">{tpl.description}</div>
@@ -517,8 +685,8 @@ reply = requests.post(
           </div>
         )}
 
-        <div className="grid gap-6 md:grid-cols-[280px_1fr]">
-          <div className="space-y-2">
+        <div className="grid min-w-0 gap-6 md:grid-cols-[minmax(0,280px)_minmax(0,1fr)]">
+          <div className="min-w-0 space-y-2">
             {profiles.length === 0 && (
               <div className="rounded-xl border border-dashed border-white/10 px-4 py-6 text-center text-sm text-zinc-500">
                 No minds yet. Your orchestrator uses the built-in Groovy persona. Create one to
@@ -529,20 +697,39 @@ reply = requests.post(
               <button
                 key={p.id}
                 onClick={() => openProfile(p)}
-                className={`w-full rounded-xl border px-4 py-3 text-left transition-colors ${
+                aria-expanded={
+                  selectedId === p.id ? !editorCollapsed : undefined
+                }
+                aria-controls={
+                  selectedId === p.id ? "mind-editor-content" : undefined
+                }
+                className={`w-full min-w-0 max-w-full overflow-hidden rounded-xl border px-4 py-3 text-left transition-colors ${
                   selectedId === p.id
                     ? "border-cyan-400/40 bg-cyan-400/5"
                     : "border-white/10 bg-white/5 hover:border-white/20"
                 }`}
               >
-                <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium">{p.name}</span>
-                  {p.is_default && <span className="text-[10px] text-zinc-500">default</span>}
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium">{p.name}</span>
+                  {p.is_default && <span className="shrink-0 text-[10px] text-zinc-500">default</span>}
                   {p.surface === "external" && (
-                    <span className="rounded-full border border-amber-400/40 px-1.5 text-[9px] uppercase text-amber-300">
-                      external
+                    <span className="shrink-0 rounded-full border border-amber-400/40 px-1.5 text-[9px] uppercase text-amber-300">
+                      guest-ready
                     </span>
                   )}
+                  {selectedId === p.id ? (
+                    editorCollapsed ? (
+                      <ChevronDown
+                        className="h-4 w-4 shrink-0 text-cyan-300"
+                        aria-hidden="true"
+                      />
+                    ) : (
+                      <ChevronUp
+                        className="h-4 w-4 shrink-0 text-cyan-300"
+                        aria-hidden="true"
+                      />
+                    )
+                  ) : null}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-zinc-500">
                   {p.model ? `${p.model.model}` : "default brain"} ·{" "}
@@ -554,25 +741,69 @@ reply = requests.post(
           </div>
 
           {selected ? (
-            <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-5">
-              <label className={labelCls}>Name</label>
-              <input
-                className={inputCls}
-                value={draft.name ?? ""}
-                onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-              />
+            <div className="min-w-0 max-w-full overflow-hidden rounded-2xl border border-white/10 bg-white/[0.03] p-4 sm:p-5">
+              <div
+                className={`flex items-center justify-between gap-3 ${
+                  editorCollapsed
+                    ? ""
+                    : "mb-5 border-b border-white/10 pb-4"
+                }`}
+              >
+                <div className="min-w-0">
+                  <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-zinc-600">
+                    Mind settings
+                  </p>
+                  <h2 className="mt-1 truncate text-sm font-medium text-zinc-200">
+                    {draft.name || selected.name}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setEditorCollapsed((collapsed) => !collapsed)
+                  }
+                  aria-expanded={!editorCollapsed}
+                  aria-controls="mind-editor-content"
+                  className="inline-flex min-h-10 shrink-0 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.035] px-3 text-xs text-zinc-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white"
+                >
+                  {editorCollapsed ? "Expand" : "Collapse"}
+                  {editorCollapsed ? (
+                    <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                  ) : (
+                    <ChevronUp className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </button>
+              </div>
 
-              <label className={labelCls}>Soul — persona prompt</label>
-              <textarea
-                className={`${inputCls} min-h-28 resize-y leading-relaxed`}
-                placeholder="Empty = the built-in Groovy persona"
-                value={draft.persona_prompt ?? ""}
-                onChange={(e) => setDraft((d) => ({ ...d, persona_prompt: e.target.value || null }))}
-              />
-              <p className="mt-1 text-[11px] text-zinc-600">
-                This is the only prompt you edit. Tools, memory, and delegation mechanics are the
-                shared kernel.
-              </p>
+              <div
+                id="mind-editor-content"
+                className={editorCollapsed ? "hidden" : ""}
+              >
+                <label className={labelCls}>Name</label>
+                <input
+                  className={inputCls}
+                  value={draft.name ?? ""}
+                  onChange={(e) =>
+                    setDraft((d) => ({ ...d, name: e.target.value }))
+                  }
+                />
+
+                <label className={labelCls}>Soul — persona prompt</label>
+                <textarea
+                  className={`${inputCls} min-h-28 resize-y leading-relaxed`}
+                  placeholder="Empty = the built-in Groovy persona"
+                  value={draft.persona_prompt ?? ""}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      persona_prompt: e.target.value || null,
+                    }))
+                  }
+                />
+                <p className="mt-1 text-[11px] text-zinc-600">
+                  This is the only prompt you edit. Tools, memory, and
+                  delegation mechanics are the shared kernel.
+                </p>
 
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
@@ -602,7 +833,7 @@ reply = requests.post(
                 }
               />
 
-              <div className="grid gap-4 sm:grid-cols-3">
+              <div className="grid gap-4 sm:grid-cols-2">
                 <div>
                   <label className={labelCls}>Authorization</label>
                   <CustomSelect
@@ -636,119 +867,242 @@ reply = requests.post(
                     ]}
                   />
                 </div>
-                <div>
-                  <label className={labelCls}>Brain (model id)</label>
-                  <input
-                    className={inputCls}
-                    placeholder="empty = your default"
-                    value={draft.model?.model ?? ""}
-                    onChange={(e) =>
-                      setDraft((d) => ({
-                        ...d,
-                        model: e.target.value.trim()
-                          ? {
-                              provider: d.model?.provider ?? "anthropic",
-                              model: e.target.value,
-                              reasoningEffort: d.model?.reasoningEffort ?? null,
-                            }
-                          : null,
-                      }))
-                    }
-                  />
-                </div>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
+              <label className={labelCls}>Audience boundary</label>
+              <CustomSelect
+                ariaLabel="Audience boundary"
+                triggerClassName={inputCls}
+                value={draft.surface ?? "internal"}
+                onChange={(value) => {
+                  const surface = value as "internal" | "external";
+                  if (surface === "external") {
+                    setCapabilities((current) =>
+                      current
+                        ? {
+                            ...current,
+                            inheritWorkspaceSkills: false,
+                            inheritWorkspaceIntegrations: false,
+                          }
+                        : current,
+                    );
+                  }
+                  setDraft((current) => ({
+                    ...current,
+                    surface,
+                    ...(surface === "external"
+                      ? {
+                          authorization_stance: "restricted",
+                          memory_scope: "profile",
+                          inherit_workspace_skills: false,
+                          inherit_workspace_integrations: false,
+                          tool_policy: {
+                            mode: "allowlist",
+                            tools:
+                              current.tool_policy?.mode === "allowlist"
+                                ? current.tool_policy.tools.filter((tool) =>
+                                    EXTERNAL_TOOL_OPTIONS.has(tool),
+                                  )
+                                : EXTERNAL_DEFAULT_TOOLS,
+                          },
+                        }
+                      : {}),
+                  }));
+                }}
+                options={[
+                  {
+                    value: "internal",
+                    label: "Internal team",
+                    description: "Trusted workspace members and operators",
+                  },
+                  {
+                    value: "external",
+                    label: "External & guests",
+                    description: "Channel guests, customers, API, and widget",
+                  },
+                ]}
+              />
+              <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-600">
+                This is a trust boundary, not a publishing switch. External
+                Minds can be used in guest channels as well as customer-facing
+                API and widget surfaces.
+              </p>
+
+              <div className="mt-5 rounded-xl border border-cyan-400/15 bg-cyan-400/[0.025] p-4">
                 <div>
-                  <label className={labelCls}>Surface</label>
-                  <CustomSelect
-                    ariaLabel="Surface"
-                    triggerClassName={inputCls}
-                    value={draft.surface ?? "internal"}
-                    onChange={(value) => {
-                      const surface = value as "internal" | "external";
-                      setDraft((current) => ({
-                        ...current,
-                        surface,
-                        ...(surface === "external"
-                          ? {
-                              authorization_stance: "restricted",
-                              memory_scope: "profile",
-                              tool_policy: {
-                                mode: "allowlist",
-                                tools:
-                                  current.tool_policy?.mode === "allowlist"
-                                    ? current.tool_policy.tools.filter((tool) =>
-                                        EXTERNAL_TOOL_OPTIONS.has(tool),
-                                      )
-                                    : [
-                                        "web_search",
-                                        "files_agent_request",
-                                        "remember",
-                                        "recall",
-                                        "wiki_search",
-                                        "wiki_read",
-                                        "wiki_file_learning",
-                                      ],
-                              },
-                            }
-                          : {}),
-                      }));
-                    }}
-                    options={[
-                      { value: "internal", label: "Internal", description: "Teammates and operators" },
-                      { value: "external", label: "External", description: "API and widget" },
-                    ]}
-                  />
+                  <h2 className="text-sm font-medium text-zinc-200">Brain</h2>
+                  <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                    Choose the model and reasoning effort this Mind uses. Auto
+                    follows the workspace orchestrator default.
+                  </p>
                 </div>
-                <div>
-                  <label className={labelCls}>Model provider</label>
-                  <CustomSelect
-                    ariaLabel="Model provider"
-                    triggerClassName={inputCls}
-                    value={draft.model?.provider ?? "anthropic"}
-                    onChange={(value) =>
-                      setDraft((current) => ({
-                        ...current,
-                        model: current.model
-                          ? {
-                              ...current.model,
-                              provider: value as "anthropic" | "openai",
-                            }
-                          : null,
-                      }))
-                    }
-                    options={[
-                      { value: "anthropic", label: "Anthropic" },
-                      { value: "openai", label: "OpenAI" },
-                    ]}
-                  />
+
+                <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-widest text-zinc-500">
+                      Provider
+                    </label>
+                    <CustomSelect
+                      ariaLabel="Model provider"
+                      value={selectedModelProvider}
+                      onChange={selectModelProvider}
+                      options={[
+                        {
+                          value: "",
+                          label: "Auto",
+                          description: "Workspace default",
+                        },
+                        {
+                          value: "anthropic",
+                          label: "Anthropic",
+                          description: "Claude models",
+                        },
+                        {
+                          value: "openai",
+                          label: "OpenAI",
+                          description: "GPT models",
+                        },
+                      ]}
+                    />
+                  </div>
+
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-widest text-zinc-500">
+                      Model
+                    </label>
+                    <CustomSelect
+                      ariaLabel="Brain model"
+                      value={draft.model?.model ?? ""}
+                      onChange={selectCatalogModel}
+                      disabled={!selectedModelGroup}
+                      placeholder={
+                        selectedModelGroup ? "Choose a model" : "Workspace default"
+                      }
+                      options={[
+                        ...(draft.model?.model && !selectedModelIsCatalogued
+                          ? [
+                              {
+                                value: draft.model.model,
+                                label: `${draft.model.model} (custom)`,
+                              },
+                            ]
+                          : []),
+                        ...(selectedModelGroup?.models.map((model) => ({
+                          value: model.id,
+                          label: model.label,
+                          description: model.hint,
+                        })) ?? []),
+                      ]}
+                    />
+                  </div>
+
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-widest text-zinc-500">
+                      Reasoning effort
+                    </label>
+                    <CustomSelect
+                      ariaLabel="Reasoning effort"
+                      value={draft.model?.reasoningEffort ?? ""}
+                      onChange={(reasoningEffort) =>
+                        setDraft((current) => ({
+                          ...current,
+                          model: current.model
+                            ? {
+                                ...current.model,
+                                reasoningEffort: reasoningEffort || null,
+                              }
+                            : null,
+                        }))
+                      }
+                      disabled={
+                        !draft.model || supportedReasoningEfforts.length === 0
+                      }
+                      placeholder={
+                        draft.model && supportedReasoningEfforts.length === 0
+                          ? "Not configurable"
+                          : "Default effort"
+                      }
+                      options={[
+                        {
+                          value: "",
+                          label: "Model default",
+                          description: "Use the provider recommendation",
+                        },
+                        ...supportedReasoningEfforts.map((effort) => ({
+                          value: effort,
+                          label: reasoningEffortLabel(effort),
+                          description:
+                            REASONING_EFFORT_DESCRIPTIONS[effort],
+                        })),
+                      ]}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-4 border-t border-white/[0.07] pt-3">
+                  <label className="mb-1.5 block text-[10px] font-medium uppercase tracking-widest text-zinc-500">
+                    Custom model ID
+                  </label>
+                  <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
+                    <input
+                      className={`${inputCls} min-w-0 flex-1`}
+                      placeholder="e.g. gpt-5.6-sol"
+                      value={customModelDraft}
+                      onChange={(event) =>
+                        setCustomModelDraft(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter") return;
+                        event.preventDefault();
+                        applyCustomModel();
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!customModelDraft.trim()}
+                      onClick={applyCustomModel}
+                      className="shrink-0 rounded-lg border border-white/10 bg-white/[0.05] px-3 py-2 text-xs text-zinc-300 transition hover:border-white/20 hover:bg-white/[0.08] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Use model
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[10px] text-zinc-600">
+                    Custom IDs are supported; Groovy infers the provider from
+                    the model name.
+                  </p>
                 </div>
               </div>
 
               <label className={labelCls}>Tool policy</label>
               <div className="rounded-xl border border-white/10 bg-black/20 p-3">
-                <label className="flex items-center gap-2 text-sm text-zinc-300">
-                  <input
-                    type="checkbox"
-                    checked={draft.tool_policy?.mode !== "allowlist"}
-                    disabled={draft.surface === "external"}
-                    onChange={(event) =>
-                      setDraft((current) => ({
-                        ...current,
-                        tool_policy: event.target.checked
-                          ? { mode: "all" }
-                          : { mode: "allowlist", tools: [] },
-                      }))
-                    }
-                  />
-                  All runtime tools
-                  {draft.surface === "external" ? (
-                    <span className="text-xs text-amber-300">
-                      External profiles are always deny-by-default.
-                    </span>
-                  ) : null}
-                </label>
+                {draft.surface === "external" ? (
+                  <div className="rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2.5">
+                    <div className="text-xs font-medium text-amber-100">
+                      Restricted tool allowlist
+                    </div>
+                    <p className="mt-1 text-[10px] leading-relaxed text-amber-100/65">
+                      External and guest audiences can use only the safe tools
+                      selected below. Workspace-wide skills, docs, and
+                      integrations do not inherit automatically.
+                    </p>
+                  </div>
+                ) : (
+                  <label className="flex items-center gap-2 text-sm text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={draft.tool_policy?.mode !== "allowlist"}
+                      onChange={(event) =>
+                        setDraft((current) => ({
+                          ...current,
+                          tool_policy: event.target.checked
+                            ? { mode: "all" }
+                            : { mode: "allowlist", tools: [] },
+                        }))
+                      }
+                    />
+                    All runtime tools
+                  </label>
+                )}
                 {draft.tool_policy?.mode === "allowlist" ? (
                   <div className="mt-3">
                     <div className="grid gap-2 sm:grid-cols-2">
@@ -800,8 +1154,14 @@ reply = requests.post(
                 ) : null}
               </div>
 
-              <label className={labelCls}>Agent roster</label>
+              <label className={labelCls}>Default agent access</label>
               <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                <p className="mb-3 text-[11px] leading-relaxed text-zinc-500">
+                  Used by Command Center, API, schedules, and other non-channel
+                  entry points. Team Chat keeps an independent roster per
+                  channel, managed by workspace admins with @ or Channel
+                  Settings.
+                </p>
                 <label className="flex items-center gap-2 text-sm text-zinc-300">
                   <input
                     type="checkbox"
@@ -815,7 +1175,7 @@ reply = requests.post(
                       }))
                     }
                   />
-                  All worker agents
+                  All worker agents by default
                 </label>
                 {draft.agent_roster != null ? (
                   <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -834,9 +1194,9 @@ reply = requests.post(
                 ) : null}
               </div>
 
-              <div className="mt-6 rounded-xl border border-violet-400/20 bg-violet-400/[0.04] p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
+              <div className="mt-6 min-w-0 max-w-full rounded-xl border border-violet-400/20 bg-violet-400/[0.04] p-4">
+                <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+                  <div className="min-w-0">
                     <h2 className="text-sm font-medium text-violet-200">
                       Skills, docs &amp; integrations
                     </h2>
@@ -848,7 +1208,7 @@ reply = requests.post(
                   </div>
                   <Link
                     href="/settings"
-                    className="shrink-0 text-xs text-violet-300 hover:text-violet-200"
+                    className="self-start text-xs text-violet-300 hover:text-violet-200 sm:shrink-0"
                   >
                     Open workspace settings
                   </Link>
@@ -861,48 +1221,57 @@ reply = requests.post(
                 ) : (
                   <div className="mt-4 space-y-5">
                     <section>
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
+                      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
                           <div className="text-xs font-medium text-zinc-300">
                             Skills &amp; Markdown instructions
                           </div>
-                          <div className="text-[11px] text-zinc-600">
+                          <div className="break-words text-[11px] text-zinc-600">
                             `SKILL.md` packages and instruction documents from the
                             shared Git-backed library.
                           </div>
                         </div>
-                        <label className="flex items-center gap-2 text-[11px] text-zinc-400">
-                          <input
-                            type="checkbox"
-                            checked={capabilities.inheritWorkspaceSkills}
-                            disabled={draft.surface === "external"}
-                            onChange={(event) =>
+                        {draft.surface === "external" ? (
+                          <span className="rounded-full border border-amber-300/20 bg-amber-300/[0.06] px-2.5 py-1 text-[10px] font-medium text-amber-200">
+                            Explicit grants only
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() =>
                               setCapabilities((current) =>
                                 current
                                   ? {
                                       ...current,
                                       inheritWorkspaceSkills:
-                                        event.target.checked,
+                                        !inheritsWorkspaceSkills,
                                     }
                                   : current,
                               )
                             }
-                          />
-                          {draft.surface === "external"
-                            ? "Grant public-safe items explicitly"
-                            : "Inherit workspace defaults"}
-                        </label>
+                            className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-400 transition hover:border-white/20 hover:text-zinc-200"
+                          >
+                            {inheritsWorkspaceSkills
+                              ? "Choose individually"
+                              : "Use workspace defaults"}
+                          </button>
+                        )}
                       </div>
+                      {inheritsWorkspaceSkills ? (
+                        <p className="mt-2 rounded-lg border border-white/10 bg-white/[0.025] px-3 py-2 text-[11px] text-zinc-500">
+                          Workspace defaults are active. Choose individually to
+                          unlock this list.
+                        </p>
+                      ) : null}
                       {capabilities.skills.length ? (
                         <div className="mt-2 grid gap-2 sm:grid-cols-2">
                           {capabilities.skills.map((skill) => {
                             const inherited =
-                              capabilities.inheritWorkspaceSkills &&
-                              skill.inherited;
+                              inheritsWorkspaceSkills && skill.inherited;
                             return (
                               <label
                                 key={skill.id}
-                                className="flex items-start gap-2 rounded-lg border border-white/10 bg-black/20 p-2.5 text-xs text-zinc-300"
+                                className="flex min-w-0 max-w-full items-start gap-2 rounded-lg border border-white/10 bg-black/20 p-2.5 text-xs text-zinc-300"
                                 title={
                                   inherited
                                     ? "Disable workspace inheritance to remove this default from the Mind."
@@ -932,7 +1301,7 @@ reply = requests.post(
                                     )
                                   }
                                 />
-                                <span className="min-w-0">
+                                <span className="min-w-0 flex-1">
                                   <span className="block truncate">
                                     {skill.name}
                                   </span>
@@ -962,12 +1331,12 @@ reply = requests.post(
                     </section>
 
                     <section className="border-t border-white/10 pt-4">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
+                      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
                           <div className="text-xs font-medium text-zinc-300">
                             Datagran &amp; data integrations
                           </div>
-                          <div className="text-[11px] text-zinc-600">
+                          <div className="break-words text-[11px] text-zinc-600">
                             Connections stay workspace-owned; this grants the Mind
                             access to selected connections.
                             {draft.surface === "external"
@@ -975,40 +1344,48 @@ reply = requests.post(
                               : ""}
                           </div>
                         </div>
-                        <label className="flex items-center gap-2 text-[11px] text-zinc-400">
-                          <input
-                            type="checkbox"
-                            checked={
-                              capabilities.inheritWorkspaceIntegrations
-                            }
-                            disabled={draft.surface === "external"}
-                            onChange={(event) =>
+                        {draft.surface === "external" ? (
+                          <span className="rounded-full border border-amber-300/20 bg-amber-300/[0.06] px-2.5 py-1 text-[10px] font-medium text-amber-200">
+                            Explicit grants only
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() =>
                               setCapabilities((current) =>
                                 current
                                   ? {
                                       ...current,
                                       inheritWorkspaceIntegrations:
-                                        event.target.checked,
+                                        !inheritsWorkspaceIntegrations,
                                     }
                                   : current,
                               )
                             }
-                          />
-                          {draft.surface === "external"
-                            ? "Grant connections explicitly"
-                            : "Inherit workspace defaults"}
-                        </label>
+                            className="rounded-lg border border-white/10 px-2.5 py-1 text-[11px] text-zinc-400 transition hover:border-white/20 hover:text-zinc-200"
+                          >
+                            {inheritsWorkspaceIntegrations
+                              ? "Choose individually"
+                              : "Use workspace defaults"}
+                          </button>
+                        )}
                       </div>
+                      {inheritsWorkspaceIntegrations ? (
+                        <p className="mt-2 rounded-lg border border-white/10 bg-white/[0.025] px-3 py-2 text-[11px] text-zinc-500">
+                          Workspace defaults are active. Choose individually to
+                          unlock this list.
+                        </p>
+                      ) : null}
                       {capabilities.integrations.length ? (
                         <div className="mt-2 grid gap-2 sm:grid-cols-2">
                           {capabilities.integrations.map((integration) => {
                             const inherited =
-                              capabilities.inheritWorkspaceIntegrations &&
+                              inheritsWorkspaceIntegrations &&
                               integration.inherited;
                             return (
                               <label
                                 key={integration.id}
-                                className="flex items-start gap-2 rounded-lg border border-white/10 bg-black/20 p-2.5 text-xs text-zinc-300"
+                                className="flex min-w-0 max-w-full items-start gap-2 rounded-lg border border-white/10 bg-black/20 p-2.5 text-xs text-zinc-300"
                                 title={
                                   inherited
                                     ? "Disable workspace inheritance to remove this default from the Mind."
@@ -1041,7 +1418,7 @@ reply = requests.post(
                                     )
                                   }
                                 />
-                                <span className="min-w-0">
+                                <span className="min-w-0 flex-1">
                                   <span className="block truncate">
                                     {integration.name}
                                   </span>
@@ -1089,11 +1466,14 @@ reply = requests.post(
               </div>
 
               {draft.surface === "external" ? (
-                <div className="mt-6 rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-4">
-                  <h2 className="text-sm font-medium text-amber-200">API &amp; Widget</h2>
+                <div className="mt-6 min-w-0 max-w-full overflow-hidden rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-4">
+                  <h2 className="text-sm font-medium text-amber-200">
+                    API &amp; Widget <span className="text-zinc-600">(optional)</span>
+                  </h2>
                   <p className="mt-1 text-xs text-zinc-500">
-                    This Mind&apos;s endpoint is ready after you save it as
-                    external and create a key. Plaintext keys are shown once.
+                    External &amp; guests also makes this Mind eligible for
+                    guest channels. It is not published to an API or widget
+                    until you create a key here. Plaintext keys are shown once.
                   </p>
                   <label className={labelCls}>Thread endpoint</label>
                   <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
@@ -1214,10 +1594,10 @@ reply = requests.post(
                     {keys.map((key) => (
                       <div
                         key={key.id}
-                        className="flex items-center gap-3 rounded-lg border border-white/10 px-3 py-2 text-xs"
+                        className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 rounded-lg border border-white/10 px-3 py-2 text-xs"
                       >
-                        <span className="font-medium">{key.name}</span>
-                        <code className="text-zinc-500">{key.key_prefix}…</code>
+                        <span className="min-w-0 max-w-full truncate font-medium">{key.name}</span>
+                        <code className="max-w-full truncate text-zinc-500">{key.key_prefix}…</code>
                         <span className="text-zinc-500">
                           {key.request_count || 0} requests
                         </span>
@@ -1231,11 +1611,11 @@ reply = requests.post(
                           </span>
                         ) : null}
                         {key.revoked_at ? (
-                          <span className="ml-auto text-red-300">revoked</span>
+                          <span className="ml-auto shrink-0 text-red-300">revoked</span>
                         ) : (
                           <button
                             onClick={() => void revokeKey(key.id)}
-                            className="ml-auto text-red-300/80 hover:text-red-300"
+                            className="ml-auto shrink-0 text-red-300/80 hover:text-red-300"
                           >
                             Revoke
                           </button>
@@ -1285,7 +1665,7 @@ reply = requests.post(
                 </div>
               ) : null}
 
-              <div className="mt-6 flex items-center gap-2 border-t border-white/10 pt-4">
+              <div className="mt-6 flex flex-wrap items-center gap-2 border-t border-white/10 pt-4">
                 <button
                   disabled={busy}
                   onClick={() => void save()}
@@ -1312,14 +1692,15 @@ reply = requests.post(
                 <button
                   disabled={busy}
                   onClick={() => void remove(selected.id)}
-                  className="ml-auto rounded-lg px-3 py-2 text-sm text-red-400/80 hover:text-red-400"
+                  className="rounded-lg px-3 py-2 text-sm text-red-400/80 hover:text-red-400 sm:ml-auto"
                 >
                   Delete
                 </button>
               </div>
+              </div>
             </div>
           ) : (
-            <div className="flex items-center justify-center rounded-2xl border border-dashed border-white/10 p-10 text-sm text-zinc-500">
+            <div className="min-w-0 max-w-full overflow-hidden rounded-2xl border border-dashed border-white/10 p-8 text-center text-sm text-zinc-500 sm:flex sm:items-center sm:justify-center sm:p-10">
               Select a mind to edit it — or create one from a template.
             </div>
           )}
@@ -1327,4 +1708,8 @@ reply = requests.post(
       </div>
     </div>
   );
+}
+
+export default function MindsPage() {
+  return <MindsManager />;
 }

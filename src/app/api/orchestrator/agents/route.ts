@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import {
   getOrCreateRuntimeSessionForAgent,
   resolveRuntimeScope,
@@ -90,12 +92,10 @@ export async function GET() {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { data: member } = await supabase
-    .from("workspace_members")
-    .select("workspace_id")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
+  const member = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin: createSupabaseAdminClient(),
+  });
   const { data: sharedRows } = member?.workspace_id
     ? await supabase
         .from("workspace_orchestrator_sessions")

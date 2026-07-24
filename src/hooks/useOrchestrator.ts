@@ -5,6 +5,11 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { getActiveProfileId } from "@/lib/harnessProfileClient";
 import { extractWhatsAppSendConfirmation } from "@/lib/whatsapp/pendingSend";
 import { extractTelegramSendConfirmation } from "@/lib/telegram/pendingSend";
+import {
+  isVisionImageFile,
+  prepareInlineImageFiles,
+  type InlineOrchestratorFile,
+} from "@/lib/orchestrator/inlineImages.client";
 
 export type AgentType =
   | "browser"
@@ -44,152 +49,6 @@ function summarizeNames(names: string[], limit = 6): string {
   const shown = clean.slice(0, limit);
   const extra = clean.length - shown.length;
   return extra > 0 ? `${shown.join(", ")} (+${extra} more)` : shown.join(", ");
-}
-
-type InlineOrchestratorFile = {
-  mediaType: string;
-  base64: string;
-  filename?: string | null;
-};
-
-type PreparedInlineOrchestratorFile = InlineOrchestratorFile & {
-  byteSize: number;
-};
-
-const VISION_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-const VISION_IMAGE_EXTENSIONS: Record<string, string> = {
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  png: "image/png",
-  webp: "image/webp",
-  gif: "image/gif",
-};
-const MAX_INLINE_IMAGE_FILES = 3;
-const MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024;
-const MAX_INLINE_IMAGE_TOTAL_BYTES = 2 * 1024 * 1024;
-const MAX_INLINE_IMAGE_DIMENSION = 1600;
-const INLINE_IMAGE_JPEG_QUALITIES = [0.86, 0.78, 0.68, 0.58, 0.48];
-
-function getVisionImageMediaType(file: File): string | null {
-  if (VISION_IMAGE_TYPES.has(file.type)) return file.type;
-  const ext = file.name.toLowerCase().split(".").pop() || "";
-  return VISION_IMAGE_EXTENSIONS[ext] || null;
-}
-
-function isVisionImageFile(file: File): boolean {
-  return !!getVisionImageMediaType(file);
-}
-
-function readBlobAsBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Failed to read image"));
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      const commaIndex = result.indexOf(",");
-      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
-    };
-    reader.readAsDataURL(blob);
-  });
-}
-
-function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error("Could not prepare image"))),
-      type,
-      quality
-    );
-  });
-}
-
-async function loadDrawableImage(file: File): Promise<{
-  source: CanvasImageSource;
-  width: number;
-  height: number;
-  close: () => void;
-}> {
-  if (typeof createImageBitmap === "function") {
-    try {
-      const bitmap = await createImageBitmap(file);
-      return {
-        source: bitmap,
-        width: bitmap.width,
-        height: bitmap.height,
-        close: () => bitmap.close(),
-      };
-    } catch {
-      // Fall back to an HTMLImageElement below.
-    }
-  }
-
-  const objectUrl = URL.createObjectURL(file);
-  try {
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("Could not load image"));
-      img.src = objectUrl;
-    });
-    return {
-      source: image,
-      width: image.naturalWidth || image.width,
-      height: image.naturalHeight || image.height,
-      close: () => URL.revokeObjectURL(objectUrl),
-    };
-  } catch (error) {
-    URL.revokeObjectURL(objectUrl);
-    throw error;
-  }
-}
-
-async function prepareVisionImageFile(file: File): Promise<PreparedInlineOrchestratorFile> {
-  const originalMediaType = getVisionImageMediaType(file) || "image/png";
-  if (file.size <= MAX_INLINE_IMAGE_BYTES) {
-    return {
-      mediaType: originalMediaType,
-      base64: await readBlobAsBase64(file),
-      filename: file.name || null,
-      byteSize: file.size,
-    };
-  }
-
-  const drawable = await loadDrawableImage(file);
-  try {
-    const longestSide = Math.max(drawable.width, drawable.height);
-    let scale = Math.min(1, MAX_INLINE_IMAGE_DIMENSION / Math.max(1, longestSide));
-
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const width = Math.max(1, Math.round(drawable.width * scale));
-      const height = Math.max(1, Math.round(drawable.height * scale));
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Could not prepare image");
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, width, height);
-      ctx.drawImage(drawable.source, 0, 0, width, height);
-
-      for (const quality of INLINE_IMAGE_JPEG_QUALITIES) {
-        const blob = await canvasToBlob(canvas, "image/jpeg", quality);
-        if (blob.size <= MAX_INLINE_IMAGE_BYTES) {
-          return {
-            mediaType: "image/jpeg",
-            base64: await readBlobAsBase64(blob),
-            filename: file.name || null,
-            byteSize: blob.size,
-          };
-        }
-      }
-
-      scale *= 0.72;
-    }
-  } finally {
-    drawable.close();
-  }
-
-  throw new Error(`${file.name || "Image"} is too large to attach. Try a smaller image or screenshot.`);
 }
 
 function buildLlmHistoryContent(
@@ -871,12 +730,49 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
       const userId = data?.user?.id;
       if (!userId) return;
 
-      const { data: membership } = await supabase
+      let { data: preferences, error: preferencesError } = await supabase
+        .from("user_preferences")
+        .select("active_workspace_id,onboarding_data")
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (
+        preferencesError &&
+        (preferencesError.code === "PGRST204" ||
+          preferencesError.message.includes("active_workspace_id"))
+      ) {
+        const fallback = await supabase
+          .from("user_preferences")
+          .select("onboarding_data")
+          .eq("user_id", userId)
+          .maybeSingle();
+        preferences = fallback.data as typeof preferences;
+        preferencesError = fallback.error;
+      }
+      if (preferencesError) return;
+      const onboardingData =
+        preferences?.onboarding_data &&
+        typeof preferences.onboarding_data === "object" &&
+        !Array.isArray(preferences.onboarding_data)
+          ? (preferences.onboarding_data as Record<string, unknown>)
+          : null;
+      const activeWorkspaceId =
+        typeof preferences?.active_workspace_id === "string"
+          ? preferences.active_workspace_id
+          : typeof onboardingData?.activeWorkspaceId === "string"
+            ? onboardingData.activeWorkspaceId
+            : null;
+      const membershipQuery = supabase
         .from("workspace_members")
         .select("workspace_id")
-        .eq("user_id", userId)
-        .limit(1)
-        .maybeSingle();
+        .eq("user_id", userId);
+      const { data: membership } = activeWorkspaceId
+        ? await membershipQuery
+            .eq("workspace_id", activeWorkspaceId)
+            .maybeSingle()
+        : await membershipQuery
+            .order("created_at", { ascending: true })
+            .limit(1)
+            .maybeSingle();
 
       const workspaceId = membership?.workspace_id ? String(membership.workspace_id) : null;
       if (!workspaceId) return;
@@ -1433,17 +1329,10 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
 
       try {
         throwIfRunCancelled();
-        if (inlineImageFiles.length > MAX_INLINE_IMAGE_FILES) {
-          throw new Error(`Attach up to ${MAX_INLINE_IMAGE_FILES} images at a time.`);
-        }
-        const preparedInlineFiles: PreparedInlineOrchestratorFile[] =
+        const preparedInlineFiles =
           inlineImageFiles.length > 0
-            ? await Promise.all(inlineImageFiles.map(prepareVisionImageFile))
+            ? await prepareInlineImageFiles(inlineImageFiles)
             : [];
-        const inlineImageBytes = preparedInlineFiles.reduce((sum, file) => sum + file.byteSize, 0);
-        if (inlineImageBytes > MAX_INLINE_IMAGE_TOTAL_BYTES) {
-          throw new Error("Keep attached images under 2 MB total after compression.");
-        }
         const inlineFilesForOrchestrator: InlineOrchestratorFile[] = preparedInlineFiles.map((file) => ({
           mediaType: file.mediaType,
           base64: file.base64,

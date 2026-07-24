@@ -214,14 +214,51 @@ export async function resolveHarnessProfile(
   }
   let effectiveWorkspaceId = opts.workspaceId || null;
   if (!effectiveWorkspaceId) {
-    const { data: membership, error: membershipError } = await supabase
+    let { data: preferences, error: preferencesError } = await supabase
+      .from("user_preferences")
+      .select("active_workspace_id,onboarding_data")
+      .eq("user_id", opts.userId)
+      .maybeSingle();
+    if (
+      preferencesError &&
+      (preferencesError.code === "PGRST204" ||
+        preferencesError.message.includes("active_workspace_id"))
+    ) {
+      const fallback = await supabase
+        .from("user_preferences")
+        .select("onboarding_data")
+        .eq("user_id", opts.userId)
+        .maybeSingle();
+      preferences = fallback.data;
+      preferencesError = fallback.error;
+    }
+    if (preferencesError) throw new Error(preferencesError.message);
+    const onboardingData =
+      preferences?.onboarding_data &&
+      typeof preferences.onboarding_data === "object" &&
+      !Array.isArray(preferences.onboarding_data)
+        ? (preferences.onboarding_data as Record<string, unknown>)
+        : null;
+    const preferredWorkspaceId =
+      typeof preferences?.active_workspace_id === "string"
+        ? preferences.active_workspace_id
+        : typeof onboardingData?.activeWorkspaceId === "string"
+          ? onboardingData.activeWorkspaceId
+          : null;
+    const membershipQuery = supabase
       .from("workspace_members")
       .select("workspace_id,role")
       .eq("user_id", opts.userId)
-      .in("role", ["admin", "member"])
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .in("role", ["admin", "member"]);
+    const { data: membership, error: membershipError } =
+      preferredWorkspaceId
+        ? await membershipQuery
+            .eq("workspace_id", preferredWorkspaceId)
+            .maybeSingle()
+        : await membershipQuery
+            .order("created_at", { ascending: true })
+            .limit(1)
+            .maybeSingle();
     if (membershipError) throw new Error(membershipError.message);
     effectiveWorkspaceId =
       typeof membership?.workspace_id === "string"

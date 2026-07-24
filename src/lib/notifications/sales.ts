@@ -1,3 +1,5 @@
+import { sendTransactionalEmail } from "@/lib/email/resend";
+
 export type EnterpriseLead = {
   name?: string;
   email?: string;
@@ -58,51 +60,15 @@ async function sendWebhook(text: string): Promise<boolean> {
 }
 
 async function sendResendEmail(subject: string, text: string): Promise<boolean> {
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey?.trim()) return false;
-  const from = process.env.ENTERPRISE_SALES_FROM || "Groovy Sales <sales@gogroovy.ai>";
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey.trim()}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from,
-      to: [enterpriseSalesEmail()],
-      subject,
-      text,
-    }),
+  const result = await sendTransactionalEmail({
+    from:
+      process.env.ENTERPRISE_SALES_FROM ||
+      "Groovy Sales <sales@hi.gogroovy.ai>",
+    to: enterpriseSalesEmail(),
+    subject,
+    text,
   });
-  return res.ok;
-}
-
-async function sendSendGridEmail(subject: string, text: string): Promise<boolean> {
-  const apiKey = process.env.SENDGRID_API_KEY;
-  const fromEmail = process.env.ENTERPRISE_SALES_FROM_EMAIL || process.env.SENDGRID_FROM_EMAIL;
-  if (!apiKey?.trim() || !fromEmail?.trim()) return false;
-  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey.trim()}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: enterpriseSalesEmail() }] }],
-      from: {
-        email: fromEmail.trim(),
-        name: process.env.ENTERPRISE_SALES_FROM_NAME || "Groovy Sales",
-      },
-      subject,
-      content: [{ type: "text/plain", value: text }],
-    }),
-  });
-  return res.ok;
-}
-
-async function sendSalesEmail(subject: string, text: string): Promise<boolean> {
-  if (await sendResendEmail(subject, text).catch(() => false)) return true;
-  return sendSendGridEmail(subject, text).catch(() => false);
+  return result.ok;
 }
 
 export async function notifyEnterpriseSalesLead(body: EnterpriseLead): Promise<{
@@ -111,7 +77,7 @@ export async function notifyEnterpriseSalesLead(body: EnterpriseLead): Promise<{
 }> {
   const text = renderEnterpriseLeadText(body);
   const [emailSent, webhookSent] = await Promise.all([
-    sendSalesEmail("New Groovy Enterprise lead", text),
+    sendResendEmail("New Groovy Enterprise lead", text).catch(() => false),
     sendWebhook(text).catch(() => false),
   ]);
   return { emailSent, webhookSent };

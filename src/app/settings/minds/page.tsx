@@ -1,1 +1,5 @@
-export { default } from "@/app/dashboard/minds/page";
+import { MindsManager } from "@/app/dashboard/minds/page";
+
+export default function SettingsMindsPage() {
+  return <MindsManager embedded />;
+}

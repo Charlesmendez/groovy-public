@@ -1,8 +1,10 @@
 "use client";
 
 import { useCallback, useState } from "react";
+import { usePathname } from "next/navigation";
 import { AlertTriangle, ArrowRight, Clock3, CreditCard, Loader2, Sparkles } from "lucide-react";
 import type { LicenseAccessStatus } from "@/hooks/useLicenseAccess";
+import { WorkspaceSwitcher } from "@/components/workspaces/WorkspaceSwitcher";
 
 function formatDate(value?: string | null) {
   if (!value) return "";
@@ -29,6 +31,7 @@ export function LicenseAccessGate({
 }) {
   const [busy, setBusy] = useState<"trial" | "checkout" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const pathname = usePathname();
 
   const startCheckout = useCallback(async () => {
     setBusy("checkout");
@@ -85,6 +88,7 @@ export function LicenseAccessGate({
   }
 
   const canStartTrial = status?.accessStatus === "trial_available";
+  const workspaceOwnerRequired = status.workspaceOwnerRequired === true;
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-[#07080b]/95 p-4 backdrop-blur-xl">
       <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-zinc-900 p-7 text-center shadow-2xl shadow-black/60">
@@ -98,10 +102,16 @@ export function LicenseAccessGate({
           {canStartTrial ? <Sparkles className="h-7 w-7" /> : <AlertTriangle className="h-7 w-7" />}
         </div>
         <h2 className="mt-5 text-2xl font-semibold text-white">
-          {canStartTrial ? "Try Groovy free for 5 days" : "Your free trial has ended"}
+          {workspaceOwnerRequired
+            ? `${status.workspaceName || "This workspace"} needs access`
+            : canStartTrial
+              ? "Try Groovy free for 5 days"
+              : "Your free trial has ended"}
         </h2>
         <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-zinc-400">
-          {canStartTrial
+          {workspaceOwnerRequired
+            ? "You do not need to purchase Groovy to participate here. Ask a workspace admin to activate the workspace, or switch to your own workspace to start a personal trial."
+            : canStartTrial
             ? "No credit card required. Your five days begin when you start the trial, with full access to agents, plans, Skills & Docs, and channels."
             : "Purchase a license to resume your orchestrator, worker agents, schedules, and channels. Your agents, configuration, plans, and history are still safe."}
         </p>
@@ -124,26 +134,40 @@ export function LicenseAccessGate({
               {busy === "trial" ? "Starting trial…" : "Start free trial"}
             </button>
           )}
-          <button
-            type="button"
-            onClick={() => void startCheckout()}
-            disabled={busy !== null}
-            className={`inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold disabled:opacity-60 ${
-              canStartTrial
-                ? "border border-white/10 text-zinc-200 hover:bg-white/5"
-                : "bg-cyan-400 text-zinc-950 hover:bg-cyan-300"
-            }`}
-          >
-            {busy === "checkout" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
-            Buy Groovy Personal · $49.99/year
-            <ArrowRight className="h-4 w-4" />
-          </button>
+          {!workspaceOwnerRequired ? (
+            <button
+              type="button"
+              onClick={() => void startCheckout()}
+              disabled={busy !== null}
+              className={`inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold disabled:opacity-60 ${
+                canStartTrial
+                  ? "border border-white/10 text-zinc-200 hover:bg-white/5"
+                  : "bg-cyan-400 text-zinc-950 hover:bg-cyan-300"
+              }`}
+            >
+              {busy === "checkout" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
+              Buy Groovy Personal · $49.99/year
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          ) : null}
           <a
             href="/enterprise"
             className="inline-flex w-full items-center justify-center rounded-xl px-4 py-2 text-xs text-zinc-500 hover:text-zinc-300"
           >
             Using Groovy for a company? Contact Enterprise Sales
           </a>
+          <div className="pt-2">
+            <p className="mb-2 text-[11px] text-zinc-500">
+              Already belong to another workspace?
+            </p>
+            <div className="mx-auto max-w-xs rounded-xl border border-white/10 bg-black/20 p-1.5 text-left">
+              <WorkspaceSwitcher
+                fallbackName={status.workspaceName || "Switch workspace"}
+                switchDestination={pathname}
+                showPendingGate={false}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>

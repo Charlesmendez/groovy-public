@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { redirect } from "next/navigation";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export default async function UsageLayout({
@@ -19,17 +20,13 @@ export default async function UsageLayout({
   }
 
   const admin = createSupabaseAdminClient();
-  const { data: membership, error: membershipErr } = await admin
-    .from("workspace_members")
-    .select("role")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
-
-  if (membershipErr || !membership || membership.role !== "admin") {
+  const membership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin,
+  });
+  if (!membership || membership.role !== "admin") {
     redirect("/dashboard");
   }
 
   return <>{children}</>;
 }
-

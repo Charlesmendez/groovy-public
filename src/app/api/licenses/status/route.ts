@@ -1,11 +1,18 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { getWorkspaceMembershipsForUser, type MembershipRow } from "@/lib/billing/state";
+import {
+  getWorkspaceMembershipForUser,
+  getWorkspaceMembershipsForUser,
+  type MembershipRow,
+} from "@/lib/billing/state";
 import { signLicensePayload } from "@/lib/licensing/server";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
 import type { GroovyLicensePayload, GroovySignedEnvelope } from "@/lib/licensing/types";
-import { FREE_TRIAL_DAYS, getFreeTrialStatus } from "@/lib/licensing/access";
+import {
+  FREE_TRIAL_DAYS,
+  getProductAccessForUser,
+} from "@/lib/licensing/access";
 import { isSelfHosted } from "@/lib/config/edition";
 
 export const runtime = "nodejs";
@@ -148,14 +155,21 @@ export async function GET() {
         durationDays: FREE_TRIAL_DAYS,
       },
       requiresPurchase: false,
+      sponsored: false,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: false,
     });
   }
 
   const admin = createSupabaseAdminClient();
   const memberships = await getWorkspaceMembershipsForUser({ userId: user.id, admin });
+  const activeMembership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin,
+  });
   const workspaceIds = memberships.map((membership) => membership.workspace_id).filter(Boolean);
   const membershipByWorkspace = new Map(memberships.map((membership) => [membership.workspace_id, membership]));
-  const workspaceId = workspaceIds[0] || null;
+  const workspaceId = activeMembership?.workspace_id || null;
 
   const workspaceNameById = new Map<string, string>();
   if (workspaceIds.length > 0) {
@@ -230,62 +244,87 @@ export async function GET() {
   }
 
   const activePrimary =
-    entitlements.find((entry) => entry.scope === "workspace" && entitlementIsActive(entry)) ||
+    entitlements.find(
+      (entry) =>
+        entry.scope === "workspace" &&
+        entry.workspaceId === workspaceId &&
+        entitlementIsActive(entry),
+    ) ||
     entitlements.find((entry) => entry.scope === "personal" && entitlementIsActive(entry)) ||
     null;
-  const trial = activePrimary
-    ? {
-        status: "not_started" as const,
-        eligible: false,
-        startedAt: null,
-        endsAt: null,
-        remainingMs: 0,
-        daysRemaining: 0,
-      }
-    : await getFreeTrialStatus({
-        userId: user.id,
-        admin,
-        eligible: (personalRows || []).length === 0,
-      });
+  const productAccess = await getProductAccessForUser({
+    userId: user.id,
+    admin,
+  });
+  const trial = productAccess.trial;
+  const activeWorkspaceName = workspaceId
+    ? workspaceNameById.get(workspaceId) || null
+    : null;
 
-  if (!activePrimary) {
-    const accessStatus =
-      trial.status === "active"
-        ? "trial"
-        : trial.status === "not_started" && trial.eligible
-          ? "trial_available"
-          : "expired";
-    const fallback = entitlements[0] || null;
+  if (!productAccess.hasAccess) {
+    const fallback =
+      entitlements.find((entry) => entry.workspaceId === workspaceId) ||
+      entitlements.find((entry) => entry.scope === "personal") ||
+      null;
     return NextResponse.json({
       licensed: false,
-      hasAccess: trial.status === "active",
-      accessStatus,
-      status: accessStatus,
+      hasAccess: false,
+      accessStatus: productAccess.accessStatus,
+      status: productAccess.accessStatus,
       workspaceId: fallback?.workspaceId || workspaceId,
+      workspaceName: activeWorkspaceName,
       license: fallback?.license || null,
       licenseKey: fallback?.licenseKey || null,
       devices: fallback?.devices || [],
       canManageLicense: fallback?.canManageLicense || false,
       licenses: entitlements,
       trial: { ...trial, durationDays: FREE_TRIAL_DAYS },
-      requiresPurchase: accessStatus === "expired",
+      requiresPurchase:
+        productAccess.accessStatus === "expired" &&
+        !productAccess.workspaceOwnerRequired,
+      sponsored: false,
+      workspaceOwnerRequired: productAccess.workspaceOwnerRequired,
+      joinedWorkspace: productAccess.joinedWorkspace,
     });
   }
 
-  const primary = activePrimary;
+  if (productAccess.accessStatus === "trial") {
+    return NextResponse.json({
+      licensed: false,
+      hasAccess: true,
+      accessStatus: "trial",
+      status: "trial",
+      workspaceId,
+      workspaceName: activeWorkspaceName,
+      license: activePrimary?.license || null,
+      licenseKey: activePrimary?.licenseKey || null,
+      devices: activePrimary?.devices || [],
+      canManageLicense: activePrimary?.canManageLicense || false,
+      licenses: entitlements,
+      trial: { ...trial, durationDays: FREE_TRIAL_DAYS },
+      requiresPurchase: false,
+      sponsored: false,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: productAccess.joinedWorkspace,
+    });
+  }
 
   return NextResponse.json({
     licensed: true,
     hasAccess: true,
     accessStatus: "licensed",
     status: "licensed",
-    workspaceId: primary.workspaceId || workspaceId,
-    license: primary.license,
-    licenseKey: primary.licenseKey,
-    devices: primary.devices,
-    canManageLicense: primary.canManageLicense,
+    workspaceId,
+    workspaceName: activeWorkspaceName,
+    license: activePrimary?.license || null,
+    licenseKey: activePrimary?.licenseKey || null,
+    devices: activePrimary?.devices || [],
+    canManageLicense: activePrimary?.canManageLicense || false,
     licenses: entitlements,
     trial: { ...trial, durationDays: FREE_TRIAL_DAYS },
     requiresPurchase: false,
+    sponsored: productAccess.sponsored,
+    workspaceOwnerRequired: false,
+    joinedWorkspace: productAccess.joinedWorkspace,
   });
 }

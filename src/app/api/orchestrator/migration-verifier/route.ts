@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 type CheckResult = {
@@ -43,6 +44,7 @@ export async function GET() {
   }
 
   const checks: CheckResult[] = [];
+  const admin = createSupabaseAdminClient();
 
   await runCheck(checks, "branch_controller_column", async () =>
     supabase.from("user_preferences").select("branch_controller").eq("user_id", user.id).limit(1)
@@ -114,6 +116,47 @@ export async function GET() {
       .from("orchestrator_external_threads")
       .select("thread_key,orchestrator_session_id,orchestrator_agent_id")
       .eq("user_id", user.id)
+      .limit(1)
+  );
+  await runCheck(checks, "chat_channel_orchestrator_instructions", async () =>
+    supabase
+      .from("chat_channels")
+      .select("id,orchestrator_instructions")
+      .limit(1)
+  );
+  await runCheck(checks, "web_push_subscriptions", async () =>
+    supabase
+      .from("web_push_subscriptions")
+      .select("id,user_id,endpoint,updated_at")
+      .eq("user_id", user.id)
+      .limit(1)
+  );
+  await runCheck(checks, "chat_notification_preferences", async () =>
+    supabase
+      .from("chat_notification_preferences")
+      .select("user_id,channel_id,mode,updated_at")
+      .eq("user_id", user.id)
+      .limit(1)
+  );
+  await runCheck(checks, "scheduled_jobs_chat_channel", async () =>
+    supabase
+      .from("scheduled_jobs")
+      .select("id,user_id,channel_id,updated_at")
+      .eq("user_id", user.id)
+      .limit(1)
+  );
+  await runCheck(checks, "chat_message_attachments", async () =>
+    admin
+      .from("chat_message_attachments")
+      .select("id,channel_id,message_id,mime_type,size_bytes,position")
+      .limit(1)
+  );
+  await runCheck(checks, "orchestrator_context_checkpoints", async () =>
+    admin
+      .from("orchestrator_context_checkpoints")
+      .select(
+        "id,session_id,scope_key,through_message_id,through_created_at,summary_version",
+      )
       .limit(1)
   );
 

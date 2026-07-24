@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,7 +49,9 @@ export async function POST(req: Request, { params }: Params) {
   const admin = createSupabaseAdminClient();
   const { data: channel } = await admin
     .from("chat_channels")
-    .select("workspace_id,workspaces!inner(billing_admin_user_id)")
+    .select(
+      "workspace_id,kind,profile_id,orchestrator_mode,workspaces!inner(billing_admin_user_id)",
+    )
     .eq("id", id)
     .maybeSingle();
   if (!channel) {
@@ -78,9 +84,55 @@ export async function POST(req: Request, { params }: Params) {
           { status: 403 },
         );
       }
+      if (channel.orchestrator_mode !== "off") {
+        const { data: profile, error: profileError } = channel.profile_id
+          ? await admin
+              .from("orchestrator_profiles")
+              .select(
+                "id,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+              )
+              .eq("id", channel.profile_id)
+              .eq("workspace_id", channel.workspace_id)
+              .maybeSingle()
+          : { data: null, error: null };
+        if (profileError) {
+          return NextResponse.json(
+            { error: profileError.message },
+            { status: 500 },
+          );
+        }
+        if (!isGuestSafeMind(profile)) {
+          return NextResponse.json(
+            {
+              error: `${GUEST_SAFE_MIND_REQUIREMENT} Configure the channel Mind before adding this guest.`,
+            },
+            { status: 409 },
+          );
+        }
+      }
     }
   }
   if (agentId) {
+    if (channel.kind === "channel") {
+      const { data: actorMembership, error: actorMembershipError } = await admin
+        .from("workspace_members")
+        .select("role")
+        .eq("workspace_id", channel.workspace_id)
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (actorMembershipError) {
+        return NextResponse.json(
+          { error: actorMembershipError.message },
+          { status: 500 },
+        );
+      }
+      if (actorMembership?.role !== "admin") {
+        return NextResponse.json(
+          { error: "Only workspace admins can add agents to channels" },
+          { status: 403 },
+        );
+      }
+    }
     const workspaceRelation = Array.isArray(channel.workspaces)
       ? channel.workspaces[0]
       : channel.workspaces;
@@ -146,32 +198,55 @@ export async function DELETE(req: Request, { params }: Params) {
     .eq("channel_id", id)
     .eq("id", memberId)
     .maybeSingle();
+  const channelRelation = Array.isArray(targetMember?.chat_channels)
+    ? targetMember.chat_channels[0]
+    : targetMember?.chat_channels;
+  const targetWorkspaceId =
+    channelRelation &&
+    typeof channelRelation === "object" &&
+    "workspace_id" in channelRelation
+      ? String(
+          (channelRelation as { workspace_id?: unknown }).workspace_id || "",
+        )
+      : "";
+  if (targetMember?.member_type === "agent") {
+    const { data: actorWorkspaceMember, error: actorWorkspaceMemberError } =
+      await admin
+        .from("workspace_members")
+        .select("role")
+        .eq("workspace_id", targetWorkspaceId)
+        .eq("user_id", user.id)
+        .maybeSingle();
+    if (actorWorkspaceMemberError) {
+      return NextResponse.json(
+        { error: actorWorkspaceMemberError.message },
+        { status: 500 },
+      );
+    }
+    if (actorWorkspaceMember?.role !== "admin") {
+      return NextResponse.json(
+        { error: "Only workspace admins can remove agents from channels" },
+        { status: 403 },
+      );
+    }
+  }
   if (
     targetMember?.member_type === "user" &&
     targetMember.user_id &&
     targetMember.user_id !== user.id
   ) {
-    const relation = Array.isArray(targetMember.chat_channels)
-      ? targetMember.chat_channels[0]
-      : targetMember.chat_channels;
-    const workspaceId =
-      relation &&
-      typeof relation === "object" &&
-      "workspace_id" in relation
-        ? String((relation as { workspace_id?: unknown }).workspace_id || "")
-        : "";
     const [{ data: targetWorkspaceMember }, { data: actorWorkspaceMember }] =
       await Promise.all([
         admin
           .from("workspace_members")
           .select("role")
-          .eq("workspace_id", workspaceId)
+          .eq("workspace_id", targetWorkspaceId)
           .eq("user_id", targetMember.user_id)
           .maybeSingle(),
         admin
           .from("workspace_members")
           .select("role")
-          .eq("workspace_id", workspaceId)
+          .eq("workspace_id", targetWorkspaceId)
           .eq("user_id", user.id)
           .maybeSingle(),
       ]);

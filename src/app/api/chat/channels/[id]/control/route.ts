@@ -12,6 +12,7 @@ import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { parseTeamChatControlRequest } from "@/lib/teamChat";
+import { sendTeamChatPush } from "@/lib/notifications/webPush";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -328,19 +329,19 @@ export async function POST(req: Request, { params }: Params) {
           baseUrl: new URL(req.url).origin,
         });
       }
-      await admin
+      const controlledAgentName =
+        (await publicAgentTasks(admin, [task]))[0]?.agentName || "the agent";
+      const controllerName = await displayName(admin, visible.user.id);
+      const controlMessage =
+        action === "redirect"
+          ? `${controllerName} redirected ${controlledAgentName}: ${direction!}`
+          : `${controllerName} stopped ${controlledAgentName}.`;
+      const { data: systemMessage, error: systemMessageError } = await admin
         .from("chat_messages")
         .insert({
           channel_id: id,
           author_type: "system",
-          content:
-            action === "redirect"
-              ? `${await displayName(admin, visible.user.id)} redirected ${(
-                  await publicAgentTasks(admin, [task])
-                )[0]?.agentName || "the agent"}: ${direction!}`
-              : `${await displayName(admin, visible.user.id)} stopped ${(
-                  await publicAgentTasks(admin, [task])
-                )[0]?.agentName || "the agent"}.`,
+          content: controlMessage,
           metadata: {
             kind: "work_control",
             action,
@@ -350,7 +351,28 @@ export async function POST(req: Request, { params }: Params) {
             controlled_by: visible.user.id,
           },
         })
-        .then(() => {});
+        .select("id")
+        .single();
+      if (systemMessageError || !systemMessage) {
+        throw new Error(
+          systemMessageError?.message || "Could not save the control update",
+        );
+      }
+      await sendTeamChatPush({
+        admin,
+        channelId: id,
+        messageId: String(systemMessage.id),
+        authorType: "system",
+        authorUserId: visible.user.id,
+        authorLabel: "System",
+        content: controlMessage,
+      }).catch((cause) => {
+        console.warn("[team-chat] agent control push delivery failed", {
+          channelId: id,
+          error:
+            cause instanceof Error ? cause.message : "Unknown push error",
+        });
+      });
       return NextResponse.json({
         ok: true,
         action,

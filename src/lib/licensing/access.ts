@@ -3,7 +3,6 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import {
   getWorkspaceMembershipForUser,
-  getWorkspaceMembershipsForUser,
 } from "@/lib/billing/state";
 import { isSelfHosted } from "@/lib/config/edition";
 
@@ -24,13 +23,18 @@ export type ProductAccess = {
   accessStatus: "licensed" | "trial" | "trial_available" | "expired";
   licensed: boolean;
   trial: FreeTrialStatus;
+  workspaceId: string | null;
+  sponsored: boolean;
+  sponsorUserId: string | null;
+  workspaceOwnerRequired: boolean;
+  joinedWorkspace: boolean;
 };
 
 export type CurrentLicenseAccess = {
   user: User;
   admin: ReturnType<typeof createSupabaseAdminClient>;
   workspaceId: string | null;
-  membershipRole: "admin" | "member" | null;
+  membershipRole: "admin" | "member" | "guest" | null;
   license: Record<string, unknown> | null;
   canManageLicense: boolean;
 };
@@ -135,6 +139,11 @@ export async function startFreeTrial(args: {
   if (existing.status !== "not_started") return existing;
 
   const currentAccess = await getProductAccessForUser({ userId: args.userId, admin });
+  if (currentAccess.joinedWorkspace) {
+    throw new Error(
+      "Switch to your own workspace before starting a personal Groovy trial.",
+    );
+  }
   if (currentAccess.licensed) {
     throw new Error("This account already has access through an active Groovy license.");
   }
@@ -165,6 +174,7 @@ export async function startFreeTrial(args: {
 
 export async function getProductAccessForUser(args: {
   userId: string;
+  workspaceId?: string | null;
   admin?: ReturnType<typeof createSupabaseAdminClient>;
 }): Promise<ProductAccess> {
   if (isSelfHosted()) {
@@ -173,47 +183,184 @@ export async function getProductAccessForUser(args: {
       accessStatus: "licensed",
       licensed: true,
       trial: trialStatusFromRow(null, false),
+      workspaceId: null,
+      sponsored: false,
+      sponsorUserId: null,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: false,
     };
   }
   const admin = args.admin || createSupabaseAdminClient();
-  const memberships = await getWorkspaceMembershipsForUser({ userId: args.userId, admin });
-  const workspaceIds = memberships.map((membership) => membership.workspace_id).filter(Boolean);
-  const [personalResult, workspaceResult] = await Promise.all([
-    admin.from("licenses").select("status,valid_until,license_type").eq("user_id", args.userId),
-    workspaceIds.length > 0
+  const requestedWorkspaceId =
+    typeof args.workspaceId === "string" && args.workspaceId.trim()
+      ? args.workspaceId.trim()
+      : null;
+  let membership;
+  if (requestedWorkspaceId) {
+    const { data, error } = await admin
+      .from("workspace_members")
+      .select("workspace_id,role")
+      .eq("user_id", args.userId)
+      .eq("workspace_id", requestedWorkspaceId)
+      .maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) {
+      throw new Error("Workspace membership not found");
+    }
+    membership = data;
+  } else {
+    membership = await getWorkspaceMembershipForUser({
+      userId: args.userId,
+      admin,
+    });
+  }
+  const workspaceId = membership?.workspace_id || null;
+  const { data: workspace, error: workspaceLookupError } = workspaceId
+    ? await admin
+        .from("workspaces")
+        .select("billing_admin_user_id")
+        .eq("id", workspaceId)
+        .maybeSingle()
+    : { data: null, error: null };
+  if (workspaceLookupError) throw new Error(workspaceLookupError.message);
+  const workspaceOwnerId =
+    typeof workspace?.billing_admin_user_id === "string"
+      ? workspace.billing_admin_user_id
+      : null;
+  const isJoinedWorkspace =
+    !!workspaceOwnerId && workspaceOwnerId !== args.userId;
+
+  const [personalResult, workspaceResult, ownerPersonalResult] = await Promise.all([
+    admin
+      .from("licenses")
+      .select("status,valid_until,license_type")
+      .eq("user_id", args.userId)
+      .eq("license_type", "personal"),
+    workspaceId
       ? admin
           .from("licenses")
           .select("status,valid_until,license_type")
-          .in("workspace_id", workspaceIds)
+          .eq("workspace_id", workspaceId)
+      : Promise.resolve({ data: [], error: null }),
+    isJoinedWorkspace
+      ? admin
+          .from("licenses")
+          .select("status,valid_until,license_type")
+          .eq("user_id", workspaceOwnerId)
+          .eq("license_type", "personal")
       : Promise.resolve({ data: [], error: null }),
   ]);
   if (personalResult.error) throw new Error(personalResult.error.message);
   if (workspaceResult.error) throw new Error(workspaceResult.error.message);
-  const licenses = [
-    ...((personalResult.data || []) as Array<Record<string, unknown>>),
-    ...((workspaceResult.data || []) as Array<Record<string, unknown>>),
-  ];
-  const licensed = licenses.some((license) => isActiveLicense(license));
-  if (licensed) {
+  if (ownerPersonalResult.error) throw new Error(ownerPersonalResult.error.message);
+
+  const workspaceLicensed = (
+    (workspaceResult.data || []) as Array<Record<string, unknown>>
+  ).some((license) => isActiveLicense(license));
+  const ownerPersonallyLicensed = (
+    (ownerPersonalResult.data || []) as Array<Record<string, unknown>>
+  ).some((license) => isActiveLicense(license));
+  const personallyLicensed = (
+    (personalResult.data || []) as Array<Record<string, unknown>>
+  ).some((license) => isActiveLicense(license));
+
+  if (workspaceLicensed || ownerPersonallyLicensed) {
     return {
       hasAccess: true,
       accessStatus: "licensed",
       licensed: true,
       trial: trialStatusFromRow(null, false),
+      workspaceId,
+      sponsored: isJoinedWorkspace,
+      sponsorUserId: isJoinedWorkspace ? workspaceOwnerId : null,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: isJoinedWorkspace,
     };
   }
+
+  if (isJoinedWorkspace && workspaceOwnerId) {
+    const ownerTrial = await getFreeTrialStatus({
+      userId: workspaceOwnerId,
+      admin,
+      eligible: false,
+    });
+    if (ownerTrial.status === "active") {
+      return {
+        hasAccess: true,
+        accessStatus: "licensed",
+        licensed: true,
+        trial: trialStatusFromRow(null, false),
+        workspaceId,
+        sponsored: true,
+        sponsorUserId: workspaceOwnerId,
+        workspaceOwnerRequired: false,
+        joinedWorkspace: true,
+      };
+    }
+  }
+
+  if (personallyLicensed) {
+    return {
+      hasAccess: true,
+      accessStatus: "licensed",
+      licensed: true,
+      trial: trialStatusFromRow(null, false),
+      workspaceId,
+      sponsored: false,
+      sponsorUserId: null,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: isJoinedWorkspace,
+    };
+  }
+
   const trial = await getFreeTrialStatus({
     userId: args.userId,
     admin,
-    eligible: !licensed && personalResult.data?.length === 0,
+    // A member should never be prompted to start a personal trial merely to
+    // enter somebody else's workspace. They can switch to their own workspace
+    // when they want to start personal access.
+    eligible:
+      !isJoinedWorkspace &&
+      !personallyLicensed &&
+      personalResult.data?.length === 0,
   });
   if (trial.status === "active") {
-    return { hasAccess: true, accessStatus: "trial", licensed: false, trial };
+    return {
+      hasAccess: true,
+      accessStatus: "trial",
+      licensed: false,
+      trial,
+      workspaceId,
+      sponsored: false,
+      sponsorUserId: null,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: isJoinedWorkspace,
+    };
   }
   if (trial.status === "not_started" && trial.eligible) {
-    return { hasAccess: false, accessStatus: "trial_available", licensed: false, trial };
+    return {
+      hasAccess: false,
+      accessStatus: "trial_available",
+      licensed: false,
+      trial,
+      workspaceId,
+      sponsored: false,
+      sponsorUserId: null,
+      workspaceOwnerRequired: false,
+      joinedWorkspace: false,
+    };
   }
-  return { hasAccess: false, accessStatus: "expired", licensed: false, trial };
+  return {
+    hasAccess: false,
+    accessStatus: "expired",
+    licensed: false,
+    trial,
+    workspaceId,
+    sponsored: false,
+    sponsorUserId: null,
+    workspaceOwnerRequired: isJoinedWorkspace,
+    joinedWorkspace: isJoinedWorkspace,
+  };
 }
 
 export function hasResellerBillingLicense(license: Record<string, unknown> | null): boolean {

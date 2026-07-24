@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { SettingsShell } from "@/components/settings/SettingsShell";
-import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 
 export default async function SettingsLayout({
   children,
@@ -14,14 +14,8 @@ export default async function SettingsLayout({
   } = await supabase.auth.getUser();
   if (!user) redirect("/login?next=/settings");
 
-  const admin = createSupabaseAdminClient();
-  const { data: membership } = await admin
-    .from("workspace_members")
-    .select("role")
-    .eq("user_id", user.id)
-    .limit(1)
-    .maybeSingle();
-  if (membership?.role === "guest") redirect("/chat");
+  const workspace = await getOrCreateWorkspaceForUser();
+  if (workspace.role === "guest") redirect("/chat");
 
   return <SettingsShell>{children}</SettingsShell>;
 }

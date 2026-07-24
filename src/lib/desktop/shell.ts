@@ -35,6 +35,24 @@ export type DesktopUpdateStatus = {
   error?: string | null;
 };
 
+export type DesktopUiUpdateStatus = {
+  state: "idle" | "ready" | "reloading";
+  revision?: string | null;
+};
+
+export type DesktopNativeNotificationStatus = {
+  supported: boolean;
+  permission: NotificationPermission | "unsupported";
+};
+
+export type DesktopChatNotification = {
+  messageId: string;
+  channelId: string;
+  title: string;
+  body: string;
+  url: string;
+};
+
 export type DesktopSettings = {
   keepRunningInBackground: boolean;
   appUrl?: string;
@@ -50,6 +68,14 @@ export type GroovyDesktopApi = {
   getUpdateStatus: () => Promise<DesktopUpdateStatus>;
   onUpdateStatus: (cb: (status: DesktopUpdateStatus) => void) => () => void;
   quitAndInstall: () => Promise<void>;
+  getUiUpdateStatus: () => Promise<DesktopUiUpdateStatus>;
+  onUiUpdateStatus: (cb: (status: DesktopUiUpdateStatus) => void) => () => void;
+  reloadUi: () => Promise<void>;
+  getNativeNotificationStatus: () => Promise<DesktopNativeNotificationStatus>;
+  showChatNotification: (
+    payload: DesktopChatNotification
+  ) => Promise<{ shown: boolean; reason?: string }>;
+  onSystemResume: (cb: () => void) => () => void;
   getSettings: () => Promise<DesktopSettings>;
   setSetting: (
     key: keyof DesktopSettings,
@@ -83,6 +109,18 @@ const noopApi: GroovyDesktopApi = {
   getUpdateStatus: async () => ({ state: "idle" as const }),
   onUpdateStatus: () => () => {},
   quitAndInstall: async () => {},
+  getUiUpdateStatus: async () => ({ state: "idle" as const }),
+  onUiUpdateStatus: () => () => {},
+  reloadUi: async () => {},
+  getNativeNotificationStatus: async () => ({
+    supported: false,
+    permission: "unsupported" as const,
+  }),
+  showChatNotification: async () => ({
+    shown: false,
+    reason: "desktop_update_required",
+  }),
+  onSystemResume: () => () => {},
   getSettings: async () => ({ keepRunningInBackground: true }),
   setSetting: async () => {},
   openLogs: async () => {},
@@ -94,7 +132,19 @@ export function isDesktopShell(): boolean {
 
 /** Typed accessor; returns safe no-ops when not running inside the shell. */
 export function getDesktopApi(): GroovyDesktopApi {
-  if (typeof window !== "undefined" && window.groovyDesktop) return window.groovyDesktop;
+  if (typeof window !== "undefined" && window.groovyDesktop) {
+    // Hosted UI can deploy before a matching native Desktop release. Fill any
+    // newly added bridge methods with safe fallbacks so an older shell never
+    // crashes while it is waiting for its own updater.
+    return {
+      ...noopApi,
+      ...window.groovyDesktop,
+      versions: {
+        ...noopApi.versions,
+        ...(window.groovyDesktop.versions || {}),
+      },
+    };
+  }
   return noopApi;
 }
 

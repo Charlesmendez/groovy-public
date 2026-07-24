@@ -35,12 +35,12 @@ export function ChatMentionMenu({
       id="chat-mention-menu"
       className="absolute bottom-[calc(100%+0.5rem)] left-0 z-30 w-full max-w-md overflow-hidden rounded-xl border border-white/10 bg-[#101116] shadow-2xl"
       role="listbox"
-      aria-label="Add people or agents to this conversation"
+      aria-label="Mention channel participants"
       onMouseDown={(event) => event.preventDefault()}
     >
       <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
         <span className="text-[10px] font-medium uppercase tracking-widest text-zinc-500">
-          Add to conversation
+          Mention participants
         </span>
         <span className="text-[10px] text-zinc-600">
           ↑↓ navigate · Enter select
@@ -96,7 +96,7 @@ export function ChatMentionMenu({
         })}
         {options.length === 0 ? (
           <div className="px-3 py-5 text-center text-xs text-zinc-600">
-            No matching people or agents
+            No matching channel participants
           </div>
         ) : null}
       </div>

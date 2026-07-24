@@ -98,6 +98,38 @@ test("external allowlists permit files and source-scoped data but not unsafe too
   assert.ok(toolPolicyParameterDenialReason("data_query", { provider: "slack" }, context));
 });
 
+test("external Team Chat can use only its explicit channel agent roster", () => {
+  const teamChat = buildToolPolicyExecutionContext({
+    profile: {
+      ...DEFAULT_GROOVY_PROFILE,
+      id: "guest-mind",
+      authorizationStance: "restricted",
+      surface: "external",
+      agentRoster: ["mind-default"],
+    },
+    provider: "team_chat_guest",
+    allowedAgentIds: ["channel-agent"],
+    agentRosterMode: "replace",
+  });
+  assert.deepEqual(teamChat.agentRoster, ["channel-agent"]);
+  assert.equal(isToolAllowed("list_agents", teamChat), true);
+  assert.equal(isToolAllowed("assign_task", teamChat), true);
+  assert.equal(isToolAllowed("consult_agent", teamChat), true);
+
+  const publicApi = buildToolPolicyExecutionContext({
+    profile: {
+      ...DEFAULT_GROOVY_PROFILE,
+      id: "guest-mind",
+      authorizationStance: "restricted",
+      surface: "external",
+    },
+    provider: "api",
+    allowedAgentIds: ["channel-agent"],
+    agentRosterMode: "replace",
+  });
+  assert.equal(isToolAllowed("assign_task", publicApi), false);
+});
+
 test("API provider classification covers every connector capability family", () => {
   for (const toolName of [
     "terminal_exec",
@@ -135,6 +167,45 @@ test("agent rosters filter both discovery and delegation candidates", () => {
     ),
     [{ id: "b", name: "B" }],
   );
+});
+
+test("caller agent rosters narrow a Mind roster and can deny every agent", () => {
+  const narrowed = buildToolPolicyExecutionContext({
+    profile: {
+      ...DEFAULT_GROOVY_PROFILE,
+      agentRoster: ["profile-only", "shared"],
+    },
+    provider: "team_chat",
+    allowedAgentIds: ["shared", "channel-only", "shared"],
+  });
+  assert.deepEqual(narrowed.agentRoster, ["shared"]);
+
+  const unrestrictedMind = buildToolPolicyExecutionContext({
+    profile: DEFAULT_GROOVY_PROFILE,
+    provider: "team_chat",
+    allowedAgentIds: ["selected"],
+  });
+  assert.deepEqual(unrestrictedMind.agentRoster, ["selected"]);
+
+  const denyAll = buildToolPolicyExecutionContext({
+    profile: DEFAULT_GROOVY_PROFILE,
+    provider: "team_chat",
+    allowedAgentIds: [],
+  });
+  assert.deepEqual(denyAll.agentRoster, []);
+});
+
+test("an admin-managed channel roster can replace Mind defaults", () => {
+  const channelScoped = buildToolPolicyExecutionContext({
+    profile: {
+      ...DEFAULT_GROOVY_PROFILE,
+      agentRoster: ["mind-default"],
+    },
+    provider: "team_chat",
+    allowedAgentIds: ["channel-a", "channel-b", "channel-a"],
+    agentRosterMode: "replace",
+  });
+  assert.deepEqual(channelScoped.agentRoster, ["channel-a", "channel-b"]);
 });
 
 test("a caller can narrow profile memory to a per-thread namespace", () => {

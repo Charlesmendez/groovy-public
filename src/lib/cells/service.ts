@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { generateObject } from "ai";
 import { z } from "zod";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import { resolveChatModel, type ProviderId } from "@/lib/ai/modelResolver";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import { getOrCreateRuntimeSessionForAgent } from "@/lib/orchestrator/runtimeGraph";
@@ -348,27 +349,22 @@ async function requireWorkspaceContext(
   }
 
   const admin = createSupabaseAdminClient();
-  const { data: membership } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role, workspaces(name)")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
+  const membership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin,
+  });
+  const workspaceId = membership?.workspace_id || null;
+  const role = membership?.role === "admin" ? "admin" : "member";
 
-  const workspaceId =
-    typeof (membership as { workspace_id?: unknown } | null)?.workspace_id === "string"
-      ? String((membership as { workspace_id?: string }).workspace_id)
-      : null;
-  const role =
-    (membership as { role?: unknown } | null)?.role === "admin" ? "admin" : "member";
-  const workspaceNameRaw = (membership as { workspaces?: unknown } | null)?.workspaces;
-  const workspaceName = Array.isArray(workspaceNameRaw)
-    ? asString((workspaceNameRaw[0] as { name?: unknown } | undefined)?.name) || "Workspace"
-    : asString((workspaceNameRaw as { name?: unknown } | null)?.name) || "Workspace";
-
-  if (!workspaceId) {
+  if (!workspaceId || membership?.role === "guest") {
     throw new Error("Workspace not found");
   }
+  const { data: workspace } = await admin
+    .from("workspaces")
+    .select("name")
+    .eq("id", workspaceId)
+    .maybeSingle();
+  const workspaceName = asString(workspace?.name) || "Workspace";
   if (opts?.requireAdmin && role !== "admin") {
     throw new Error("Admin access required");
   }

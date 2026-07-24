@@ -13,6 +13,11 @@ import {
   X,
 } from "lucide-react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import { MAX_CHANNEL_ORCHESTRATOR_INSTRUCTIONS } from "@/lib/chat/channelConfig";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 export type ChannelCreateInput = {
   name: string;
@@ -20,6 +25,7 @@ export type ChannelCreateInput = {
   visibility: "workspace" | "private";
   profileId: string | null;
   orchestratorMode: "mention" | "always" | "off";
+  orchestratorInstructions: string | null;
   userIds: string[];
   agentIds: string[];
   skillArtifactIds: string[];
@@ -29,6 +35,11 @@ type ProfileOption = {
   id: string;
   name: string;
   is_default: boolean;
+  surface: string;
+  authorization_stance: string;
+  memory_scope: string;
+  inherit_workspace_skills: boolean;
+  inherit_workspace_integrations: boolean;
 };
 
 type AgentOption = {
@@ -72,20 +83,18 @@ function SelectionRow({
   onChange: () => void;
 }) {
   return (
-    <label
-      className={`flex cursor-pointer items-center gap-3 rounded-xl border px-3 py-2.5 transition-colors ${
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={onChange}
+      className={`flex w-full touch-manipulation items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors ${
         checked
           ? "border-cyan-400/35 bg-cyan-400/[0.07]"
           : "border-white/10 bg-black/20 hover:border-white/20"
       } ${disabled ? "cursor-not-allowed opacity-50" : ""}`}
     >
-      <input
-        type="checkbox"
-        className="sr-only"
-        checked={checked}
-        disabled={disabled}
-        onChange={onChange}
-      />
       <span
         className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
           checked
@@ -109,7 +118,7 @@ function SelectionRow({
       >
         {checked ? <Check className="h-3.5 w-3.5" /> : null}
       </span>
-    </label>
+    </button>
   );
 }
 
@@ -119,6 +128,7 @@ export function ChannelCreateModal({
   people,
   skills,
   currentUserId,
+  canAssignAgents,
   onClose,
   onCreate,
 }: {
@@ -127,6 +137,7 @@ export function ChannelCreateModal({
   people: PersonOption[];
   skills: ChannelSkillOption[];
   currentUserId: string;
+  canAssignAgents: boolean;
   onClose: () => void;
   onCreate: (input: ChannelCreateInput) => Promise<void>;
 }) {
@@ -142,6 +153,7 @@ export function ChannelCreateModal({
   const [orchestratorMode, setOrchestratorMode] = useState<
     "mention" | "always" | "off"
   >("mention");
+  const [orchestratorInstructions, setOrchestratorInstructions] = useState("");
   const [userIds, setUserIds] = useState<string[]>([]);
   const [agentIds, setAgentIds] = useState<string[]>([]);
   const [skillArtifactIds, setSkillArtifactIds] = useState<string[]>([]);
@@ -149,10 +161,47 @@ export function ChannelCreateModal({
   const [skillQuery, setSkillQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [viewportFrame, setViewportFrame] = useState<{
+    height: number;
+    top: number;
+  } | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    nameRef.current?.focus();
+    if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
+      nameRef.current?.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const body = document.body;
+    const previousRootOverflow = root.style.overflow;
+    const previousBodyOverflow = body.style.overflow;
+    root.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+
+    const viewport = window.visualViewport;
+    const syncViewport = () => {
+      setViewportFrame(
+        viewport
+          ? {
+              height: viewport.height,
+              top: viewport.offsetTop,
+            }
+          : null,
+      );
+    };
+    syncViewport();
+    viewport?.addEventListener("resize", syncViewport);
+    viewport?.addEventListener("scroll", syncViewport);
+
+    return () => {
+      root.style.overflow = previousRootOverflow;
+      body.style.overflow = previousBodyOverflow;
+      viewport?.removeEventListener("resize", syncViewport);
+      viewport?.removeEventListener("scroll", syncViewport);
+    };
   }, []);
 
   useEffect(() => {
@@ -175,13 +224,15 @@ export function ChannelCreateModal({
         .includes(normalizedParticipantQuery),
     ),
   );
-  const visibleAgents = agents.filter((agent) =>
-    [agent.name, agent.harness, agent.model].some((value) =>
-      String(value || "")
-        .toLowerCase()
-        .includes(normalizedParticipantQuery),
-    ),
-  );
+  const visibleAgents = canAssignAgents
+    ? agents.filter((agent) =>
+        [agent.name, agent.harness, agent.model].some((value) =>
+          String(value || "")
+            .toLowerCase()
+            .includes(normalizedParticipantQuery),
+        ),
+      )
+    : [];
   const normalizedSkillQuery = skillQuery.trim().toLowerCase();
   const visibleSkills = skills.filter((skill) =>
     [skill.name, skill.description, skill.relative_path, skill.artifact_type].some(
@@ -191,6 +242,11 @@ export function ChannelCreateModal({
   const selectedGuests = teammates.filter(
     (person) => person.role === "guest" && userIds.includes(person.user_id),
   );
+  const selectedProfile =
+    profiles.find((profile) => profile.id === profileId) || null;
+  const guestMindRequired =
+    selectedGuests.length > 0 && orchestratorMode !== "off";
+  const selectedProfileIsGuestSafe = isGuestSafeMind(selectedProfile);
 
   const toggle = (
     id: string,
@@ -216,6 +272,13 @@ export function ChannelCreateModal({
 
   const submit = async () => {
     if (!name.trim() || busy) return;
+    if (guestMindRequired && !selectedProfileIsGuestSafe) {
+      setStep(0);
+      setError(
+        `${GUEST_SAFE_MIND_REQUIREMENT} Choose a guest-ready Mind or set attention to Humans only.`,
+      );
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -225,6 +288,7 @@ export function ChannelCreateModal({
         visibility,
         profileId: profileId || null,
         orchestratorMode,
+        orchestratorInstructions: orchestratorInstructions.trim() || null,
         userIds,
         agentIds,
         skillArtifactIds:
@@ -241,7 +305,15 @@ export function ChannelCreateModal({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-end justify-center bg-black/75 backdrop-blur-sm sm:items-center sm:p-4"
+      className="fixed inset-x-0 top-0 z-[60] flex h-[100dvh] items-end justify-center overflow-hidden bg-black/75 backdrop-blur-sm sm:items-center sm:p-4"
+      style={
+        viewportFrame
+          ? {
+              height: viewportFrame.height,
+              top: viewportFrame.top,
+            }
+          : undefined
+      }
       onClick={() => {
         if (!busy) onClose();
       }}
@@ -250,10 +322,10 @@ export function ChannelCreateModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="create-channel-title"
-        className="animate-slide-up flex max-h-[94dvh] w-full flex-col overflow-hidden rounded-t-2xl border border-white/10 bg-[#0c0d11] shadow-2xl sm:animate-none sm:max-w-2xl sm:rounded-2xl"
+        className="animate-slide-up flex max-h-[calc(100%-0.5rem)] min-h-0 w-full max-w-full flex-col overflow-hidden overscroll-contain rounded-t-2xl border border-white/10 bg-[#0c0d11] shadow-2xl sm:animate-none sm:max-h-[92dvh] sm:max-w-2xl sm:rounded-2xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="border-b border-white/10 px-5 pb-4 pt-5 sm:px-6">
+        <div className="shrink-0 border-b border-white/10 px-5 pb-4 pt-5 sm:px-6">
           <div className="flex items-start justify-between gap-4">
             <div>
               <h2 id="create-channel-title" className="text-lg font-semibold">
@@ -305,7 +377,7 @@ export function ChannelCreateModal({
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 sm:px-6">
+        <div className="min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-5 py-5 [-webkit-overflow-scrolling:touch] sm:px-6">
           {step === 0 ? (
             <div className="space-y-5">
               <div>
@@ -415,10 +487,26 @@ export function ChannelCreateModal({
                     value={profileId}
                     onChange={setProfileId}
                     options={[
-                      { value: "", label: "Groovy default" },
+                      {
+                        value: "",
+                        label: "Groovy default",
+                        description: guestMindRequired
+                          ? "Unavailable while guests can talk to the Mind"
+                          : "Workspace default",
+                        disabled: guestMindRequired,
+                      },
                       ...profiles.map((profile) => ({
                         value: profile.id,
                         label: profile.name,
+                        description: isGuestSafeMind(profile)
+                          ? "Guest-ready · External · Restricted"
+                          : guestMindRequired
+                            ? "Internal Mind · not available with guests"
+                            : profile.is_default
+                              ? "Workspace default"
+                              : "Workspace Mind",
+                        disabled:
+                          guestMindRequired && !isGuestSafeMind(profile),
                       })),
                     ]}
                     ariaLabel="Channel Mind"
@@ -459,6 +547,47 @@ export function ChannelCreateModal({
                     disabled={busy}
                   />
                 </div>
+              </div>
+              {guestMindRequired && !selectedProfileIsGuestSafe ? (
+                <div className="rounded-xl border border-amber-400/25 bg-amber-400/[0.07] p-3 text-xs leading-relaxed text-amber-100">
+                  {GUEST_SAFE_MIND_REQUIREMENT} Choose a Mind labeled
+                  Guest-ready, or create/configure one in Settings → Minds. If
+                  this person is a trusted teammate who needs internal tools,
+                  invite them as a workspace Member instead.
+                </div>
+              ) : null}
+              <div>
+                <div className="flex items-end justify-between gap-3">
+                  <label
+                    htmlFor="channel-create-instructions"
+                    className="block text-[11px] font-medium uppercase tracking-widest text-zinc-500"
+                  >
+                    Channel instructions{" "}
+                    <span className="normal-case tracking-normal">
+                      (optional)
+                    </span>
+                  </label>
+                  <span className="text-[9px] tabular-nums text-zinc-600">
+                    {orchestratorInstructions.length.toLocaleString()} /{" "}
+                    {MAX_CHANNEL_ORCHESTRATOR_INSTRUCTIONS.toLocaleString()}
+                  </span>
+                </div>
+                <textarea
+                  id="channel-create-instructions"
+                  rows={4}
+                  maxLength={MAX_CHANNEL_ORCHESTRATOR_INSTRUCTIONS}
+                  value={orchestratorInstructions}
+                  onChange={(event) =>
+                    setOrchestratorInstructions(event.target.value)
+                  }
+                  placeholder="How should the Mind work in this channel? For example: begin with a short status, call out blockers, and ask before changing production."
+                  className="mt-2 w-full resize-y rounded-xl border border-white/10 bg-black/30 px-3 py-2.5 text-sm leading-relaxed outline-none placeholder:text-zinc-600 focus:border-cyan-400/40 focus:ring-2 focus:ring-cyan-400/10"
+                  disabled={busy}
+                />
+                <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-600">
+                  This operating brief shapes channel behavior but cannot grant
+                  tools or override the selected Mind’s permissions.
+                </p>
               </div>
             </div>
           ) : null}
@@ -519,25 +648,38 @@ export function ChannelCreateModal({
               <div className="mt-6 text-[10px] font-medium uppercase tracking-widest text-zinc-600">
                 Agents
               </div>
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                {visibleAgents.map((agent) => (
-                  <SelectionRow
-                    key={agent.id}
-                    checked={agentIds.includes(agent.id)}
-                    onChange={() => toggle(agent.id, setAgentIds)}
-                    icon={<Bot className="h-4 w-4" />}
-                    label={agent.name}
-                    meta={`${agent.harness}${agent.model ? ` · ${agent.model}` : ""}${
-                      agent.deviceOnline ? " · online" : " · offline"
-                    }`}
-                  />
-                ))}
-                {visibleAgents.length === 0 ? (
-                  <p className="rounded-xl border border-dashed border-white/10 px-3 py-5 text-center text-xs text-zinc-600 sm:col-span-2">
-                    No agents match this search.
-                  </p>
-                ) : null}
-              </div>
+              {selectedGuests.length > 0 && canAssignAgents ? (
+                <p className="mt-2 rounded-lg border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2 text-[11px] leading-relaxed text-amber-100/75">
+                  Guests are selected. Adding an agent authorizes it to act on
+                  guest messages and return its results in this channel.
+                </p>
+              ) : null}
+              {canAssignAgents ? (
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  {visibleAgents.map((agent) => (
+                    <SelectionRow
+                      key={agent.id}
+                      checked={agentIds.includes(agent.id)}
+                      onChange={() => toggle(agent.id, setAgentIds)}
+                      icon={<Bot className="h-4 w-4" />}
+                      label={agent.name}
+                      meta={`${agent.harness}${agent.model ? ` · ${agent.model}` : ""}${
+                        agent.deviceOnline ? " · online" : " · offline"
+                      }`}
+                    />
+                  ))}
+                  {visibleAgents.length === 0 ? (
+                    <p className="rounded-xl border border-dashed border-white/10 px-3 py-5 text-center text-xs text-zinc-600 sm:col-span-2">
+                      No agents match this search.
+                    </p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-2 rounded-xl border border-white/10 bg-white/[0.025] px-3 py-3 text-xs leading-relaxed text-zinc-500">
+                  Only workspace admins can assign agents to channels. An
+                  admin can add them later from the @ menu or Channel Settings.
+                </p>
+              )}
             </div>
           ) : null}
 
@@ -619,7 +761,7 @@ export function ChannelCreateModal({
           ) : null}
         </div>
 
-        <div className="flex items-center justify-between gap-3 border-t border-white/10 bg-black/20 px-5 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))] sm:px-6 sm:pb-4">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-black/20 px-5 py-4 pb-[calc(1rem+env(safe-area-inset-bottom))] sm:px-6 sm:pb-4">
           <button
             type="button"
             onClick={() => {

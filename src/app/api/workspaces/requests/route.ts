@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 type PostBody = {
   sessionId?: unknown;
@@ -134,13 +136,11 @@ export async function POST(req: Request) {
   }
 
   // Infer workspace_id (single-workspace model)
-  const { data: membership, error: memberErr } = await supabase
-    .from("workspace_members")
-    .select("workspace_id")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
-  if (memberErr || !membership?.workspace_id) {
+  const membership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin: createSupabaseAdminClient(),
+  });
+  if (!membership?.workspace_id) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }
   const workspaceId = String(membership.workspace_id);
@@ -401,4 +401,3 @@ export async function PATCH(req: Request) {
 
   return NextResponse.json({ error: "Unknown action" }, { status: 400 });
 }
-

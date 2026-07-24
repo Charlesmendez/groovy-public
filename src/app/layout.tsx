@@ -2,6 +2,8 @@ import type { Metadata, Viewport } from "next";
 import { Outfit, Orbitron, JetBrains_Mono } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
+import { DesktopChatNotificationBridge } from "@/components/desktop/DesktopChatNotificationBridge";
+import { DesktopUiUpdateBanner } from "@/components/desktop/DesktopUiUpdateBanner";
 import { getAppUrl, getBrandName } from "@/lib/config/appConfig";
 
 const outfit = Outfit({
@@ -33,6 +35,7 @@ const brandName = getBrandName();
 
 export const metadata: Metadata = {
   metadataBase: siteUrl,
+  manifest: "/manifest.webmanifest",
   title: `${brandName.toUpperCase()} | Command Center`,
   description: "AI Agent Command Center - Get into your groove",
   alternates: {
@@ -79,6 +82,8 @@ export default function RootLayout({
       <body className="antialiased">
         <div className="noise-overlay" />
         {children}
+        <DesktopChatNotificationBridge />
+        <DesktopUiUpdateBanner />
         {/* Datagran Web Pixel - Analytics */}
         <Script
           src="https://www.datagran.io/pixel.js"

@@ -31,6 +31,7 @@ export function PeopleInviteModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{
+    inviteId: string | null;
     email: string;
     inviteUrl: string | null;
     emailSent: boolean;
@@ -92,6 +93,8 @@ export function PeopleInviteModal({
         throw new Error(payload.error || "Could not create invitation");
       }
       setResult({
+        inviteId:
+          typeof payload.invite?.id === "string" ? payload.invite.id : null,
         email: normalizedEmail,
         inviteUrl:
           typeof payload.inviteUrl === "string" ? payload.inviteUrl : null,
@@ -104,6 +107,44 @@ export function PeopleInviteModal({
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : "Could not create invitation",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resendInvite = async () => {
+    if (!result?.inviteId || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/workspaces/invites", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inviteId: result.inviteId }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || "Could not resend invitation");
+      }
+      setResult((current) =>
+        current
+          ? {
+              ...current,
+              inviteUrl:
+                typeof payload.inviteUrl === "string"
+                  ? payload.inviteUrl
+                  : current.inviteUrl,
+              emailSent: true,
+              emailError: null,
+            }
+          : current,
+      );
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not resend invitation",
       );
     } finally {
       setBusy(false);
@@ -268,7 +309,13 @@ export function PeopleInviteModal({
           ) : null}
 
           {result ? (
-            <div className="mt-4 rounded-lg border border-emerald-400/30 bg-emerald-400/10 p-3 text-xs leading-relaxed text-emerald-100">
+            <div
+              className={`mt-4 rounded-lg border p-3 text-xs leading-relaxed ${
+                result.emailSent
+                  ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-100"
+                  : "border-amber-400/30 bg-amber-400/10 text-amber-100"
+              }`}
+            >
               <div>
                 {result.emailSent
                   ? `Invitation sent to ${result.email}.`
@@ -276,6 +323,16 @@ export function PeopleInviteModal({
               </div>
               {!result.emailSent && result.emailError ? (
                 <div className="mt-1 text-amber-200/80">{result.emailError}</div>
+              ) : null}
+              {!result.emailSent && result.inviteId ? (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void resendInvite()}
+                  className="mt-2 mr-4 font-medium text-cyan-200 underline disabled:opacity-40"
+                >
+                  {busy ? "Sending again…" : "Try sending email again"}
+                </button>
               ) : null}
               {result.inviteUrl ? (
                 <button

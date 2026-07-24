@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { sanitizeProfilePatch } from "@/lib/orchestrator/profileApi";
 
@@ -39,17 +40,113 @@ export async function PATCH(req: Request, { params }: Params) {
   const patch = sanitizeProfilePatch(body);
   const { data: existing } = await supabase
     .from("orchestrator_profiles")
-    .select("workspace_id,user_id,surface")
+    .select(
+      "workspace_id,user_id,surface,authorization_stance,memory_scope",
+    )
     .eq("id", id)
     .maybeSingle();
   if (!existing) {
     return NextResponse.json({ error: "Not found or not allowed" }, { status: 404 });
+  }
+  if (existing.workspace_id) {
+    const { data: membership, error: membershipError } = await supabase
+      .from("workspace_members")
+      .select("role")
+      .eq("workspace_id", existing.workspace_id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (membershipError) {
+      return NextResponse.json(
+        { error: membershipError.message },
+        { status: 500 },
+      );
+    }
+    if (membership?.role !== "admin") {
+      return NextResponse.json(
+        { error: "Only workspace admins can edit Minds." },
+        { status: 403 },
+      );
+    }
+  } else if (existing.user_id !== user.id) {
+    return NextResponse.json(
+      { error: "Not found or not allowed" },
+      { status: 404 },
+    );
   }
   if (existing.surface === "external" && patch.surface !== "internal") {
     patch.authorization_stance = "restricted";
     patch.memory_scope = "profile";
     patch.inherit_workspace_skills = false;
     patch.inherit_workspace_integrations = false;
+  }
+  if (existing.surface === "external" && patch.surface === "internal") {
+    const admin = createSupabaseAdminClient();
+    const { data: boundChannels, error: channelsError } = await admin
+      .from("chat_channels")
+      .select("id,name,workspace_id")
+      .eq("profile_id", id)
+      .neq("orchestrator_mode", "off")
+      .eq("is_archived", false);
+    if (channelsError) {
+      return NextResponse.json(
+        { error: channelsError.message },
+        { status: 500 },
+      );
+    }
+    const workspaceIds = Array.from(
+      new Set(
+        (boundChannels || []).map((channel) => String(channel.workspace_id)),
+      ),
+    );
+    const channelIds = (boundChannels || []).map((channel) =>
+      String(channel.id),
+    );
+    if (workspaceIds.length > 0 && channelIds.length > 0) {
+      const { data: guests, error: guestsError } = await admin
+        .from("workspace_members")
+        .select("user_id")
+        .in("workspace_id", workspaceIds)
+        .eq("role", "guest");
+      if (guestsError) {
+        return NextResponse.json(
+          { error: guestsError.message },
+          { status: 500 },
+        );
+      }
+      const guestIds = Array.from(
+        new Set((guests || []).map((guest) => String(guest.user_id))),
+      );
+      const { data: guestChannelMember, error: guestChannelError } =
+        guestIds.length > 0
+          ? await admin
+              .from("chat_channel_members")
+              .select("channel_id")
+              .in("channel_id", channelIds)
+              .eq("member_type", "user")
+              .in("user_id", guestIds)
+              .limit(1)
+              .maybeSingle()
+          : { data: null, error: null };
+      if (guestChannelError) {
+        return NextResponse.json(
+          { error: guestChannelError.message },
+          { status: 500 },
+        );
+      }
+      if (guestChannelMember) {
+        const channelName =
+          (boundChannels || []).find(
+            (channel) =>
+              String(channel.id) === String(guestChannelMember.channel_id),
+          )?.name || "a guest channel";
+        return NextResponse.json(
+          {
+            error: `This Mind is the guest-safe boundary for #${channelName}. Bind another guest-ready Mind or set that channel to Humans only before changing this audience to Internal team.`,
+          },
+          { status: 409 },
+        );
+      }
+    }
   }
   if (Object.keys(patch).length === 0) {
     return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });

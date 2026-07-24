@@ -4,6 +4,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { findUpreadyUserByEmail } from "@/lib/upready/client";
 import { getConfiguredAppUrl } from "@/lib/config/appConfig";
+import { sendTransactionalEmail } from "@/lib/email/resend";
 
 type LinkBody = {
   email?: unknown;
@@ -30,15 +31,6 @@ async function sendUpreadyLinkEmail(params: {
   toEmail: string;
   confirmUrl: string;
 }) {
-  const apiKey = (process.env.SENDGRID_API_KEY || "").trim();
-  const fromEmail = (process.env.SENDGRID_FROM_EMAIL || "").trim();
-  if (!apiKey || !fromEmail) {
-    return {
-      ok: false as const,
-      error: "SendGrid not configured (missing SENDGRID_API_KEY or SENDGRID_FROM_EMAIL)",
-    };
-  }
-
   const htmlEsc = (value: string) =>
     value
       .replaceAll("&", "&amp;")
@@ -55,31 +47,12 @@ async function sendUpreadyLinkEmail(params: {
   <p style="font-size:12px;color:#666;">This link expires in 15 minutes.</p>
 </div>`;
 
-  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: params.toEmail }], subject }],
-      from: { email: fromEmail, name: "Groovy" },
-      content: [
-        { type: "text/plain", value: text },
-        { type: "text/html", value: html },
-      ],
-    }),
+  return sendTransactionalEmail({
+    to: params.toEmail,
+    subject,
+    text,
+    html,
   });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    return {
-      ok: false as const,
-      error: `SendGrid error (${res.status}): ${errText || "unknown"}`,
-    };
-  }
-
-  return { ok: true as const };
 }
 
 export async function GET() {

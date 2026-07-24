@@ -266,7 +266,11 @@ function defaultInstructionContent(name: string, targets: Target[]) {
   ].join("\n");
 }
 
-export function SkillsManagerContent() {
+export function SkillsManagerContent({
+  embedded = false,
+}: {
+  embedded?: boolean;
+} = {}) {
   const relay = useRelay({ enabled: true });
 
   const [state, setState] = useState<SkillsState | null>(null);
@@ -654,18 +658,28 @@ export function SkillsManagerContent() {
     );
 
   return (
-    <div className="app-scroll-page bg-[#08090b] text-white">
-      <div className="sticky top-0 z-30 border-b border-white/10 bg-[#08090b]/90 backdrop-blur-xl">
+    <div
+      className={`bg-[#08090b] text-white ${
+        embedded ? "" : "app-scroll-page"
+      }`}
+    >
+      <div
+        className={`border-b border-white/10 bg-[#08090b]/90 backdrop-blur-xl ${
+          embedded ? "relative" : "sticky top-0 z-30"
+        }`}
+      >
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-4 sm:px-6">
           <div className="flex items-center gap-3">
-            <a
-              href="/dashboard"
-              className="rounded-lg p-2 text-zinc-400 transition hover:bg-white/5 hover:text-white"
-              title="Back to dashboard"
-              aria-label="Back to dashboard"
-            >
-              <ArrowLeft className="h-5 w-5" />
-            </a>
+            {!embedded ? (
+              <a
+                href="/dashboard"
+                className="rounded-lg p-2 text-zinc-400 transition hover:bg-white/5 hover:text-white"
+                title="Back to dashboard"
+                aria-label="Back to dashboard"
+              >
+                <ArrowLeft className="h-5 w-5" />
+              </a>
+            ) : null}
             <div>
               <div className="flex items-center gap-2">
                 <ShieldCheck className="h-5 w-5 text-emerald-300" />

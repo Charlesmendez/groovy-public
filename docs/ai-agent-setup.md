@@ -104,6 +104,14 @@ GROOVY_LICENSE_PUBLIC_KEY_PEM=...
 GROOVY_LICENSE_PRIVATE_KEY_PEM=...
 ```
 
+Optional browser/Home Screen notifications:
+
+```bash
+WEB_PUSH_VAPID_PUBLIC_KEY=...
+WEB_PUSH_VAPID_PRIVATE_KEY=...
+WEB_PUSH_CONTACT=mailto:notifications@example.com
+```
+
 Stripe values for Groovy Personal:
 
 ```bash

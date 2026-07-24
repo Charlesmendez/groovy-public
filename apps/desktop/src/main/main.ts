@@ -14,6 +14,7 @@ import { app, BrowserWindow } from "electron";
 import * as path from "path";
 import log from "electron-log/main";
 import { ConnectorManager, relayUrl } from "./connectorManager";
+import { HostedUiUpdater } from "./hostedUiUpdater";
 import { registerIpc } from "./ipc";
 import { installLaunchAgent, removeLaunchAgent } from "./launchAgent";
 import { getSettings } from "./settings";
@@ -38,6 +39,7 @@ if (!gotLock) {
   app.quit();
 } else {
   const connector = new ConnectorManager(connectorResourcesDir());
+  const hostedUiUpdater = new HostedUiUpdater();
   let mainWindow: BrowserWindow | null = null;
   let tray: GroovyTray | null = null;
   let quitting = false;
@@ -73,14 +75,14 @@ if (!gotLock) {
     await cleanup(true);
   });
 
-  const showWindow = () => {
+  const showWindow = (): BrowserWindow => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
-      return;
+      return mainWindow;
     }
-    mainWindow = createMainWindow();
+    mainWindow = createMainWindow(hostedUiUpdater);
     mainWindow.on("close", (event) => {
       // Closing the window keeps the app (and connector) alive in the tray.
       if (!quitting) {
@@ -91,6 +93,7 @@ if (!gotLock) {
     mainWindow.on("closed", () => {
       mainWindow = null;
     });
+    return mainWindow;
   };
 
   app.on("second-instance", () => showWindow());
@@ -101,7 +104,7 @@ if (!gotLock) {
   app.on("open-url", () => showWindow());
 
   app.whenReady().then(async () => {
-    registerIpc({ connector, updater });
+    registerIpc({ connector, updater, hostedUiUpdater, showWindow });
 
     // Take over any standalone connector install, then run it ourselves.
     await connector.adoptStandalone();

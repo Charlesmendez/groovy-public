@@ -6,12 +6,33 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { resolveHarnessProfile } from "@/lib/orchestrator/harnessProfiles";
 import { runOrchestratorRound } from "@/lib/orchestrator/runOrchestratorRound";
 import { filterExternalHarnessOutput } from "@/lib/publicApi/outputFilter";
+import { sendTeamChatPush } from "@/lib/notifications/webPush";
+import {
+  buildChatImageStoragePath,
+  CHAT_IMAGE_BUCKET,
+  ChatImageValidationError,
+  imageOnlyMessage,
+  publicChatImageAttachment,
+  validateChatImages,
+} from "@/lib/chat/channelImages";
 import {
   acquireTurnLock,
   getOrCreateExternalSession,
   shouldRunChannelOrchestrator,
   type ChatChannelRow,
 } from "@/lib/teamChat";
+import {
+  createAgentTask,
+  kickAgentTask,
+} from "@/lib/orchestrator/agentTasks";
+import { resolveChatRoundText } from "@/lib/chat/orchestratorResponse";
+import { getProductAccessForUser } from "@/lib/licensing/access";
+import { channelAgentIds } from "@/lib/chat/channelAgentRoster";
+import { buildChannelParticipantContext } from "@/lib/chat/channelParticipants";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,10 +84,44 @@ export async function POST(req: Request, { params }: Params) {
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
-  const content = typeof body?.content === "string" ? body.content.trim() : "";
-  if (!content || content.length > 40000) {
-    return NextResponse.json({ error: "content must be 1-40000 characters" }, { status: 400 });
+  const rawClientMessageId = body?.clientMessageId;
+  const clientMessageId =
+    typeof rawClientMessageId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      rawClientMessageId,
+    )
+      ? rawClientMessageId
+      : null;
+  if (rawClientMessageId !== undefined && !clientMessageId) {
+    return NextResponse.json(
+      { error: "clientMessageId must be a UUID" },
+      { status: 400 },
+    );
   }
+  let inlineImages: ReturnType<typeof validateChatImages>;
+  try {
+    inlineImages = validateChatImages(body?.files);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error:
+          error instanceof ChatImageValidationError
+            ? error.message
+            : "Could not validate the attached images.",
+      },
+      { status: 400 },
+    );
+  }
+  const typedContent =
+    typeof body?.content === "string" ? body.content.trim() : "";
+  if ((!typedContent && inlineImages.length === 0) || typedContent.length > 40000) {
+    return NextResponse.json(
+      { error: "Add a message or up to 3 images (40,000 characters maximum)." },
+      { status: 400 },
+    );
+  }
+  const content =
+    typedContent || imageOnlyMessage(inlineImages.length);
   const replyTo =
     typeof body?.replyToMessageId === "string" && body.replyToMessageId
       ? body.replyToMessageId
@@ -82,6 +137,39 @@ export async function POST(req: Request, { params }: Params) {
   const channel = channelData as ChatChannelRow;
   if (channel.is_archived) {
     return NextResponse.json({ error: "Archived channels are read-only" }, { status: 409 });
+  }
+  if (inlineImages.length > 0) {
+    if (channel.kind !== "channel" || channel.orchestrator_mode === "off") {
+      return NextResponse.json(
+        {
+          error:
+            "Images can be shared in channels where the orchestrator is available.",
+        },
+        { status: 409 },
+      );
+    }
+    const { data: orchestratorMember, error: orchestratorMemberError } =
+      await supabase
+        .from("chat_channel_members")
+        .select("id")
+        .eq("channel_id", id)
+        .eq("member_type", "orchestrator")
+        .maybeSingle();
+    if (orchestratorMemberError) {
+      return NextResponse.json(
+        { error: "Could not verify the channel orchestrator." },
+        { status: 500 },
+      );
+    }
+    if (!orchestratorMember) {
+      return NextResponse.json(
+        {
+          error:
+            "Add the orchestrator to this channel before sharing images.",
+        },
+        { status: 409 },
+      );
+    }
   }
 
   if (replyTo) {
@@ -102,6 +190,23 @@ export async function POST(req: Request, { params }: Params) {
     }
   }
 
+  const admin = createSupabaseAdminClient();
+  if (inlineImages.length > 0) {
+    const { error: imageSchemaError } = await admin
+      .from("chat_message_attachments")
+      .select("id")
+      .limit(1);
+    if (imageSchemaError) {
+      return NextResponse.json(
+        {
+          error:
+            "Channel images are ready in the app but need the latest database migration before they can be sent.",
+        },
+        { status: 503 },
+      );
+    }
+  }
+
   const { data: inserted, error: insertError } = await supabase
     .from("chat_messages")
     .insert({
@@ -110,7 +215,9 @@ export async function POST(req: Request, { params }: Params) {
       author_user_id: user.id,
       content,
       reply_to_message_id: replyTo,
-      metadata: {},
+      metadata: clientMessageId
+        ? { client_message_id: clientMessageId }
+        : {},
     })
     .select("*")
     .single();
@@ -121,7 +228,135 @@ export async function POST(req: Request, { params }: Params) {
     );
   }
 
-  const admin = createSupabaseAdminClient();
+  const uploadedImagePaths: string[] = [];
+  const cleanupMessageAndImages = async () => {
+    if (uploadedImagePaths.length > 0) {
+      await admin.storage.from(CHAT_IMAGE_BUCKET).remove(uploadedImagePaths);
+    }
+    await admin
+      .from("chat_messages")
+      .delete()
+      .eq("id", inserted.id)
+      .eq("channel_id", id)
+      .eq("author_user_id", user.id);
+  };
+  if (inlineImages.length > 0) {
+    try {
+      const uploaded = [];
+      for (const [position, image] of inlineImages.entries()) {
+        const storagePath = buildChatImageStoragePath({
+          uploaderId: user.id,
+          channelId: id,
+          mediaType: image.mediaType,
+        });
+        const { error: uploadError } = await admin.storage
+          .from(CHAT_IMAGE_BUCKET)
+          .upload(storagePath, image.bytes, {
+            contentType: image.mediaType,
+            cacheControl: "3600",
+            upsert: false,
+          });
+        if (uploadError) throw new Error(uploadError.message);
+        uploadedImagePaths.push(storagePath);
+        uploaded.push({
+          channel_id: id,
+          message_id: inserted.id,
+          uploaded_by: user.id,
+          storage_path: storagePath,
+          file_name: image.filename,
+          mime_type: image.mediaType,
+          size_bytes: image.byteSize,
+          position,
+        });
+      }
+      const { data: attachmentRows, error: attachmentError } = await admin
+        .from("chat_message_attachments")
+        .insert(uploaded)
+        .select("id,storage_path,file_name,mime_type,size_bytes");
+      if (attachmentError || !attachmentRows) {
+        throw new Error(
+          attachmentError?.message || "Could not save image attachments",
+        );
+      }
+      const attachmentByPath = new Map(
+        attachmentRows.map((attachment) => [
+          String(attachment.storage_path),
+          attachment,
+        ]),
+      );
+      const attachments = uploaded.map((upload) => {
+        const attachment = attachmentByPath.get(upload.storage_path);
+        if (!attachment) throw new Error("Could not resolve an uploaded image");
+        return publicChatImageAttachment(attachment);
+      });
+      const metadata = {
+        ...(clientMessageId
+          ? { client_message_id: clientMessageId }
+          : {}),
+        attachments,
+        image_only: !typedContent,
+      };
+      const { data: updatedMessage, error: metadataError } = await admin
+        .from("chat_messages")
+        .update({ metadata })
+        .eq("id", inserted.id)
+        .eq("channel_id", id)
+        .select("metadata")
+        .single();
+      if (metadataError || !updatedMessage) {
+        throw new Error(
+          metadataError?.message || "Could not attach images to the message",
+        );
+      }
+      inserted.metadata = updatedMessage.metadata;
+    } catch (error) {
+      await cleanupMessageAndImages();
+      console.error("[team-chat] image_upload_failed", {
+        channelId: id,
+        userId: user.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return NextResponse.json(
+        { error: "Could not securely attach those images. Please try again." },
+        { status: 500 },
+      );
+    }
+  }
+
+  const speaker =
+    (
+      (typeof user.user_metadata?.full_name === "string" &&
+        user.user_metadata.full_name.trim()) ||
+      (typeof user.user_metadata?.name === "string" &&
+        user.user_metadata.name.trim()) ||
+      user.email ||
+      "Workspace member"
+    )
+      .replace(/[\r\n[\]]+/g, " ")
+      .trim()
+      .slice(0, 300) || "Workspace member";
+  let humanPushSent = false;
+  const notifyHumanMessage = async () => {
+    if (humanPushSent) return;
+    humanPushSent = true;
+    try {
+      await sendTeamChatPush({
+        admin,
+        channelId: id,
+        messageId: String(inserted.id),
+        authorType: "user",
+        authorUserId: user.id,
+        authorLabel: speaker,
+        content,
+      });
+    } catch (cause) {
+      console.warn("[team-chat] human push delivery failed", {
+        channelId: id,
+        messageId: inserted.id,
+        error: cause instanceof Error ? cause.message : "Unknown push error",
+      });
+    }
+  };
   const { data: workspace, error: workspaceError } = await admin
     .from("workspaces")
     .select("id,name,billing_admin_user_id")
@@ -132,6 +367,7 @@ export async function POST(req: Request, { params }: Params) {
       channelId: id,
       error: workspaceError?.message || "workspace owner unavailable",
     });
+    await notifyHumanMessage();
     return NextResponse.json(
       {
         message: inserted,
@@ -140,6 +376,129 @@ export async function POST(req: Request, { params }: Params) {
       },
       { status: 201 },
     );
+  }
+  const traceId = randomUUID();
+  const { data: channelMembers, error: channelMembersError } = await admin
+    .from("chat_channel_members")
+    .select("member_type,user_id,agent_id")
+    .eq("channel_id", id)
+    .in("member_type", ["user", "agent"]);
+  if (channelMembersError) {
+    await notifyHumanMessage();
+    return NextResponse.json(
+      {
+        message: inserted,
+        orchestrator: null,
+        error: "Message delivered, but channel members could not be resolved.",
+      },
+      { status: 201 },
+    );
+  }
+  const uniqueAgentIds = channelAgentIds(channelMembers || []);
+  const channelUserIds = (channelMembers || [])
+    .filter((member) => member.member_type === "user")
+    .map((member) => (typeof member.user_id === "string" ? member.user_id : ""))
+    .filter(Boolean);
+  const { data: agents, error: agentsError } = uniqueAgentIds.length
+    ? await admin
+        .from("agents")
+        .select("id,name")
+        .eq("user_id", workspace.billing_admin_user_id)
+        .in("id", uniqueAgentIds)
+    : { data: [], error: null };
+  if (agentsError || (agents || []).length !== uniqueAgentIds.length) {
+    await notifyHumanMessage();
+    return NextResponse.json(
+      {
+        message: inserted,
+        orchestrator: null,
+        error: "Message delivered, but channel agents could not be resolved.",
+      },
+      { status: 201 },
+    );
+  }
+
+  const directDmAgent =
+    channel.kind === "dm" &&
+    uniqueAgentIds.length === 1 &&
+    (agents || []).length === 1
+      ? agents?.[0]
+      : null;
+  if (directDmAgent?.id) {
+    // A one-to-one worker DM must never depend on a Mind, orchestrator
+    // session, turn lock, prompt router, or orchestration model. The durable
+    // worker task and its eventual team-chat completion are the whole path.
+    const access = await getProductAccessForUser({
+      userId: workspace.billing_admin_user_id,
+      workspaceId: channel.workspace_id,
+    }).catch(() => null);
+    if (!access?.hasAccess) {
+      await cleanupMessageAndImages();
+      return NextResponse.json(
+        {
+          error:
+            access?.accessStatus === "trial_available"
+              ? "The workspace owner needs to start their free trial before agents can run here."
+              : "The workspace owner needs to activate Groovy before agents can run here.",
+          code:
+            access?.accessStatus === "trial_available"
+              ? "trial_not_started"
+              : "license_required",
+        },
+        { status: 402 },
+      );
+    }
+
+    await notifyHumanMessage();
+    try {
+      const task = await createAgentTask({
+        userId: workspace.billing_admin_user_id,
+        agentId: String(directDmAgent.id),
+        prompt: content,
+        context: `Direct message from ${speaker} in ${channel.name}.`,
+        requestedChannel: `team_chat:${id}`,
+        notify: { dashboard: true },
+        source: "api",
+        traceId,
+        turnId: traceId,
+      });
+      kickAgentTask({
+        taskId: task.id,
+        userId: workspace.billing_admin_user_id,
+        baseUrl: new URL(req.url).origin,
+      });
+      return NextResponse.json(
+        {
+          message: inserted,
+          orchestrator: null,
+          agentTask: {
+            id: task.id,
+            status: task.status,
+            title: task.title || "Agent task",
+            agentId: String(directDmAgent.id),
+            agentName: String(directDmAgent.name || "Agent"),
+            traceId,
+          },
+        },
+        { status: 201 },
+      );
+    } catch (error) {
+      console.error("[team-chat] direct_agent_dispatch_failed", {
+        channelId: id,
+        agentId: directDmAgent.id,
+        traceId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return NextResponse.json(
+        {
+          message: inserted,
+          orchestrator: null,
+          error:
+            "Message delivered, but the agent task could not be started. Please try again.",
+        },
+        { status: 201 },
+      );
+    }
   }
 
   let profile: Awaited<ReturnType<typeof resolveHarnessProfile>>;
@@ -154,6 +513,7 @@ export async function POST(req: Request, { params }: Params) {
       channelId: id,
       error: error instanceof Error ? error.message : String(error),
     });
+    await notifyHumanMessage();
     return NextResponse.json(
       {
         message: inserted,
@@ -164,12 +524,7 @@ export async function POST(req: Request, { params }: Params) {
     );
   }
   if (channel.profile_id && !profile) {
-    await admin
-      .from("chat_messages")
-      .delete()
-      .eq("id", inserted.id)
-      .eq("channel_id", id)
-      .eq("author_user_id", user.id);
+    await cleanupMessageAndImages();
     return NextResponse.json(
       {
         orchestrator: null,
@@ -178,39 +533,16 @@ export async function POST(req: Request, { params }: Params) {
       { status: 409 },
     );
   }
-  const { data: channelMembers, error: channelMembersError } = await admin
-    .from("chat_channel_members")
-    .select("member_type,user_id,agent_id")
-    .eq("channel_id", id)
-    .in("member_type", ["user", "agent"]);
-  if (channelMembersError) {
-    return NextResponse.json(
-      {
-        message: inserted,
-        orchestrator: null,
-        error: "Message delivered, but channel members could not be resolved.",
-      },
-      { status: 201 },
-    );
-  }
-  const agentIds = (channelMembers || [])
-    .filter((member) => member.member_type === "agent")
-    .map((member) => (typeof member.agent_id === "string" ? member.agent_id : ""))
-    .filter(Boolean);
-  const channelUserIds = (channelMembers || [])
-    .filter((member) => member.member_type === "user")
-    .map((member) => (typeof member.user_id === "string" ? member.user_id : ""))
-    .filter(Boolean);
-  const { count: guestMemberCount, error: guestMemberError } =
+  const { data: channelWorkspaceMembers, error: guestMemberError } =
     channelUserIds.length > 0
       ? await admin
           .from("workspace_members")
-          .select("user_id", { count: "exact", head: true })
+          .select("user_id,role")
           .eq("workspace_id", channel.workspace_id)
-          .eq("role", "guest")
           .in("user_id", channelUserIds)
-      : { count: 0, error: null };
+      : { data: [], error: null };
   if (guestMemberError) {
+    await notifyHumanMessage();
     return NextResponse.json(
       {
         message: inserted,
@@ -220,7 +552,18 @@ export async function POST(req: Request, { params }: Params) {
       { status: 201 },
     );
   }
-  const channelHasGuests = Number(guestMemberCount || 0) > 0;
+  const channelRoleByUserId = new Map(
+    (channelWorkspaceMembers || []).map((member) => [
+      String(member.user_id),
+      member.role === "admin" || member.role === "guest"
+        ? member.role
+        : "member",
+    ]),
+  );
+  const channelHasGuests = channelUserIds.some(
+    (participantUserId) =>
+      (channelRoleByUserId.get(participantUserId) || "guest") === "guest",
+  );
   const teamChatProvider = channelHasGuests
     ? "team_chat_guest"
     : "team_chat";
@@ -233,6 +576,7 @@ export async function POST(req: Request, { params }: Params) {
       .eq("thread_key", id)
       .maybeSingle();
     if (stickyThreadError) {
+      await notifyHumanMessage();
       return NextResponse.json(
         {
           message: inserted,
@@ -257,12 +601,7 @@ export async function POST(req: Request, { params }: Params) {
       profile = null;
     }
     if (stickyThread?.profile_id && !profile) {
-      await admin
-        .from("chat_messages")
-        .delete()
-        .eq("id", inserted.id)
-        .eq("channel_id", id)
-        .eq("author_user_id", user.id);
+      await cleanupMessageAndImages();
       return NextResponse.json(
         {
           orchestrator: null,
@@ -273,32 +612,19 @@ export async function POST(req: Request, { params }: Params) {
       );
     }
   }
-  const { data: agents, error: agentsError } = agentIds.length
-    ? await admin.from("agents").select("id,name").in("id", agentIds)
-    : { data: [], error: null };
-  if (agentsError) {
-    return NextResponse.json(
-      {
-        message: inserted,
-        orchestrator: null,
-        error: "Message delivered, but channel agents could not be resolved.",
-      },
-      { status: 201 },
-    );
-  }
-  const requestedOrchestratorReply = shouldRunChannelOrchestrator({
-    content,
-    channel,
-    profileName: profile?.name,
-    profileSlug: profile?.slug,
-    agentNames: (agents || []).map((agent) => String(agent.name || "")),
-  });
+  const requestedOrchestratorReply =
+    inlineImages.length > 0 ||
+    shouldRunChannelOrchestrator({
+      content,
+      channel,
+      profileName: profile?.name,
+      profileSlug: profile?.slug,
+      agentNames: (agents || []).map((agent) => String(agent.name || "")),
+    });
   const guestSafeProfile =
-    Boolean(channel.profile_id) &&
-    profile?.surface === "external" &&
-    profile.authorizationStance === "restricted" &&
-    profile.memoryScope === "profile";
+    Boolean(channel.profile_id) && isGuestSafeMind(profile);
   if (channelHasGuests && !guestSafeProfile) {
+    await notifyHumanMessage();
     return NextResponse.json(
       {
         message: inserted,
@@ -306,7 +632,7 @@ export async function POST(req: Request, { params }: Params) {
         ...(requestedOrchestratorReply
           ? {
               error:
-                "Message delivered. This channel contains guests, so an admin must bind an external, restricted Mind before the orchestrator can reply.",
+                `Message delivered. ${GUEST_SAFE_MIND_REQUIREMENT} Ask a workspace admin to configure or bind one before the orchestrator can reply.`,
             }
           : {}),
       },
@@ -314,6 +640,41 @@ export async function POST(req: Request, { params }: Params) {
     );
   }
   const shouldReply = requestedOrchestratorReply;
+  const channelParticipantContext = shouldReply
+    ? buildChannelParticipantContext({
+        channelName: channel.name,
+        visibility:
+          channel.visibility === "private" ? "private" : "workspace",
+        currentSpeakerUserId: user.id,
+        humans: await Promise.all(
+          channelUserIds.map(async (participantUserId) => {
+            const { data } =
+              await admin.auth.admin.getUserById(participantUserId);
+            const participant = data.user;
+            const displayName =
+              (typeof participant?.user_metadata?.full_name === "string" &&
+                participant.user_metadata.full_name.trim()) ||
+              (typeof participant?.user_metadata?.name === "string" &&
+                participant.user_metadata.name.trim()) ||
+              participant?.email?.split("@")[0] ||
+              "Workspace member";
+            return {
+              userId: participantUserId,
+              displayName,
+              email: participant?.email || null,
+              workspaceRole:
+                channelRoleByUserId.get(participantUserId) ||
+                ("guest" as const),
+            };
+          }),
+        ),
+        agents: (agents || []).map((agent) => ({
+          id: String(agent.id),
+          name: String(agent.name || "Worker agent"),
+        })),
+        mindName: profile?.name || "Groovy",
+      })
+    : null;
   const { data: channelSkillAssignments, error: channelSkillsError } =
     shouldReply && !channelHasGuests
       ? await admin
@@ -346,6 +707,7 @@ export async function POST(req: Request, { params }: Params) {
       channelId: id,
       error: error instanceof Error ? error.message : String(error),
     });
+    await notifyHumanMessage();
     return NextResponse.json(
       {
         message: inserted,
@@ -355,35 +717,19 @@ export async function POST(req: Request, { params }: Params) {
       { status: 201 },
     );
   }
-  const speaker =
-    (
-      (typeof user.user_metadata?.full_name === "string" &&
-        user.user_metadata.full_name.trim()) ||
-      (typeof user.user_metadata?.name === "string" && user.user_metadata.name.trim()) ||
-      user.email ||
-      "Workspace member"
-    )
-      .replace(/[\r\n[\]]+/g, " ")
-      .trim()
-      .slice(0, 300) || "Workspace member";
-  const attributedContent = `[From: ${speaker}]\n${content}`;
-  const directDmAgent =
-    channel.kind === "dm" && (agents || []).length === 1
-      ? String(agents?.[0]?.name || "").trim()
+  const imageContext =
+    inlineImages.length > 0
+      ? `\n[Attached image filenames (untrusted labels only): ${JSON.stringify(
+          inlineImages.map((image) => image.filename),
+        )}]`
       : "";
-  const routedContent = directDmAgent
-    ? `[From: ${speaker}]\n@${directDmAgent.replace(/\s+/g, "")} ${content}`
-    : attributedContent;
-  const traceId = randomUUID();
+  const attributedContent = `[From: ${speaker}]\n${content}${imageContext}`;
+  const routedContent = attributedContent;
   const loadHistoryAndPersistUser = async () => {
     const { data: priorRows, error: historyError } = await admin
       .from("orchestrator_messages")
       .select("role,content")
       .eq("session_id", external.sessionId)
-      .contains("metadata", {
-        provider: teamChatProvider,
-        channel_id: id,
-      })
       .order("created_at", { ascending: false })
       .limit(100);
     if (historyError) throw new Error(historyError.message);
@@ -400,6 +746,15 @@ export async function POST(req: Request, { params }: Params) {
           channel_id: id,
           chat_message_id: inserted.id,
           speaker_user_id: user.id,
+          ...(inlineImages.length > 0
+            ? {
+                attachments: inlineImages.map((image) => ({
+                  name: image.filename,
+                  mimeType: image.mediaType,
+                  sizeBytes: image.byteSize,
+                })),
+              }
+            : {}),
         },
       })
       .select("id")
@@ -407,10 +762,13 @@ export async function POST(req: Request, { params }: Params) {
     if (persistenceError || !persistedUser) {
       throw new Error(persistenceError?.message || "Could not save channel history");
     }
-    return [...(priorRows || [])].reverse();
+    return [
+      ...(priorRows || []).reverse(),
+      { role: "user", content: routedContent },
+    ];
   };
-
   if (!shouldReply) {
+    await notifyHumanMessage();
     try {
       await loadHistoryAndPersistUser();
       return NextResponse.json({ message: inserted, orchestrator: null }, { status: 201 });
@@ -436,12 +794,7 @@ export async function POST(req: Request, { params }: Params) {
 
   const lock = await acquireTurnLock(admin, external.sessionId);
   if (!lock) {
-    await admin
-      .from("chat_messages")
-      .delete()
-      .eq("id", inserted.id)
-      .eq("channel_id", id)
-      .eq("author_user_id", user.id);
+    await cleanupMessageAndImages();
     return NextResponse.json(
       {
         orchestrator: null,
@@ -450,6 +803,7 @@ export async function POST(req: Request, { params }: Params) {
       { status: 409 },
     );
   }
+  await notifyHumanMessage();
 
   let assistantChatMessageId: string | null = null;
   let runId: string | null = null;
@@ -577,15 +931,27 @@ export async function POST(req: Request, { params }: Params) {
           userEmail: owner.user?.email || null,
           history: roundHistory,
           message: roundMessage,
+          files:
+            inlineImages.length > 0
+              ? inlineImages.map((image) => ({
+                  mediaType: image.mediaType,
+                  base64: image.base64,
+                  filename: image.filename,
+                }))
+              : undefined,
           orchestratorSessionId: external.sessionId,
           profile,
           sourceProvider: teamChatProvider,
           memoryScopeId: channelHasGuests ? id : undefined,
           additionalSkillArtifactIds: channelSkillArtifactIds,
+          channelInstructions: channel.orchestrator_instructions,
+          channelParticipantContext,
           deviceId: null,
           traceId: activeTraceId,
           abortController: controller,
           taskRequestedChannel: `team_chat:${id}`,
+          allowedAgentIds: uniqueAgentIds,
+          agentRosterMode: "replace",
         });
         stopControlMonitor();
         const { data: finalizing, error: finalizingError } = await admin
@@ -659,6 +1025,23 @@ export async function POST(req: Request, { params }: Params) {
             })
             .select("*")
             .single();
+          if (stoppedMessage) {
+            await sendTeamChatPush({
+              admin,
+              channelId: id,
+              messageId: String(stoppedMessage.id),
+              authorType: "system",
+              authorUserId: control.requestedBy,
+              authorLabel: "System",
+              content: stoppedText,
+            }).catch((cause) => {
+              console.warn("[team-chat] control push delivery failed", {
+                channelId: id,
+                error:
+                  cause instanceof Error ? cause.message : "Unknown push error",
+              });
+            });
+          }
           await admin
             .from("chat_orchestrator_runs")
             .update({
@@ -678,15 +1061,13 @@ export async function POST(req: Request, { params }: Params) {
         }
 
         redirectsHandled += 1;
+        const direction = control.direction;
+        const redirectAttributed = `[Redirect from: ${requestedByName}]\n${direction}`;
+        roundMessage = redirectAttributed;
         roundHistory = [
           ...roundHistory,
           { role: "user", content: roundMessage },
         ];
-        const direction = control.direction;
-        const redirectAttributed = `[Redirect from: ${requestedByName}]\n${direction}`;
-        roundMessage = directDmAgent
-          ? `[Redirect from: ${requestedByName}]\n@${directDmAgent.replace(/\s+/g, "")} ${direction}`
-          : redirectAttributed;
         activeTraceId = randomUUID();
 
         const { data: redirectMessage, error: redirectMessageError } = await admin
@@ -713,6 +1094,21 @@ export async function POST(req: Request, { params }: Params) {
             redirectMessageError?.message || "Could not save the redirect",
           );
         }
+        await sendTeamChatPush({
+          admin,
+          channelId: id,
+          messageId: String(redirectMessage.id),
+          authorType: "user",
+          authorUserId: control.requestedBy,
+          authorLabel: requestedByName,
+          content: direction,
+        }).catch((cause) => {
+          console.warn("[team-chat] redirect push delivery failed", {
+            channelId: id,
+            error:
+              cause instanceof Error ? cause.message : "Unknown push error",
+          });
+        });
         replyTargetMessageId = String(redirectMessage.id);
         const { error: redirectHistoryError } = await admin
           .from("orchestrator_messages")
@@ -747,10 +1143,7 @@ export async function POST(req: Request, { params }: Params) {
     }
 
     if (!result) throw new Error("The channel orchestrator returned no result");
-    const rawText =
-      result.kind === "final"
-        ? result.text.trim()
-        : "This channel turn could not be completed without a local connector.";
+    const rawText = resolveChatRoundText(result);
     const text = channelHasGuests
       ? filterExternalHarnessOutput(rawText)
       : rawText;
@@ -760,7 +1153,7 @@ export async function POST(req: Request, { params }: Params) {
         channel_id: id,
         author_type: "orchestrator",
         profile_id: profile?.id || null,
-        content: text || "Done.",
+        content: text,
         reply_to_message_id: replyTargetMessageId,
         metadata: {
           trace_id: activeTraceId,
@@ -776,7 +1169,7 @@ export async function POST(req: Request, { params }: Params) {
       session_id: external.sessionId,
       user_id: workspace.billing_admin_user_id,
       role: "assistant",
-      content: text || "Done.",
+      content: text,
       trace_id: activeTraceId,
       metadata: {
         provider: teamChatProvider,
@@ -785,6 +1178,19 @@ export async function POST(req: Request, { params }: Params) {
       },
     });
     if (assistantHistoryError) throw new Error(assistantHistoryError.message);
+    await sendTeamChatPush({
+      admin,
+      channelId: id,
+      messageId: String(assistant.id),
+      authorType: "orchestrator",
+      authorLabel: profile?.name || "Groovy",
+      content: text,
+    }).catch((cause) => {
+      console.warn("[team-chat] orchestrator push delivery failed", {
+        channelId: id,
+        error: cause instanceof Error ? cause.message : "Unknown push error",
+      });
+    });
     await admin
       .from("chat_orchestrator_runs")
       .update({
@@ -848,6 +1254,22 @@ export async function POST(req: Request, { params }: Params) {
       })
       .select("*")
       .maybeSingle();
+    if (failureMessage) {
+      await sendTeamChatPush({
+        admin,
+        channelId: id,
+        messageId: String(failureMessage.id),
+        authorType: "system",
+        authorLabel: "System",
+        content: failureText,
+      }).catch((cause) => {
+        console.warn("[team-chat] failure push delivery failed", {
+          channelId: id,
+          error:
+            cause instanceof Error ? cause.message : "Unknown push error",
+        });
+      });
+    }
     console.error("[team-chat] orchestrator_turn_failed", {
       channelId: id,
       traceId: activeTraceId,

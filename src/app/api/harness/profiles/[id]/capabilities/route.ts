@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { normalizeIntegrationAssignments } from "@/lib/integrations/assignments";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -64,17 +65,15 @@ async function loadContext(id: string, requireWrite: boolean) {
     if (profile.user_id !== user.id) {
       throw Object.assign(new Error("Mind not found"), { status: 404 });
     }
-    const { data: membership } = await admin
-      .from("workspace_members")
-      .select("workspace_id,role")
-      .eq("user_id", user.id)
-      .neq("role", "guest")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
     workspaceId =
-      typeof membership?.workspace_id === "string" ? membership.workspace_id : null;
-    workspaceRole = typeof membership?.role === "string" ? membership.role : null;
+      membership && membership.role !== "guest"
+        ? membership.workspace_id
+        : null;
+    workspaceRole = membership?.role || null;
   }
   if (!workspaceId) {
     throw Object.assign(
@@ -198,8 +197,11 @@ async function loadCapabilities(id: string) {
   return {
     context,
     payload: {
-      inheritWorkspaceSkills: profile.inherit_workspace_skills !== false,
+      inheritWorkspaceSkills:
+        profile.surface !== "external" &&
+        profile.inherit_workspace_skills !== false,
       inheritWorkspaceIntegrations:
+        profile.surface !== "external" &&
         profile.inherit_workspace_integrations !== false,
       skills: (artifactsResult.data || [])
         .filter((artifact) => supportsFlow(artifact.targets))

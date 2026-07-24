@@ -37,6 +37,12 @@ const EXTERNAL_OPT_IN_TOOLS = new Set([
   "data_query",
 ]);
 
+const CHANNEL_AGENT_TOOLS = new Set([
+  "list_agents",
+  "assign_task",
+  "consult_agent",
+]);
+
 const EXTERNAL_HARD_BLOCKED_NAMES = new Set([
   "terminal_exec",
   "code_cli_run",
@@ -83,16 +89,41 @@ export function buildToolPolicyExecutionContext(args: {
   profile?: HarnessProfile | null;
   provider?: string | null;
   memoryScopeId?: string | null;
+  /**
+   * Optional caller-owned roster boundary. When present, even an unrestricted
+   * Mind can only discover or delegate to these worker ids. An empty array is
+   * an explicit deny-all roster.
+   */
+  allowedAgentIds?: string[];
+  /**
+   * Team Chat owns its worker roster per channel. Other entry points retain
+   * the safer default of intersecting the caller boundary with the Mind roster.
+   */
+  agentRosterMode?: "intersect" | "replace";
 }): ToolPolicyExecutionContext {
   const profile = args.profile ?? null;
   const profileId =
     profile?.id && profile.id !== "__default__" ? profile.id : null;
+  const profileAgentRoster = profile?.agentRoster ?? null;
+  const callerAgentRoster = Array.isArray(args.allowedAgentIds)
+    ? Array.from(new Set(args.allowedAgentIds.map(String).filter(Boolean)))
+    : null;
+  const agentRoster =
+    callerAgentRoster === null
+      ? profileAgentRoster
+      : args.agentRosterMode === "replace"
+        ? callerAgentRoster
+      : profileAgentRoster === null
+        ? callerAgentRoster
+        : profileAgentRoster.filter((agentId) =>
+            callerAgentRoster.includes(agentId),
+          );
   return {
     profileId,
     surface: profile?.surface === "external" ? "external" : "internal",
     provider: String(args.provider || "dashboard"),
     policy: profile?.toolPolicy ?? { mode: "all" },
-    agentRoster: profile?.agentRoster ?? null,
+    agentRoster,
     memoryScope: profile?.memoryScope === "profile" ? "profile" : "shared",
     memoryScopeId:
       profile?.memoryScope === "profile"
@@ -145,6 +176,16 @@ export function toolPolicyDenialReason(
       EXTERNAL_HARD_BLOCKED_PREFIXES.some((prefix) => name.startsWith(prefix))
     ) {
       return `Harness tool policy blocked "${name}": external profiles cannot use this capability.`;
+    }
+
+    if (CHANNEL_AGENT_TOOLS.has(name)) {
+      const isScopedTeamChat =
+        (context.provider === "team_chat" ||
+          context.provider === "team_chat_guest") &&
+        Array.isArray(context.agentRoster);
+      return isScopedTeamChat
+        ? null
+        : `Harness tool policy blocked "${name}": external profiles may delegate only to an explicit, admin-managed Team Chat channel roster.`;
     }
 
     if (!EXTERNAL_OPT_IN_TOOLS.has(name)) {

@@ -2,25 +2,40 @@ import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { syncWorkspaceAddonSubscriptionBestEffort } from "@/lib/billing/addons";
+import { setActiveWorkspaceForUser } from "@/lib/billing/state";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 type AcceptBody = {
   token?: string;
+  inviteId?: string;
 };
 
 export async function POST(req: Request) {
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as AcceptBody | null;
-    if (!body || typeof body.token !== "string" || !body.token.trim()) {
-      return NextResponse.json({ error: "Invalid token" }, { status: 400 });
+    const token =
+      typeof body?.token === "string" ? body.token.trim() : "";
+    const inviteId =
+      typeof body?.inviteId === "string" ? body.inviteId.trim() : "";
+    if (!token && !inviteId) {
+      return NextResponse.json(
+        { error: "Invitation reference required" },
+        { status: 400 },
+      );
     }
 
     const admin = createSupabaseAdminClient();
-    const { data: invite, error: inviteErr } = await admin
+    let inviteQuery = admin
       .from("workspace_invites")
-      .select("id, workspace_id, email, role, expires_at")
-      .eq("token", body.token.trim())
-      .single();
+      .select("id, workspace_id, email, role, expires_at");
+    inviteQuery = token
+      ? inviteQuery.eq("token", token)
+      : inviteQuery.eq("id", inviteId);
+    const { data: invite, error: inviteErr } = await inviteQuery.single();
     if (inviteErr || !invite) {
       return NextResponse.json({ error: "Invite not found" }, { status: 404 });
     }
@@ -28,8 +43,13 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invite expired" }, { status: 410 });
     }
 
-    // Optional: enforce email match
-    if (invite.email && user.email && invite.email.toLowerCase() !== user.email.toLowerCase()) {
+    // Invitations are email-bound. Fail closed when the authenticated account
+    // has no email instead of allowing possession of the link alone.
+    if (
+      invite.email &&
+      (!user.email ||
+        invite.email.trim().toLowerCase() !== user.email.trim().toLowerCase())
+    ) {
       return NextResponse.json({ error: "Invite email does not match your account" }, { status: 403 });
     }
 
@@ -55,13 +75,81 @@ export async function POST(req: Request) {
         { status: 409 },
       );
     }
+    if (invitedRole === "guest") {
+      const { data: channels, error: channelsError } = await admin
+        .from("chat_channels")
+        .select("id,name,profile_id,orchestrator_mode")
+        .eq("workspace_id", invitedWorkspaceId)
+        .in("id", invitedChannelIds);
+      if (channelsError) {
+        return NextResponse.json(
+          { error: channelsError.message },
+          { status: 500 },
+        );
+      }
+      if ((channels || []).length !== invitedChannelIds.length) {
+        return NextResponse.json(
+          { error: "One or more invited channels are no longer available" },
+          { status: 409 },
+        );
+      }
+      const channelsWithMind = (channels || []).filter(
+        (channel) => channel.orchestrator_mode !== "off",
+      );
+      const profileIds = Array.from(
+        new Set(
+          channelsWithMind
+            .map((channel) => String(channel.profile_id || ""))
+            .filter(Boolean),
+        ),
+      );
+      const { data: profiles, error: profilesError } = profileIds.length
+        ? await admin
+            .from("orchestrator_profiles")
+            .select(
+              "id,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+            )
+            .eq("workspace_id", invitedWorkspaceId)
+            .in("id", profileIds)
+        : { data: [], error: null };
+      if (profilesError) {
+        return NextResponse.json(
+          { error: profilesError.message },
+          { status: 500 },
+        );
+      }
+      const safeProfileIds = new Set(
+        (profiles || [])
+          .filter((profile) => isGuestSafeMind(profile))
+          .map((profile) => String(profile.id)),
+      );
+      const invalidChannels = channelsWithMind.filter(
+        (channel) =>
+          !channel.profile_id ||
+          !safeProfileIds.has(String(channel.profile_id)),
+      );
+      if (invalidChannels.length > 0) {
+        return NextResponse.json(
+          {
+            error: `${GUEST_SAFE_MIND_REQUIREMENT} Ask a workspace admin to configure ${invalidChannels
+              .map((channel) => `#${channel.name}`)
+              .join(", ")} before accepting this invite.`,
+          },
+          { status: 409 },
+        );
+      }
+    }
 
-    // Enforce single-workspace-per-user: if the user is already in a different workspace,
-    // only allow auto-move if their current workspace is "personal" (they are the only member).
-    const { data: memberships } = await admin
+    const { data: memberships, error: membershipsError } = await admin
       .from("workspace_members")
       .select("workspace_id, role")
       .eq("user_id", user.id);
+    if (membershipsError) {
+      return NextResponse.json(
+        { error: membershipsError.message },
+        { status: 500 },
+      );
+    }
 
     const currentMemberships = Array.isArray(memberships) ? memberships : [];
 
@@ -70,34 +158,8 @@ export async function POST(req: Request) {
         String(membership.workspace_id) === invitedWorkspaceId,
     );
 
-    const otherMemberships = currentMemberships.filter(
-      (m) => String(m.workspace_id) !== invitedWorkspaceId,
-    );
-    if (otherMemberships.length > 0) {
-      for (const m of otherMemberships) {
-        const wId = String(m.workspace_id);
-        const { data: members } = await admin
-          .from("workspace_members")
-          .select("user_id")
-          .eq("workspace_id", wId)
-          .limit(2);
-
-        const isPersonal =
-          Array.isArray(members) &&
-          members.length === 1 &&
-          String(members[0]?.user_id || "") === String(user.id);
-
-        if (!isPersonal) {
-          return NextResponse.json(
-            { error: "You're already in a workspace. Leave it before joining another." },
-            { status: 409 }
-          );
-        }
-      }
-
-    }
-
-    // Join the workspace. Never downgrade an existing operator to guest.
+    // Joining a workspace does not remove the user's personal workspace or any
+    // other memberships. The newly joined workspace becomes active.
     const effectiveRole =
       existingInvitedMembership?.role === "admin" ||
       existingInvitedMembership?.role === "member"
@@ -106,10 +168,10 @@ export async function POST(req: Request) {
     const { error: membershipWriteError } = await admin
       .from("workspace_members")
       .upsert({
-      workspace_id: invitedWorkspaceId,
-      user_id: user.id,
-      role: effectiveRole,
-    });
+        workspace_id: invitedWorkspaceId,
+        user_id: user.id,
+        role: effectiveRole,
+      });
     if (membershipWriteError) {
       return NextResponse.json(
         { error: membershipWriteError.message },
@@ -118,10 +180,6 @@ export async function POST(req: Request) {
     }
 
     const newlyAddedChannelIds: string[] = [];
-    const removedOldMemberships: Array<{
-      workspace_id: string;
-      role: string;
-    }> = [];
     const rollbackNewJoin = async () => {
       if (newlyAddedChannelIds.length) {
         await admin
@@ -143,15 +201,6 @@ export async function POST(req: Request) {
           .delete()
           .eq("workspace_id", invitedWorkspaceId)
           .eq("user_id", user.id);
-      }
-      if (removedOldMemberships.length) {
-        await admin.from("workspace_members").upsert(
-          removedOldMemberships.map((membership) => ({
-            workspace_id: membership.workspace_id,
-            user_id: user.id,
-            role: membership.role,
-          })),
-        );
       }
     };
 
@@ -201,61 +250,26 @@ export async function POST(req: Request) {
       }
     }
 
-    // Only remove the old personal workspace after the new membership and all
-    // requested channel grants have succeeded. This keeps a transient write
-    // failure from stranding the user without either workspace.
-    const oldChannelIdsToClean: string[] = [];
-    for (const membership of otherMemberships) {
-      const oldWorkspaceId = String(membership.workspace_id);
-      const { data: oldWorkspaceChannels, error: oldChannelsError } =
-        await admin
-          .from("chat_channels")
-          .select("id")
-          .eq("workspace_id", oldWorkspaceId);
-      if (oldChannelsError) {
-        await rollbackNewJoin();
-        return NextResponse.json(
-          { error: oldChannelsError.message },
-          { status: 500 },
-        );
-      }
-      const oldChannelIds = (oldWorkspaceChannels || []).map((channel) =>
-        String(channel.id),
-      );
-      oldChannelIdsToClean.push(...oldChannelIds);
-      const { error: oldMembershipDeleteError } = await admin
-        .from("workspace_members")
-        .delete()
-        .eq("workspace_id", oldWorkspaceId)
-        .eq("user_id", user.id);
-      if (oldMembershipDeleteError) {
-        await rollbackNewJoin();
-        return NextResponse.json(
-          { error: oldMembershipDeleteError.message },
-          { status: 500 },
-        );
-      }
-      removedOldMemberships.push({
-        workspace_id: oldWorkspaceId,
-        role: String(membership.role),
+    try {
+      const selectedMembership = await setActiveWorkspaceForUser({
+        userId: user.id,
+        workspaceId: invitedWorkspaceId,
+        admin,
       });
-    }
-    if (oldChannelIdsToClean.length) {
-      const { error: oldChannelMembershipError } = await admin
-        .from("chat_channel_members")
-        .delete()
-        .eq("member_type", "user")
-        .eq("user_id", user.id)
-        .in("channel_id", oldChannelIdsToClean);
-      if (oldChannelMembershipError) {
-        // The membership removal already revoked access because is_channel_member
-        // also requires a current workspace identity. Leave only inert cleanup
-        // rows instead of rolling back a completed, secure workspace move.
-        console.warn(
-          "[workspace-invite] stale channel membership cleanup failed",
-          oldChannelMembershipError.message,
-        );
+      if (!selectedMembership) {
+        throw new Error("The new workspace membership could not be selected");
       }
+    } catch (selectionError) {
+      await rollbackNewJoin();
+      return NextResponse.json(
+        {
+          error:
+            selectionError instanceof Error
+              ? selectionError.message
+              : "Failed to select workspace",
+        },
+        { status: 500 },
+      );
     }
 
     // Seed explicit agent ACL rows for agents already shared with this workspace.
@@ -270,9 +284,14 @@ export async function POST(req: Request) {
       await admin.from("orchestrator_agent_members").upsert(
         sharedAgentRows
           .map((row) => {
-            const agentId = String((row as { agent_id?: unknown }).agent_id || "").trim();
+            const agentId = String(
+              (row as { agent_id?: unknown }).agent_id || "",
+            ).trim();
             if (!agentId) return null;
-            const createdBy = String((row as { created_by_user_id?: unknown }).created_by_user_id || "").trim();
+            const createdBy = String(
+              (row as { created_by_user_id?: unknown }).created_by_user_id ||
+                "",
+            ).trim();
             return {
               agent_id: agentId,
               user_id: user.id,
@@ -283,16 +302,16 @@ export async function POST(req: Request) {
           })
           .filter(
             (
-              row
+              row,
             ): row is {
               agent_id: string;
               user_id: string;
               role: "viewer";
               created_by_user_id: string;
               updated_at: string;
-            } => row !== null
+            } => row !== null,
           ),
-        { onConflict: "agent_id,user_id" }
+        { onConflict: "agent_id,user_id" },
       );
     }
 
@@ -315,8 +334,9 @@ export async function POST(req: Request) {
     return NextResponse.json({
       success: true,
       role: effectiveRole,
+      workspaceId: invitedWorkspaceId,
       channelIds: invitedChannelIds,
-      destination: effectiveRole === "guest" ? "/chat" : "/dashboard",
+      destination: "/chat",
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to accept invite";

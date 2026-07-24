@@ -5,6 +5,7 @@ import {
   getOrCreateWorkspaceForUser,
   isWorkspaceOperatorRole,
 } from "@/lib/workspaces";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 export async function GET() {
   try {
@@ -36,13 +37,11 @@ export async function POST(req: Request) {
     }
 
     const admin = createSupabaseAdminClient();
-    const { data: membership, error: memberErr } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-    if (memberErr || !membership) {
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
     if (membership.role !== "admin") {

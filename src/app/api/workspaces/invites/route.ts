@@ -4,24 +4,24 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { getConfiguredAppUrl } from "@/lib/config/appConfig";
 import { normalizeWorkspaceInviteEmail } from "@/lib/workspaceInvites";
+import { sendTransactionalEmail } from "@/lib/email/resend";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
+import {
+  GUEST_SAFE_MIND_REQUIREMENT,
+  isGuestSafeMind,
+} from "@/lib/chat/guestMind";
 
 function safeOrigin() {
   const o = getConfiguredAppUrl() || "";
   return String(o || "").replace(/\/+$/, "");
 }
 
-async function sendSendgridInviteEmail(params: {
+async function sendWorkspaceInviteEmail(params: {
   toEmail: string;
   inviteUrl: string;
   workspaceName: string;
   inviterEmail: string | null;
 }) {
-  const apiKey = process.env.SENDGRID_API_KEY || "";
-  const fromEmail = process.env.SENDGRID_FROM_EMAIL || "";
-  if (!apiKey || !fromEmail) {
-    return { ok: false, error: "SendGrid not configured (missing SENDGRID_API_KEY or SENDGRID_FROM_EMAIL)" };
-  }
-
   const subject = `You're invited to ${params.workspaceName} on Groovy`;
   const inviterLine = params.inviterEmail ? `Invited by: ${params.inviterEmail}\n\n` : "";
   const text = `${inviterLine}Join workspace: ${params.workspaceName}\n\nAccept invite:\n${params.inviteUrl}\n\nIf you don't have an account yet, sign up first with this email, then reopen the invite link.\n`;
@@ -41,27 +41,12 @@ async function sendSendgridInviteEmail(params: {
   <p style="color:#666;font-size:12px;">If you don't have an account yet, sign up first with this email, then reopen the invite link.</p>
 </div>`;
 
-  const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: params.toEmail }], subject }],
-      from: { email: fromEmail, name: "Groovy" },
-      content: [
-        { type: "text/plain", value: text },
-        { type: "text/html", value: html },
-      ],
-    }),
+  return sendTransactionalEmail({
+    to: params.toEmail,
+    subject,
+    text,
+    html,
   });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    return { ok: false, error: `SendGrid error (${res.status}): ${errText || "unknown"}` };
-  }
-  return { ok: true as const };
 }
 
 export async function GET() {
@@ -69,13 +54,11 @@ export async function GET() {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
 
-    const { data: membership, error: memberErr } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-    if (memberErr || !membership) {
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
     if (membership.role !== "admin") {
@@ -140,6 +123,10 @@ type InviteBody = {
   channelIds?: string[];
 };
 
+type ResendInviteBody = {
+  inviteId?: unknown;
+};
+
 export async function POST(req: Request) {
   try {
     const user = await getAuthedUser();
@@ -164,13 +151,11 @@ export async function POST(req: Request) {
     }
 
     const admin = createSupabaseAdminClient();
-    const { data: membership, error: memberErr } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-    if (memberErr || !membership) {
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
     if (membership.role !== "admin") {
@@ -187,7 +172,7 @@ export async function POST(req: Request) {
       requestedChannelIds.length
         ? await admin
             .from("chat_channels")
-            .select("id,name")
+            .select("id,name,profile_id,orchestrator_mode")
             .eq("workspace_id", membership.workspace_id)
             .eq("kind", "channel")
             .eq("is_archived", false)
@@ -204,6 +189,53 @@ export async function POST(req: Request) {
         { error: "One or more selected channels are invalid" },
         { status: 400 },
       );
+    }
+    if (role === "guest") {
+      const channelsWithMind = (selectedChannels || []).filter(
+        (channel) => channel.orchestrator_mode !== "off",
+      );
+      const profileIds = Array.from(
+        new Set(
+          channelsWithMind
+            .map((channel) => String(channel.profile_id || ""))
+            .filter(Boolean),
+        ),
+      );
+      const { data: profiles, error: profilesError } = profileIds.length
+        ? await admin
+            .from("orchestrator_profiles")
+            .select(
+              "id,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+            )
+            .eq("workspace_id", membership.workspace_id)
+            .in("id", profileIds)
+        : { data: [], error: null };
+      if (profilesError) {
+        return NextResponse.json(
+          { error: profilesError.message },
+          { status: 500 },
+        );
+      }
+      const safeProfileIds = new Set(
+        (profiles || [])
+          .filter((profile) => isGuestSafeMind(profile))
+          .map((profile) => String(profile.id)),
+      );
+      const invalidChannels = channelsWithMind.filter(
+        (channel) =>
+          !channel.profile_id ||
+          !safeProfileIds.has(String(channel.profile_id)),
+      );
+      if (invalidChannels.length > 0) {
+        return NextResponse.json(
+          {
+            error: `${GUEST_SAFE_MIND_REQUIREMENT} Configure ${invalidChannels
+              .map((channel) => `#${channel.name}`)
+              .join(", ")} before inviting a guest.`,
+          },
+          { status: 409 },
+        );
+      }
     }
 
     const token = randomUUID();
@@ -244,24 +276,33 @@ export async function POST(req: Request) {
 
     let emailSent = false;
     let emailError: string | null = null;
-    try {
-      const emailRes = await sendSendgridInviteEmail({
-        toEmail: String(invite.email),
-        inviteUrl,
-        workspaceName,
-        inviterEmail: user.email || null,
-      });
-      emailSent = emailRes.ok === true;
-      emailError = emailSent ? null : (emailRes as { error?: string }).error || "Failed to send";
-    } catch (e) {
-      emailSent = false;
-      emailError = e instanceof Error ? e.message : "Failed to send";
+    if (!origin) {
+      emailError = "App URL is not configured for invitation delivery";
+    } else {
+      try {
+        const emailRes = await sendWorkspaceInviteEmail({
+          toEmail: String(invite.email),
+          inviteUrl,
+          workspaceName,
+          inviterEmail: user.email || null,
+        });
+        emailSent = emailRes.ok === true;
+        emailError = emailSent
+          ? null
+          : (emailRes as { error?: string }).error || "Failed to send";
+      } catch (e) {
+        emailSent = false;
+        emailError = e instanceof Error ? e.message : "Failed to send";
+      }
     }
 
     return NextResponse.json({
       invite: {
         ...invite,
-        channels: selectedChannels || [],
+        channels: (selectedChannels || []).map((channel) => ({
+          id: channel.id,
+          name: channel.name,
+        })),
       },
       inviteUrl,
       emailSent,
@@ -271,6 +312,143 @@ export async function POST(req: Request) {
     const message = err instanceof Error ? err.message : "Failed to create invite";
     const status = message === "Unauthorized" ? 401 : 500;
     return NextResponse.json({ error: message }, { status });
+  }
+}
+
+export async function PATCH(req: Request) {
+  try {
+    const user = await getAuthedUser();
+    const body = (await req.json().catch(() => null)) as
+      | ResendInviteBody
+      | null;
+    const inviteId =
+      typeof body?.inviteId === "string" ? body.inviteId.trim() : "";
+    if (!inviteId) {
+      return NextResponse.json(
+        { error: "inviteId required" },
+        { status: 400 },
+      );
+    }
+
+    const admin = createSupabaseAdminClient();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
+      return NextResponse.json(
+        { error: "Workspace not found" },
+        { status: 404 },
+      );
+    }
+    if (membership.role !== "admin") {
+      return NextResponse.json(
+        { error: "Admin access required" },
+        { status: 403 },
+      );
+    }
+
+    const { data: storedInvite, error: inviteError } = await admin
+      .from("workspace_invites")
+      .select("id,workspace_id,email,token,role,expires_at,created_at")
+      .eq("id", inviteId)
+      .eq("workspace_id", membership.workspace_id)
+      .maybeSingle();
+    if (inviteError) {
+      return NextResponse.json(
+        { error: inviteError.message },
+        { status: 500 },
+      );
+    }
+    if (!storedInvite) {
+      return NextResponse.json(
+        { error: "Invite not found" },
+        { status: 404 },
+      );
+    }
+
+    let invite = storedInvite;
+    const expiresAtMs = new Date(String(storedInvite.expires_at)).getTime();
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+      const { data: refreshedInvite, error: refreshError } = await admin
+        .from("workspace_invites")
+        .update({
+          expires_at: new Date(
+            Date.now() + 1000 * 60 * 60 * 24 * 7,
+          ).toISOString(),
+        })
+        .eq("id", inviteId)
+        .eq("workspace_id", membership.workspace_id)
+        .select("id,workspace_id,email,token,role,expires_at,created_at")
+        .maybeSingle();
+      if (refreshError || !refreshedInvite) {
+        return NextResponse.json(
+          { error: refreshError?.message || "Failed to refresh invitation" },
+          { status: 500 },
+        );
+      }
+      invite = refreshedInvite;
+    }
+
+    const { data: workspace, error: workspaceError } = await admin
+      .from("workspaces")
+      .select("name")
+      .eq("id", membership.workspace_id)
+      .maybeSingle();
+    if (workspaceError) {
+      return NextResponse.json(
+        { error: workspaceError.message },
+        { status: 500 },
+      );
+    }
+    if (!workspace) {
+      return NextResponse.json(
+        { error: "Workspace not found" },
+        { status: 404 },
+      );
+    }
+
+    const origin = safeOrigin();
+    if (!origin) {
+      return NextResponse.json(
+        { error: "App URL is not configured for invitation delivery" },
+        { status: 503 },
+      );
+    }
+    const inviteUrl = `${origin}/invite/${invite.token}`;
+    const delivery = await sendWorkspaceInviteEmail({
+      toEmail: String(invite.email),
+      inviteUrl,
+      workspaceName: String(workspace.name || "Workspace"),
+      inviterEmail: user.email || null,
+    });
+    if (!delivery.ok) {
+      return NextResponse.json(
+        { error: delivery.error, emailSent: false, inviteUrl },
+        { status: delivery.code === "not_configured" ? 503 : 502 },
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      emailSent: true,
+      inviteUrl,
+      invite: {
+        id: invite.id,
+        email: invite.email,
+        token: invite.token,
+        role: invite.role,
+        expires_at: invite.expires_at,
+        created_at: invite.created_at,
+      },
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to resend invitation";
+    return NextResponse.json(
+      { error: message },
+      { status: message === "Unauthorized" ? 401 : 500 },
+    );
   }
 }
 
@@ -286,12 +464,10 @@ export async function DELETE(req: Request) {
       return NextResponse.json({ error: "inviteId required" }, { status: 400 });
     }
     const admin = createSupabaseAdminClient();
-    const { data: membership } = await admin
-      .from("workspace_members")
-      .select("workspace_id,role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .maybeSingle();
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
     if (!membership || membership.role !== "admin") {
       return NextResponse.json({ error: "Admin access required" }, { status: 403 });
     }

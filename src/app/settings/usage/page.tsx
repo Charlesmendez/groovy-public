@@ -1,22 +1,9 @@
 import { UsageDashboardContent } from "@/components/usage/UsageDashboardContent";
-import { createSupabaseAdminClient } from "@/lib/supabase/admin";
-import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 
 export default async function SettingsUsagePage() {
-  const supabase = await createSupabaseServerClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  const admin = createSupabaseAdminClient();
-  const { data: membership } = user
-    ? await admin
-        .from("workspace_members")
-        .select("role")
-        .eq("user_id", user.id)
-        .limit(1)
-        .maybeSingle()
-    : { data: null };
-  const canViewWorkspaceUsage = membership?.role === "admin";
+  const workspace = await getOrCreateWorkspaceForUser();
+  const canViewWorkspaceUsage = workspace.role === "admin";
 
   return (
     <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">

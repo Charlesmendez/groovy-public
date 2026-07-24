@@ -62,7 +62,9 @@ export async function POST(req: Request) {
     return NextResponse.json(
       {
         error:
-          access?.accessStatus === "trial_available"
+          access?.workspaceOwnerRequired
+            ? "This workspace needs an active plan. Ask a workspace admin to activate Groovy."
+            : access?.accessStatus === "trial_available"
             ? "Start your free 5-day trial to run agents."
             : "Your free trial has ended. Purchase a Groovy license to run agents.",
         code: access?.accessStatus === "trial_available" ? "trial_not_started" : "license_required",

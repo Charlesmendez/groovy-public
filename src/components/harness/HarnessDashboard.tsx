@@ -61,6 +61,7 @@ import { PlansBrowser } from "@/components/claude/PlansBrowser";
 import { useClaudePlans, type ClaudePlan } from "@/hooks/useClaudePlans";
 import { canonicalWorkspacePath } from "@/lib/workspaces/path";
 import { AppNav } from "@/components/AppNav";
+import { WorkspaceSwitcher } from "@/components/workspaces/WorkspaceSwitcher";
 
 export default function HarnessDashboard() {
   const router = useRouter();
@@ -563,6 +564,11 @@ export default function HarnessDashboard() {
 
   return (
     <div className="app-viewport-shell w-full max-w-full bg-[var(--bg-primary)] flex flex-col overflow-hidden">
+      <WorkspaceSwitcher
+        modalOnly
+        fallbackName="Workspace"
+        switchDestination="/dashboard"
+      />
       {/* Ambient background */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-0 left-1/4 w-[600px] h-[600px] bg-cyan-500/[0.04] rounded-full blur-[160px]" />
@@ -571,17 +577,23 @@ export default function HarnessDashboard() {
 
       {/* Header */}
       <header className="relative z-10 shrink-0 border-b border-white/5 bg-[var(--bg-primary)]/80 backdrop-blur-xl">
-        <div className="px-4 py-2 flex items-center gap-3">
+        <div className="flex items-center gap-2 px-3 py-2 sm:gap-3 sm:px-4">
           <Image
             src="/Groovy_no_bg.png"
             alt="Groovy"
             width={140}
             height={40}
-            className="h-8 sm:h-10 w-auto"
+            className="h-7 w-auto max-w-[78px] object-contain sm:h-10 sm:max-w-none"
             unoptimized
             priority
           />
           <AppNav />
+          <WorkspaceSwitcher
+            compact
+            fallbackName="Workspace"
+            switchDestination="/dashboard"
+            showPendingGate={false}
+          />
 
           {/* Connector status */}
           <button
@@ -791,7 +803,9 @@ export default function HarnessDashboard() {
         </div>
       )}
 
-      {onboarding.loaded && onboarding.onboardingCompleted === true && (
+      {onboarding.loaded &&
+        (onboarding.onboardingCompleted === true ||
+          licenseAccess.status?.joinedWorkspace === true) && (
         <LicenseAccessGate
           status={licenseAccess.status}
           loading={licenseAccess.loading}
@@ -1015,7 +1029,10 @@ export default function HarnessDashboard() {
       )}
 
       {/* Onboarding overlay / post-onboarding checklist */}
-      {onboarding.loaded && onboarding.onboardingCompleted === false && (
+      {onboarding.loaded &&
+        onboarding.onboardingCompleted === false &&
+        licenseAccess.loading === false &&
+        licenseAccess.status?.joinedWorkspace !== true && (
         <HarnessOnboarding
           autoPair={desktopAutoPair}
           onComplete={() => void onboarding.refetch()}

@@ -4,6 +4,7 @@ import { getAuthedUser } from "@/lib/workspaces";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
 import { syncWorkspaceAddonSubscription } from "@/lib/billing/addons";
 import { isSelfHosted } from "@/lib/config/edition";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 type RequestBody = {
   requested_provider?: string;
@@ -12,14 +13,7 @@ type RequestBody = {
 };
 
 async function getWorkspaceMembership(admin: ReturnType<typeof createSupabaseAdminClient>, userId: string) {
-  const { data, error } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role")
-    .eq("user_id", userId)
-    .limit(1)
-    .single();
-  if (error || !data) return null;
-  return data;
+  return getWorkspaceMembershipForUser({ userId, admin });
 }
 
 export async function GET() {

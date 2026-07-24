@@ -21,6 +21,16 @@ type UpdateStatus = {
   error?: string | null;
 };
 
+type HostedUiUpdateStatus = {
+  state: "idle" | "ready" | "reloading";
+  revision?: string | null;
+};
+
+type NativeNotificationStatus = {
+  supported: boolean;
+  permission: "default" | "denied" | "granted" | "unsupported";
+};
+
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const listener = (_event: IpcRendererEvent, payload: T) => cb(payload);
   ipcRenderer.on(channel, listener);
@@ -52,6 +62,23 @@ const api = {
   onUpdateStatus: (cb: (status: UpdateStatus) => void) =>
     subscribe<UpdateStatus>("groovy:update-status", cb),
   quitAndInstall: (): Promise<void> => ipcRenderer.invoke("groovy:quit-and-install"),
+  getUiUpdateStatus: (): Promise<HostedUiUpdateStatus> =>
+    ipcRenderer.invoke("groovy:get-ui-update-status"),
+  onUiUpdateStatus: (cb: (status: HostedUiUpdateStatus) => void) =>
+    subscribe<HostedUiUpdateStatus>("groovy:ui-update-status", cb),
+  reloadUi: (): Promise<void> => ipcRenderer.invoke("groovy:reload-ui"),
+  getNativeNotificationStatus: (): Promise<NativeNotificationStatus> =>
+    ipcRenderer.invoke("groovy:get-native-notification-status"),
+  showChatNotification: (payload: {
+    messageId: string;
+    channelId: string;
+    title: string;
+    body: string;
+    url: string;
+  }): Promise<{ shown: boolean; reason?: string }> =>
+    ipcRenderer.invoke("groovy:show-chat-notification", payload),
+  onSystemResume: (cb: () => void) =>
+    subscribe<Record<string, never>>("groovy:system-resumed", () => cb()),
   getSettings: (): Promise<{ keepRunningInBackground: boolean; appUrl?: string }> =>
     ipcRenderer.invoke("groovy:get-settings"),
   setSetting: (key: string, value: unknown): Promise<void> =>

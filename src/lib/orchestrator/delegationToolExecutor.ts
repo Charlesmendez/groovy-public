@@ -144,9 +144,23 @@ async function resolveSkillAssignmentDestination(
     return { ok: true, agentId: null, target: "flow", label: "the orchestrator" };
   }
   if (destination === "all_claude") {
+    if (Array.isArray(allowedAgentIds)) {
+      return {
+        ok: false,
+        error:
+          "This conversation has a restricted worker roster. Choose one selected worker instead of all Claude agents.",
+      };
+    }
     return { ok: true, agentId: null, target: "claude", label: "all Claude agents" };
   }
   if (destination === "all_codex") {
+    if (Array.isArray(allowedAgentIds)) {
+      return {
+        ok: false,
+        error:
+          "This conversation has a restricted worker roster. Choose one selected worker instead of all Codex agents.",
+      };
+    }
     return { ok: true, agentId: null, target: "codex", label: "all Codex agents" };
   }
   if (destination !== "worker") {
@@ -181,6 +195,16 @@ export async function executeAgentDelegationTool(
 ): Promise<ToolResult> {
   const userId = context.userId;
   const integrationOwnerUserId = context.integrationOwnerUserId || userId;
+  const allowedAgentIds = context.toolPolicy?.agentRoster;
+  const teamChatTaskScope = context.taskRequestedChannel?.startsWith(
+    "team_chat:",
+  )
+    ? context.taskRequestedChannel
+    : null;
+  const taskIsVisible = (task: AgentTaskRow): boolean =>
+    (!Array.isArray(allowedAgentIds) ||
+      allowedAgentIds.includes(task.agent_id)) &&
+    (!teamChatTaskScope || task.requested_channel === teamChatTaskScope);
   if (!userId) return fail(toolName, startTime, "Missing user context");
   const policyDenial = toolPolicyDenialReason(toolName, context.toolPolicy);
   if (policyDenial) return fail(toolName, startTime, policyDenial);
@@ -263,7 +287,21 @@ export async function executeAgentDelegationTool(
         const artifactId = typeof row.artifact_id === "string" ? row.artifact_id : "";
         if (!artifactId) continue;
         const agentId = typeof row.agent_id === "string" ? row.agent_id : null;
+        if (
+          agentId &&
+          Array.isArray(allowedAgentIds) &&
+          !allowedAgentIds.includes(agentId)
+        ) {
+          continue;
+        }
         const target = typeof row.target === "string" ? row.target : "";
+        if (
+          !agentId &&
+          Array.isArray(allowedAgentIds) &&
+          (target === "claude" || target === "codex")
+        ) {
+          continue;
+        }
         const label = agentId
           ? nameByAgentId.get(agentId) || `worker ${agentId.slice(0, 8)}`
           : target === "flow"
@@ -458,12 +496,20 @@ export async function executeAgentDelegationTool(
           : null;
       const planningSessionId = requestedPlanningSessionId || crypto.randomUUID();
       const admin = createSupabaseAdminClient();
-      const { data: existingConsultations } = await admin
+      let existingConsultationsQuery = admin
         .from("agent_tasks")
         .select("id,agent_id,result_text,result_meta,created_at")
         .eq("user_id", userId)
         .contains("result_meta", { planning_session_id: planningSessionId })
         .order("created_at", { ascending: true });
+      if (teamChatTaskScope) {
+        existingConsultationsQuery = existingConsultationsQuery.eq(
+          "requested_channel",
+          teamChatTaskScope,
+        );
+      }
+      const { data: existingConsultations } =
+        await existingConsultationsQuery;
       const prior = (existingConsultations || []) as Array<{
         id: string;
         agent_id: string;
@@ -622,17 +668,32 @@ export async function executeAgentDelegationTool(
       }
 
       const admin = createSupabaseAdminClient();
-      const { data: consultationRows, error: consultationError } = await admin
+      let consultationQuery = admin
         .from("agent_tasks")
         .select("*")
         .eq("user_id", userId)
         .contains("result_meta", { planning_session_id: planningSessionId })
         .order("created_at", { ascending: true });
+      if (teamChatTaskScope) {
+        consultationQuery = consultationQuery.eq(
+          "requested_channel",
+          teamChatTaskScope,
+        );
+      }
+      const { data: consultationRows, error: consultationError } =
+        await consultationQuery;
       if (consultationError || !consultationRows?.length) {
         return fail(toolName, startTime, "Planning session not found");
       }
 
       const consultations = consultationRows as AgentTaskRow[];
+      if (!consultations.every(taskIsVisible)) {
+        return fail(
+          toolName,
+          startTime,
+          "Planning session unavailable in this conversation.",
+        );
+      }
       const unfinished = consultations.find(
         (task) => task.status !== "done" || !task.result_text?.trim()
       );
@@ -708,7 +769,9 @@ export async function executeAgentDelegationTool(
       const taskId = typeof params.task_id === "string" ? params.task_id.trim() : "";
       if (taskId) {
         const task = await getAgentTask(userId, taskId);
-        if (!task) return fail(toolName, startTime, `No task ${taskId}`);
+        if (!task || !taskIsVisible(task)) {
+          return fail(toolName, startTime, "Task unavailable in this conversation.");
+        }
         return ok(toolName, startTime, taskSummary(task));
       }
 
@@ -731,6 +794,15 @@ export async function executeAgentDelegationTool(
         .order("created_at", { ascending: false })
         .limit(15);
       if (agentFilter) query = query.eq("agent_id", agentFilter);
+      if (Array.isArray(allowedAgentIds)) {
+        if (allowedAgentIds.length === 0) {
+          return ok(toolName, startTime, { agents: [], recentTasks: [] });
+        }
+        query = query.in("agent_id", allowedAgentIds);
+      }
+      if (teamChatTaskScope) {
+        query = query.eq("requested_channel", teamChatTaskScope);
+      }
       const { data: tasks } = await query;
 
       const nameById = new Map(roster.map((a) => [a.id, a.name]));
@@ -751,7 +823,9 @@ export async function executeAgentDelegationTool(
       const taskId = typeof params.task_id === "string" ? params.task_id.trim() : "";
       if (!taskId) return fail(toolName, startTime, "collect_result requires task_id");
       const task = await getAgentTask(userId, taskId);
-      if (!task) return fail(toolName, startTime, `No task ${taskId}`);
+      if (!task || !taskIsVisible(task)) {
+        return fail(toolName, startTime, "Task unavailable in this conversation.");
+      }
       return ok(toolName, startTime, {
         taskId: task.id,
         status: task.status,
@@ -763,10 +837,32 @@ export async function executeAgentDelegationTool(
     }
 
     if (toolName === "transfer_context") {
+      if (teamChatTaskScope) {
+        return fail(
+          toolName,
+          startTime,
+          "Cross-task context transfer is unavailable in Team Chat because it can contain information from another conversation.",
+        );
+      }
       const fromAgent = typeof params.from_agent === "string" ? params.from_agent.trim() : "";
       const toAgent = typeof params.to_agent === "string" ? params.to_agent.trim() : "";
       if (!fromAgent || !toAgent) {
         return fail(toolName, startTime, "transfer_context requires from_agent and to_agent");
+      }
+      const roster = filterAgentRoster(
+        await listWorkerAgents(userId),
+        allowedAgentIds,
+      );
+      const [resolvedFrom, resolvedTo] = await Promise.all([
+        resolveWorkerAgentByRef(userId, fromAgent, { roster }),
+        resolveWorkerAgentByRef(userId, toAgent, { roster }),
+      ]);
+      if (!resolvedFrom.ok || !resolvedTo.ok) {
+        return fail(
+          toolName,
+          startTime,
+          "Both workers must be selected for this conversation.",
+        );
       }
       const provider = context.apiKeys?.anthropic
         ? ("anthropic" as const)
@@ -775,8 +871,8 @@ export async function executeAgentDelegationTool(
           : ("anthropic" as const);
       const outcome = await transferContext({
         userId,
-        fromAgentRef: fromAgent,
-        toAgentRef: toAgent,
+        fromAgentRef: resolvedFrom.agent.id,
+        toAgentRef: resolvedTo.agent.id,
         instructions: typeof params.instructions === "string" ? params.instructions : null,
         provider,
         apiKey: provider === "anthropic" ? context.apiKeys?.anthropic : context.apiKeys?.openai,
@@ -792,6 +888,13 @@ export async function executeAgentDelegationTool(
     }
 
     if (toolName === "usage_report") {
+      if (Array.isArray(allowedAgentIds)) {
+        return fail(
+          toolName,
+          startTime,
+          "Workspace-wide agent usage is unavailable from a restricted conversation.",
+        );
+      }
       const { buildAgentUsageReport } = await import("@/lib/billing/agentUsageReport");
       const days = Number.isFinite(Number(params.days)) ? Number(params.days) : 30;
       const report = await buildAgentUsageReport({ userId, days });

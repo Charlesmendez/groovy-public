@@ -35,6 +35,7 @@ import {
   workerPromptLabel,
   type WorkerAgentRosterEntry,
 } from "@/lib/agents/types";
+import { sendTeamChatPush } from "@/lib/notifications/webPush";
 
 // Device considered online when the connector heartbeat is this recent.
 const DEVICE_ONLINE_THRESHOLD_MS = 3 * 60 * 1000;
@@ -93,6 +94,46 @@ export type AgentTaskRow = {
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function teamChatChannelId(requestedChannel: string | null | undefined) {
+  const prefix = "team_chat:";
+  if (!requestedChannel?.startsWith(prefix)) return null;
+  return requestedChannel.slice(prefix.length).trim();
+}
+
+async function assertTeamChatAgentMembership(
+  admin: SupabaseClient,
+  args: {
+    requestedChannel: string | null | undefined;
+    agentId: string;
+  },
+): Promise<void> {
+  const channelId = teamChatChannelId(args.requestedChannel);
+  if (channelId === null) return;
+  if (!channelId) {
+    throw new Error(
+      "Agent task denied: the Team Chat channel scope is invalid.",
+    );
+  }
+  const { data: channelMembership, error: channelMembershipError } =
+    await admin
+      .from("chat_channel_members")
+      .select("id")
+      .eq("channel_id", channelId)
+      .eq("member_type", "agent")
+      .eq("agent_id", args.agentId)
+      .maybeSingle();
+  if (channelMembershipError) {
+    throw new Error(
+      `Agent task denied: channel roster verification failed (${channelMembershipError.message}).`,
+    );
+  }
+  if (!channelMembership) {
+    throw new Error(
+      "Agent task denied: this agent is not selected for the Team Chat channel.",
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +300,10 @@ export async function createAgentTask(args: {
   turnId?: string | null;
 }): Promise<AgentTaskRow> {
   const admin = createSupabaseAdminClient();
+  await assertTeamChatAgentMembership(admin, {
+    requestedChannel: args.requestedChannel,
+    agentId: args.agentId,
+  });
   const status: AgentTaskStatus = args.requireApproval ? "awaiting_approval" : "queued";
   const { data, error } = await admin
     .from("agent_tasks")
@@ -726,6 +771,18 @@ export async function runAgentTask(args: {
       consumedTransferIds,
     });
 
+  try {
+    // A worker may have been removed while its task was waiting in the queue.
+    // Revalidate at execution time so stale queued work cannot outlive the
+    // channel authorization that created it.
+    await assertTeamChatAgentMembership(admin, {
+      requestedChannel: task.requested_channel,
+      agentId: task.agent_id,
+    });
+  } catch {
+    return fail("team_chat_agent_not_selected");
+  }
+
   // Load worker config for device routing.
   const { data: config } = await admin
     .from("claude_code_agent_configs")
@@ -1130,23 +1187,41 @@ async function appendTaskEventToTeamChat(
       ? `${unbounded.slice(0, 39_980)}\n...[truncated]`
       : unbounded;
 
-  const { error } = await admin.from("chat_messages").insert({
-    channel_id: channelId,
-    author_type: "agent",
-    author_agent_id: task.agent_id,
-    content,
-    metadata: {
-      kind: "agent_task_result",
-      task_id: task.id,
-      status,
-      agent_name: agentName,
-      title: task.title || "Task",
-      trace_id: task.trace_id,
-      diff_count:
-        (task.result_meta as { diffCount?: number } | null)?.diffCount || 0,
-    },
-  });
+  const { data: message, error } = await admin
+    .from("chat_messages")
+    .insert({
+      channel_id: channelId,
+      author_type: "agent",
+      author_agent_id: task.agent_id,
+      content,
+      metadata: {
+        kind: "agent_task_result",
+        task_id: task.id,
+        status,
+        agent_name: agentName,
+        title: task.title || "Task",
+        trace_id: task.trace_id,
+        diff_count:
+          (task.result_meta as { diffCount?: number } | null)?.diffCount || 0,
+      },
+    })
+    .select("id")
+    .single();
   if (error) throw new Error(error.message);
+  await sendTeamChatPush({
+    admin,
+    channelId,
+    messageId: String(message.id),
+    authorType: "agent",
+    authorLabel: agentName,
+    content,
+  }).catch((cause) => {
+    console.warn("[team-chat] agent completion push delivery failed", {
+      channelId,
+      taskId: task.id,
+      error: cause instanceof Error ? cause.message : "Unknown push error",
+    });
+  });
 }
 
 /**

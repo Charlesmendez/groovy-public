@@ -2,6 +2,18 @@ import Link from "next/link";
 
 const sections = [
   {
+    href: "/settings/channels",
+    title: "Channels",
+    description:
+      "Set each channel’s Mind, operating brief, attention mode, participants, privacy, skills, and instruction docs.",
+  },
+  {
+    href: "/settings/notifications",
+    title: "Notifications",
+    description:
+      "Connect each browser or Home Screen app, then choose alerts per channel and direct message.",
+  },
+  {
     href: "/settings/minds",
     title: "Minds",
     description:

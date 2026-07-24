@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Lock } from "lucide-react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 
 type WorkspaceMember = {
@@ -37,6 +38,10 @@ export function TeamAccessSettings() {
   const [channelIds, setChannelIds] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{
+    tone: "success" | "warning";
+    message: string;
+  } | null>(null);
   const [createdUrl, setCreatedUrl] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -106,20 +111,22 @@ export function TeamAccessSettings() {
   );
 
   const sendInvite = async () => {
-    if (!email.trim()) return;
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) return;
     if (inviteRole === "guest" && channelIds.length === 0) {
       setError("Choose at least one channel for a channel guest.");
       return;
     }
     setBusy(true);
     setError(null);
+    setNotice(null);
     setCreatedUrl(null);
     try {
       const res = await fetch("/api/workspaces/invites", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          email: email.trim(),
+          email: normalizedEmail,
           role: inviteRole,
           channelIds,
         }),
@@ -131,6 +138,17 @@ export function TeamAccessSettings() {
       setCreatedUrl(
         typeof payload.inviteUrl === "string" ? payload.inviteUrl : null,
       );
+      setNotice({
+        tone: payload.emailSent === true ? "success" : "warning",
+        message:
+          payload.emailSent === true
+            ? `Invitation email sent to ${normalizedEmail}.`
+            : `Invitation created, but email delivery failed${
+                typeof payload.emailError === "string" && payload.emailError
+                  ? `: ${payload.emailError}`
+                  : "."
+              }`,
+      });
       setEmail("");
       setChannelIds([]);
       await load();
@@ -161,6 +179,8 @@ export function TeamAccessSettings() {
 
   const cancelInvite = async (inviteId: string) => {
     setBusy(true);
+    setError(null);
+    setNotice(null);
     const res = await fetch("/api/workspaces/invites", {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
@@ -170,6 +190,36 @@ export function TeamAccessSettings() {
     if (!res.ok) setError(payload.error || "Could not cancel invitation");
     await load().catch(() => undefined);
     setBusy(false);
+  };
+
+  const resendInvite = async (invite: Invite) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/workspaces/invites", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ inviteId: invite.id }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || "Could not resend invitation");
+      }
+      setNotice({
+        tone: "success",
+        message: `Invitation email sent again to ${invite.email}.`,
+      });
+      await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not resend invitation",
+      );
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -185,6 +235,17 @@ export function TeamAccessSettings() {
       {error ? (
         <div className="mt-5 rounded-xl border border-red-400/30 bg-red-400/10 p-3 text-sm text-red-200">
           {error}
+        </div>
+      ) : null}
+      {notice ? (
+        <div
+          className={`mt-5 rounded-xl border p-3 text-sm ${
+            notice.tone === "success"
+              ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-100"
+              : "border-amber-400/30 bg-amber-400/10 text-amber-100"
+          }`}
+        >
+          {notice.message}
         </div>
       ) : null}
 
@@ -234,7 +295,15 @@ export function TeamAccessSettings() {
                       )
                     }
                   />
-                  <span className="truncate">#{channel.name}</span>
+                  {channel.visibility === "private" ? (
+                    <Lock
+                      className="h-3.5 w-3.5 shrink-0 text-zinc-500"
+                      aria-label="Private channel"
+                    />
+                  ) : (
+                    <span className="shrink-0 text-zinc-600">#</span>
+                  )}
+                  <span className="truncate">{channel.name}</span>
                   <span className="ml-auto text-[9px] text-zinc-600">
                     {channel.visibility}
                   </span>
@@ -346,14 +415,24 @@ export function TeamAccessSettings() {
                     </div>
                   </div>
                   {role === "admin" ? (
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void cancelInvite(invite.id)}
-                      className="text-xs text-red-300/80"
-                    >
-                      Cancel
-                    </button>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void resendInvite(invite)}
+                        className="text-xs text-cyan-300 disabled:opacity-40"
+                      >
+                        Resend email
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void cancelInvite(invite.id)}
+                        className="text-xs text-red-300/80 disabled:opacity-40"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   ) : null}
                 </div>
               </div>

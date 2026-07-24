@@ -7,6 +7,11 @@ export type LicenseAccessStatus = {
   hasAccess: boolean;
   accessStatus: "licensed" | "trial" | "trial_available" | "expired";
   requiresPurchase?: boolean;
+  workspaceId?: string | null;
+  workspaceName?: string | null;
+  sponsored?: boolean;
+  workspaceOwnerRequired?: boolean;
+  joinedWorkspace?: boolean;
   trial?: {
     status: "not_started" | "active" | "expired";
     eligible: boolean;

@@ -29,10 +29,13 @@ Do not copy real secret values into documentation. Use placeholders and ask the 
 - `GROOVY_LICENSE_PUBLIC_KEY_PEM` or `NEXT_PUBLIC_GROOVY_LICENSE_PUBLIC_KEY_PEM`
 - `GROOVY_ADMIN_EMAILS`
 - `ENTERPRISE_SALES_EMAIL` (defaults to `sales@gogroovy.ai`)
-- `RESEND_API_KEY` and `ENTERPRISE_SALES_FROM` if direct sales email delivery uses Resend
-- `SENDGRID_API_KEY` and `SENDGRID_FROM_EMAIL` can also deliver enterprise sales email when Resend is not configured
+- `RESEND_API_KEY` for workspace invitations, account-link confirmations, and enterprise lead notifications
+- `RESEND_FROM_EMAIL` (optional; defaults to `Groovy <notifications@hi.gogroovy.ai>`)
+- `ENTERPRISE_SALES_FROM` (optional; defaults to `Groovy Sales <sales@hi.gogroovy.ai>`)
 - `DATAGRAN_API_KEY` when Groovy Memory or Datagran-backed Data Integrations are enabled
 - `DATAGRAN_CHAT_MODEL` when Groovy Memory is enabled
+- `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, and
+  `WEB_PUSH_CONTACT` when browser/Home Screen notifications are enabled
 
 ## Model Provider Keys
 

@@ -6,6 +6,7 @@ import {
   isWorkspaceOperatorRole,
   type WorkspaceInfo,
 } from "@/lib/workspaces";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 type AuthedContext = {
   userId: string;
@@ -156,13 +157,10 @@ async function getWorkspaceForUserId(
   admin: ReturnType<typeof createSupabaseAdminClient>,
   userId: string
 ): Promise<WorkspaceInfo> {
-  const { data: memberships, error: memberErr } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role")
-    .eq("user_id", userId)
-    .limit(1);
-  if (memberErr) throw new Error(memberErr.message);
-  const membership = memberships?.[0];
+  const membership = await getWorkspaceMembershipForUser({
+    userId,
+    admin,
+  });
   if (!membership?.workspace_id) throw new Error("Workspace not found");
 
   const { data: workspace, error: wsErr } = await admin

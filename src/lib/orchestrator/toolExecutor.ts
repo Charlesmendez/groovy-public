@@ -21,6 +21,11 @@ import { buildInternalRouteAuthHeaders } from "@/lib/internalRouteAuth";
 import { getAppUrl } from "@/lib/config/appConfig";
 import { inferScheduledWhatsAppDeliveryIntent } from "@/lib/scheduler/delivery";
 import { inferProviderForModelId } from "@/lib/ai/modelCatalog";
+import {
+  channelScheduleSummary,
+  parseTeamChatChannelId,
+  publicChannelSchedule,
+} from "@/lib/chat/channelSchedules";
 import { ensureOrchestratorRuntimeAgentId } from "./runtimeAgents";
 import { startParallelBranchRuntime } from "./parallelBranchRuntime";
 import {
@@ -1564,6 +1569,38 @@ async function executeScheduleTool(
 
   const supabase = context.supabase;
   const userId = context.userId;
+  const teamChatChannelId = parseTeamChatChannelId(
+    context.taskRequestedChannel,
+  );
+  const channelSafeJob = (job: unknown): unknown => {
+    if (!job || typeof job !== "object" || Array.isArray(job)) return job;
+    const value = job as Record<string, unknown>;
+    return {
+      id: typeof value.id === "string" ? value.id : null,
+      name:
+        typeof value.name === "string"
+          ? value.name.replace(/\s+/g, " ").trim().slice(0, 120)
+          : "Scheduled task",
+      kind: value.kind === "shell" ? "shell" : "orchestrator",
+      summary: channelScheduleSummary({
+        kind: value.kind,
+        task: value.task,
+      }),
+      schedule: publicChannelSchedule(value.schedule),
+      enabled: value.enabled === true,
+      skip_next_run: value.skip_next_run === true,
+      last_run_at:
+        typeof value.last_run_at === "string" ? value.last_run_at : null,
+      last_status:
+        value.last_status === "success" ||
+        value.last_status === "error" ||
+        value.last_status === "skipped"
+          ? value.last_status
+          : null,
+      updated_at:
+        typeof value.updated_at === "string" ? value.updated_at : null,
+    };
+  };
 
   const resolveScheduleDeviceId = async (): Promise<string | null> => {
     // Prefer explicit request context first.
@@ -1833,62 +1870,80 @@ async function executeScheduleTool(
         targetAgentId = resolvedWorker.agent.id;
       }
 
-      const { data, error } = await supabase
+      const insertPayload: Record<string, unknown> = {
+        user_id: userId,
+        device_id: deviceId,
+        agent_id: resolvedAgentId,
+        target_agent_id: targetAgentId,
+        name: name || "Scheduled task",
+        kind,
+        command: kind === "shell" ? command : null,
+        cwd,
+        task:
+          kind === "orchestrator"
+            ? {
+                message: taskMessage,
+                orchestrator_agent_id: resolvedAgentId,
+                ...(explicitSessionId
+                  ? {
+                      orchestrator_session_id: explicitSessionId,
+                    }
+                  : {}),
+                ...(requiresWhatsAppDelivery || scheduledModel
+                  ? {
+                      options: {
+                        ...(requiresWhatsAppDelivery
+                          ? { requires_whatsapp_delivery: true }
+                          : {}),
+                        ...(requiresWhatsAppDelivery && scheduledWhatsAppRecipientQuery
+                          ? {
+                              whatsapp_recipient_query: scheduledWhatsAppRecipientQuery,
+                            }
+                          : {}),
+                        ...(scheduledModel
+                          ? {
+                              model_name: scheduledModel,
+                              model_provider: scheduledProvider,
+                              ...(scheduledReasoningEffort
+                                ? { reasoning_effort: scheduledReasoningEffort }
+                                : {}),
+                            }
+                          : {}),
+                      },
+                    }
+                  : {}),
+              }
+            : null,
+        session_id: explicitSessionId,
+        ...(teamChatChannelId ? { channel_id: teamChatChannelId } : {}),
+        // A schedule created from a custom Mind stays bound to that exact
+        // profile. Worker-targeted jobs use the worker's own harness instead.
+        profile_id:
+          kind === "orchestrator" && !targetAgentId
+            ? context.harnessProfile?.id || null
+            : null,
+        schedule,
+      };
+      let insertResult = await supabase
         .from("scheduled_jobs")
-        .insert({
-          user_id: userId,
-          device_id: deviceId,
-          agent_id: resolvedAgentId,
-          target_agent_id: targetAgentId,
-          name: name || "Scheduled task",
-          kind,
-          command: kind === "shell" ? command : null,
-          cwd,
-          task:
-            kind === "orchestrator"
-              ? {
-                  message: taskMessage,
-                  orchestrator_agent_id: resolvedAgentId,
-                  ...(explicitSessionId
-                    ? {
-                        orchestrator_session_id: explicitSessionId,
-                      }
-                    : {}),
-                  ...(requiresWhatsAppDelivery || scheduledModel
-                    ? {
-                        options: {
-                          ...(requiresWhatsAppDelivery
-                            ? { requires_whatsapp_delivery: true }
-                            : {}),
-                          ...(requiresWhatsAppDelivery && scheduledWhatsAppRecipientQuery
-                            ? {
-                                whatsapp_recipient_query: scheduledWhatsAppRecipientQuery,
-                              }
-                            : {}),
-                          ...(scheduledModel
-                            ? {
-                                model_name: scheduledModel,
-                                model_provider: scheduledProvider,
-                                ...(scheduledReasoningEffort
-                                  ? { reasoning_effort: scheduledReasoningEffort }
-                                  : {}),
-                              }
-                            : {}),
-                        },
-                      }
-                    : {}),
-                }
-              : null,
-          // A schedule created from a custom Mind stays bound to that exact
-          // profile. Worker-targeted jobs use the worker's own harness instead.
-          profile_id:
-            kind === "orchestrator" && !targetAgentId
-              ? context.harnessProfile?.id || null
-              : null,
-          schedule,
-        })
+        .insert(insertPayload)
         .select("*")
         .single();
+      // Keep channel message delivery backward-compatible during the additive
+      // migration rollout. The migration backfills this row through session_id.
+      if (
+        teamChatChannelId &&
+        insertResult.error &&
+        /channel_id|schema cache/i.test(insertResult.error.message || "")
+      ) {
+        delete insertPayload.channel_id;
+        insertResult = await supabase
+          .from("scheduled_jobs")
+          .insert(insertPayload)
+          .select("*")
+          .single();
+      }
+      const { data, error } = insertResult;
 
       if (error) {
         const msg = error.message || "Failed to create schedule";
@@ -1935,7 +1990,10 @@ async function executeScheduleTool(
 
       return {
         success: true,
-        result: { ok: true, job: data },
+        result: {
+          ok: true,
+          job: teamChatChannelId ? channelSafeJob(data) : data,
+        },
         agent: "schedule",
         toolName,
         executionTime: Date.now() - startTime,
@@ -1954,10 +2012,17 @@ async function executeScheduleTool(
 
       let q = supabase
         .from("scheduled_jobs")
-        .select("*")
+        .select(
+          teamChatChannelId
+            ? "id,name,kind,task,schedule,enabled,skip_next_run,last_run_at,last_status,updated_at"
+            : "*",
+        )
         .eq("user_id", userId)
         .order("updated_at", { ascending: false })
         .limit(200);
+      // Team Chat is a shared surface. Never expose the schedule owner's
+      // unrelated personal jobs to channel participants.
+      if (teamChatChannelId) q = q.eq("channel_id", teamChatChannelId);
       if (deviceFilter) q = q.eq("device_id", deviceFilter);
       if (agentFilter) q = q.eq("agent_id", agentFilter);
 
@@ -1974,7 +2039,12 @@ async function executeScheduleTool(
 
       return {
         success: true,
-        result: { ok: true, jobs: data || [] },
+        result: {
+          ok: true,
+          jobs: teamChatChannelId
+            ? (data || []).map((job) => channelSafeJob(job))
+            : data || [],
+        },
         agent: "schedule",
         toolName,
         executionTime: Date.now() - startTime,
@@ -1993,11 +2063,12 @@ async function executeScheduleTool(
     }
 
     if (toolName === "schedule_pause") {
-      const q = supabase
+      let q = supabase
         .from("scheduled_jobs")
         .update({ enabled: false, updated_at: new Date().toISOString() })
         .eq("id", jobId)
         .eq("user_id", userId);
+      if (teamChatChannelId) q = q.eq("channel_id", teamChatChannelId);
       const { data, error } = await q.select("*").single();
       if (error) {
         return {
@@ -2010,7 +2081,10 @@ async function executeScheduleTool(
       }
       return {
         success: true,
-        result: { ok: true, job: data },
+        result: {
+          ok: true,
+          job: teamChatChannelId ? channelSafeJob(data) : data,
+        },
         agent: "schedule",
         toolName,
         executionTime: Date.now() - startTime,
@@ -2018,11 +2092,12 @@ async function executeScheduleTool(
     }
 
     if (toolName === "schedule_resume") {
-      const q = supabase
+      let q = supabase
         .from("scheduled_jobs")
         .update({ enabled: true, updated_at: new Date().toISOString() })
         .eq("id", jobId)
         .eq("user_id", userId);
+      if (teamChatChannelId) q = q.eq("channel_id", teamChatChannelId);
       const { data, error } = await q.select("*").single();
       if (error) {
         return {
@@ -2035,7 +2110,10 @@ async function executeScheduleTool(
       }
       return {
         success: true,
-        result: { ok: true, job: data },
+        result: {
+          ok: true,
+          job: teamChatChannelId ? channelSafeJob(data) : data,
+        },
         agent: "schedule",
         toolName,
         executionTime: Date.now() - startTime,
@@ -2043,11 +2121,12 @@ async function executeScheduleTool(
     }
 
     if (toolName === "schedule_cancel_next") {
-      const q = supabase
+      let q = supabase
         .from("scheduled_jobs")
         .update({ skip_next_run: true, updated_at: new Date().toISOString() })
         .eq("id", jobId)
         .eq("user_id", userId);
+      if (teamChatChannelId) q = q.eq("channel_id", teamChatChannelId);
       const { data, error } = await q.select("*").single();
       if (error) {
         return {
@@ -2060,7 +2139,10 @@ async function executeScheduleTool(
       }
       return {
         success: true,
-        result: { ok: true, job: data },
+        result: {
+          ok: true,
+          job: teamChatChannelId ? channelSafeJob(data) : data,
+        },
         agent: "schedule",
         toolName,
         executionTime: Date.now() - startTime,
@@ -2068,11 +2150,12 @@ async function executeScheduleTool(
     }
 
     if (toolName === "schedule_delete") {
-      const q = supabase
+      let q = supabase
         .from("scheduled_jobs")
         .delete()
         .eq("id", jobId)
         .eq("user_id", userId);
+      if (teamChatChannelId) q = q.eq("channel_id", teamChatChannelId);
       const { data, error } = await q.select("id").maybeSingle();
       if (error) {
         return {

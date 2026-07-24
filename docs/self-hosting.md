@@ -43,6 +43,17 @@ the cron declared in `vercel.json`.
 `GROOVY_APP_URL` and `GROOVY_RELAY_URL` must be browser-reachable URLs. Use
 HTTPS/WSS behind a reverse proxy outside local development.
 
+To enable browser and installed Home Screen notifications, generate one VAPID
+pair for this deployment and keep the private half server-side:
+
+```bash
+npx web-push generate-vapid-keys --json
+```
+
+Set `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, and a
+`WEB_PUSH_CONTACT` value such as `mailto:notifications@example.com`. Push
+requires a secure HTTPS origin outside localhost.
+
 Do not configure Stripe for self-hosting. Compose sets
 `GROOVY_EDITION=self-hosted`, which switches off hosted checkout, metering,
 and online license-row checks. This is a deployment-mode switch, not a grant
@@ -115,7 +126,8 @@ when enabled:
 ## Operations and security
 
 - Back up the Supabase database and private Storage buckets.
-- Keep the service-role key and all four application secrets server-side.
+- Keep the service-role key, VAPID private key, and all four application
+  secrets server-side.
 - Rotate a compromised harness API key from the Harness editor; raw keys are
   shown only once and only hashes are stored.
 - Put web and relay behind TLS before exposing them to the internet.

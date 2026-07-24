@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import { getAuthedUser } from "@/lib/workspaces";
 import { createKapsoCustomer, createKapsoSetupLink } from "@/lib/whatsapp/kapso";
 import { logError, logInfo, logWarn } from "@/lib/observability/log";
@@ -22,13 +23,11 @@ export async function GET() {
   try {
     const user = await getAuthedUser();
     const admin = createSupabaseAdminClient();
-    const { data: membership, error: memberErr } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-    if (memberErr || !membership) {
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
       logWarn("kapso.company_whatsapp.get.no_workspace", { user_id: user.id });
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }
@@ -84,13 +83,11 @@ export async function POST(req: Request) {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as Body | null;
     const admin = createSupabaseAdminClient();
-    const { data: membership, error: memberErr } = await admin
-      .from("workspace_members")
-      .select("workspace_id, role")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
-    if (memberErr || !membership) {
+    const membership = await getWorkspaceMembershipForUser({
+      userId: user.id,
+      admin,
+    });
+    if (!membership) {
       logWarn("kapso.company_whatsapp.post.no_workspace", { user_id: user.id });
       return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
     }

@@ -10,12 +10,12 @@
  *   detect the shell (src/lib/desktop/shell.ts).
  */
 
-import { app, BrowserWindow, net, Notification, session, shell } from "electron";
+import { app, BrowserWindow, session, shell } from "electron";
 import * as path from "path";
+import type { HostedUiUpdater } from "./hostedUiUpdater";
 import { configuredAppUrl } from "./runtimeConfig";
 
 const PARTITION = "persist:groovy";
-const UI_VERSION_CHECK_INTERVAL_MS = 2 * 60 * 1000;
 
 export function appUrl(): string {
   return configuredAppUrl();
@@ -25,7 +25,7 @@ export function appOrigin(): string {
   return new URL(appUrl()).origin;
 }
 
-export function createMainWindow(): BrowserWindow {
+export function createMainWindow(hostedUiUpdater: HostedUiUpdater): BrowserWindow {
   const ses = session.fromPartition(PARTITION);
   const userAgent = `${ses.getUserAgent()} GroovyDesktop/${app.getVersion()}`;
   ses.setUserAgent(userAgent);
@@ -46,6 +46,10 @@ export function createMainWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // The hidden tray window owns the authenticated Realtime connection
+      // used for native chat alerts. Keep it responsive while not visible so
+      // notifications are not delayed until the window is reopened.
+      backgroundThrottling: false,
       additionalArguments: [`--groovy-app-version=${app.getVersion()}`],
     },
   });
@@ -53,60 +57,7 @@ export function createMainWindow(): BrowserWindow {
   win.once("ready-to-show", () => win.show());
 
   const origin = appOrigin();
-  let deployedRevision: string | null = null;
-  let notifiedRevision: string | null = null;
-  let versionCheckInFlight = false;
-
-  const reloadLatestUi = () => {
-    if (!win.isDestroyed()) win.webContents.reloadIgnoringCache();
-  };
-
-  const checkForUiUpdate = async () => {
-    if (win.isDestroyed() || versionCheckInFlight) return;
-    versionCheckInFlight = true;
-    try {
-      const response = await net.fetch(`${origin}/api/app-version`, {
-        cache: "no-store",
-        headers: { "Cache-Control": "no-cache" },
-      });
-      if (!response.ok) return;
-      const payload = (await response.json()) as { revision?: unknown };
-      const revision = typeof payload.revision === "string" ? payload.revision.trim() : "";
-      if (!revision || revision === "local") return;
-      if (!deployedRevision) {
-        deployedRevision = revision;
-        return;
-      }
-      if (revision === deployedRevision) return;
-      deployedRevision = revision;
-
-      // Refresh silently when the window is in the background. Never replace
-      // an active UI while the user may be typing or reviewing agent output.
-      if (!win.isVisible() || !win.isFocused()) {
-        reloadLatestUi();
-        return;
-      }
-
-      if (!Notification.isSupported() || notifiedRevision === revision) return;
-      notifiedRevision = revision;
-      const notification = new Notification({
-        title: "Groovy UI update ready",
-        body: "A new Groovy interface is available. Click to refresh now.",
-      });
-      notification.on("click", reloadLatestUi);
-      notification.show();
-    } catch {
-      // Hosted UI checks are best-effort; native and connector updates continue independently.
-    } finally {
-      versionCheckInFlight = false;
-    }
-  };
-
-  const uiVersionTimer = setInterval(() => void checkForUiUpdate(), UI_VERSION_CHECK_INTERVAL_MS);
-  uiVersionTimer.unref();
-  win.webContents.on("did-finish-load", () => void checkForUiUpdate());
-  win.on("focus", () => void checkForUiUpdate());
-  win.on("closed", () => clearInterval(uiVersionTimer));
+  hostedUiUpdater.attach(win, origin);
 
   // Open non-app origins in the default browser.
   win.webContents.setWindowOpenHandler(({ url }) => {

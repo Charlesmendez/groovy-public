@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import {
   getOrCreateRuntimeSessionForAgent,
   resolveRuntimeScope,
@@ -111,12 +113,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Agent not found" }, { status: 404 });
   }
 
-  const { data: membership } = await supabase
-    .from("workspace_members")
-    .select("workspace_id")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
+  const membership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin: createSupabaseAdminClient(),
+  });
   if (!membership?.workspace_id) {
     return NextResponse.json({ error: "Workspace not found" }, { status: 404 });
   }

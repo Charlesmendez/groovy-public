@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { estimateTokensFromCostUsd } from "@/lib/billing/usage";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -315,14 +316,11 @@ export async function GET(req: Request) {
   const admin = createSupabaseAdminClient();
 
   // Resolve workspace + admin check
-  const { data: membership, error: mErr } = await admin
-    .from("workspace_members")
-    .select("workspace_id, role")
-    .eq("user_id", user.id)
-    .limit(1)
-    .single();
-
-  if (mErr || !membership) {
+  const membership = await getWorkspaceMembershipForUser({
+    userId: user.id,
+    admin,
+  });
+  if (!membership) {
     return NextResponse.json({ error: "No workspace found" }, { status: 404 });
   }
   if (membership.role !== "admin") {
