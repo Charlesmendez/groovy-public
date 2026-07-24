@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getAuthedUser } from "@/lib/workspaces";
 import { getConfiguredAppUrl } from "@/lib/config/appConfig";
+import { normalizeWorkspaceInviteEmail } from "@/lib/workspaceInvites";
 
 function safeOrigin() {
   const o = getConfiguredAppUrl() || "";
@@ -143,7 +144,8 @@ export async function POST(req: Request) {
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as InviteBody | null;
-    if (!body || typeof body.email !== "string" || !body.email.trim()) {
+    const inviteEmail = normalizeWorkspaceInviteEmail(body?.email);
+    if (!body || !inviteEmail) {
       return NextResponse.json({ error: "Invalid email" }, { status: 400 });
     }
     const role = body.role === "guest" ? "guest" : "member";
@@ -211,7 +213,7 @@ export async function POST(req: Request) {
       .from("workspace_invites")
       .insert({
         workspace_id: membership.workspace_id,
-        email: body.email.trim().toLowerCase(),
+        email: inviteEmail,
         token,
         role,
         expires_at: expiresAt,

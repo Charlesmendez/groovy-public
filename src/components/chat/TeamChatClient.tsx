@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { AppNav } from "@/components/AppNav";
 import { ChannelAccessModal } from "@/components/chat/ChannelAccessModal";
+import { PeopleInviteModal } from "@/components/chat/PeopleInviteModal";
 
 type Channel = {
   id: string;
@@ -138,6 +139,7 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   const [controlBusy, setControlBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [accessOpen, setAccessOpen] = useState(false);
+  const [peopleInviteOpen, setPeopleInviteOpen] = useState(false);
   const [roomSheetOpen, setRoomSheetOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const channelNameRef = useRef<HTMLInputElement>(null);
@@ -766,22 +768,46 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                 <span className="truncate">{channel.name}</span>
               </button>
             ))}
+          <div className="flex items-center justify-between px-2 pb-1 pt-5 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
+            <span>People</span>
+            {workspaceRole === "admin" ? (
+              <button
+                type="button"
+                onClick={() => setPeopleInviteOpen(true)}
+                className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
+                aria-label="Invite people"
+                title="Invite people"
+              >
+                +
+              </button>
+            ) : null}
+          </div>
           {workspaceRole !== "guest"
             ? people
                 .filter((person) => person.user_id !== currentUserId)
                 .map((person) => (
-              <button
-                key={person.user_id}
-                onClick={() => void openPersonDm(person)}
-                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-white"
-              >
-                <span className="text-[var(--accent-green)]">●</span>
-                <span className="truncate">
-                  {person.email?.split("@")[0] || "Teammate"}
-                </span>
-              </button>
+                  <button
+                    key={person.user_id}
+                    onClick={() => void openPersonDm(person)}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-white"
+                  >
+                    <span className="text-[var(--accent-green)]">●</span>
+                    <span className="min-w-0 flex-1 truncate">
+                      {person.email?.split("@")[0] || "Teammate"}
+                    </span>
+                    <span className="text-[9px] uppercase tracking-wider text-zinc-600">
+                      {person.role === "guest" ? "guest" : person.role}
+                    </span>
+                  </button>
                 ))
             : null}
+          {workspaceRole !== "guest" &&
+          people.filter((person) => person.user_id !== currentUserId).length ===
+            0 ? (
+            <p className="px-3 py-2 text-xs text-zinc-600">
+              No teammates yet.
+            </p>
+          ) : null}
           <div className="px-2 pb-1 pt-5 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
             Agents
           </div>
@@ -1243,6 +1269,18 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
           onChanged={async () => {
             await loadSidebar();
           }}
+        />
+      ) : null}
+      {peopleInviteOpen && workspaceRole === "admin" ? (
+        <PeopleInviteModal
+          channels={channels
+            .filter((channel) => channel.kind === "channel")
+            .map((channel) => ({
+              id: channel.id,
+              name: channel.name,
+              visibility: channel.visibility,
+            }))}
+          onClose={() => setPeopleInviteOpen(false)}
         />
       ) : null}
     </div>
