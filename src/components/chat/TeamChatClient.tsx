@@ -1,7 +1,15 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { ChevronDown, Search, X } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { AppNav } from "@/components/AppNav";
 import { ChannelAccessModal } from "@/components/chat/ChannelAccessModal";
@@ -89,6 +97,47 @@ type ActiveWork = {
   agents: ActiveAgentTask[];
 };
 
+type SidebarSection = "channels" | "direct" | "people" | "agents";
+
+function SidebarSectionHeader({
+  action,
+  collapsed,
+  controls,
+  count,
+  label,
+  onToggle,
+}: {
+  action?: ReactNode;
+  collapsed: boolean;
+  controls: string;
+  count: number;
+  label: string;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 px-2 pb-1 pt-4 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-1 text-left hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/30"
+        aria-expanded={!collapsed}
+        aria-controls={controls}
+      >
+        <ChevronDown
+          className={`h-3 w-3 shrink-0 transition-transform ${
+            collapsed ? "-rotate-90" : ""
+          }`}
+        />
+        <span className="truncate">{label}</span>
+        <span className="rounded-full bg-white/[0.05] px-1.5 py-0.5 text-[9px] tabular-nums text-zinc-500">
+          {count}
+        </span>
+      </button>
+      {action}
+    </div>
+  );
+}
+
 function mergeMessages(current: Message[], incoming: Message[]): Message[] {
   const byId = new Map(current.map((message) => [message.id, message]));
   for (const message of incoming) byId.set(message.id, message);
@@ -109,6 +158,16 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   const [workspaceName, setWorkspaceName] = useState("Workspace");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
+  const [sidebarQuery, setSidebarQuery] = useState("");
+  const [collapsedSections, setCollapsedSections] = useState<
+    Record<SidebarSection, boolean>
+  >({
+    channels: false,
+    direct: false,
+    people: false,
+    agents: false,
+  });
   const [channelComposerOpen, setChannelComposerOpen] = useState(false);
   const [newChannelName, setNewChannelName] = useState("");
   const [newChannelVisibility, setNewChannelVisibility] = useState<
@@ -143,6 +202,8 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
   const [peopleInviteOpen, setPeopleInviteOpen] = useState(false);
   const [roomSheetOpen, setRoomSheetOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const sidebarScrollRef = useRef<HTMLDivElement>(null);
+  const sidebarSearchRef = useRef<HTMLInputElement>(null);
   const channelNameRef = useRef<HTMLInputElement>(null);
 
   const loadSidebar = useCallback(async () => {
@@ -257,8 +318,38 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
 
   useEffect(() => {
     if (!channelComposerOpen) return;
-    channelNameRef.current?.focus();
-  }, [channelComposerOpen]);
+    const onMobile = window.matchMedia("(max-width: 767px)").matches;
+    if (onMobile && !mobileNavOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      sidebarScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+      channelNameRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [channelComposerOpen, mobileNavOpen]);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const mobileMedia = window.matchMedia("(max-width: 767px)");
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) {
+        setMobileNavOpen(false);
+      }
+    };
+    const syncBodyScroll = () => {
+      document.body.style.overflow = mobileMedia.matches
+        ? "hidden"
+        : previousOverflow;
+    };
+    syncBodyScroll();
+    mobileMedia.addEventListener("change", syncBodyScroll);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      mobileMedia.removeEventListener("change", syncBodyScroll);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [mobileNavOpen]);
 
   useEffect(() => {
     if (!activeId) {
@@ -320,6 +411,60 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
     () => new Map(profiles.map((profile) => [profile.id, profile])),
     [profiles],
   );
+  const workspaceChannels = useMemo(
+    () => channels.filter((channel) => channel.kind === "channel"),
+    [channels],
+  );
+  const directChannels = useMemo(
+    () => channels.filter((channel) => channel.kind === "dm"),
+    [channels],
+  );
+  const teammates = useMemo(
+    () => people.filter((person) => person.user_id !== currentUserId),
+    [currentUserId, people],
+  );
+  const normalizedSidebarQuery = sidebarQuery.trim().toLowerCase();
+  const filteredWorkspaceChannels = useMemo(
+    () =>
+      workspaceChannels.filter((channel) =>
+        channel.name.toLowerCase().includes(normalizedSidebarQuery),
+      ),
+    [normalizedSidebarQuery, workspaceChannels],
+  );
+  const filteredDirectChannels = useMemo(
+    () =>
+      directChannels.filter((channel) =>
+        channel.name.toLowerCase().includes(normalizedSidebarQuery),
+      ),
+    [directChannels, normalizedSidebarQuery],
+  );
+  const filteredTeammates = useMemo(
+    () =>
+      teammates.filter((person) =>
+        [person.email, person.role]
+          .filter(Boolean)
+          .some((value) =>
+            String(value).toLowerCase().includes(normalizedSidebarQuery),
+          ),
+      ),
+    [normalizedSidebarQuery, teammates],
+  );
+  const filteredAgents = useMemo(
+    () =>
+      agents.filter((agent) =>
+        [agent.name, agent.harness, agent.model]
+          .filter(Boolean)
+          .some((value) =>
+            String(value).toLowerCase().includes(normalizedSidebarQuery),
+          ),
+      ),
+    [agents, normalizedSidebarQuery],
+  );
+  const sidebarResultCount =
+    filteredWorkspaceChannels.length +
+    filteredDirectChannels.length +
+    (workspaceRole === "guest" ? 0 : filteredTeammates.length) +
+    (workspaceRole === "guest" ? 0 : filteredAgents.length);
   const messageById = useMemo(
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],
@@ -347,9 +492,29 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
     }
   };
 
+  const toggleSidebarSection = (section: SidebarSection) => {
+    setCollapsedSections((current) => ({
+      ...current,
+      [section]: !current[section],
+    }));
+  };
+
+  const toggleSidebarSearch = () => {
+    if (sidebarSearchOpen) {
+      setSidebarSearchOpen(false);
+      setSidebarQuery("");
+      return;
+    }
+    setSidebarSearchOpen(true);
+    window.requestAnimationFrame(() => sidebarSearchRef.current?.focus());
+  };
+
   const openChannelComposer = () => {
     if (workspaceRole === "guest") return;
     setChannelCreateError(null);
+    setCollapsedSections((current) => ({ ...current, channels: false }));
+    setSidebarSearchOpen(false);
+    setSidebarQuery("");
     setChannelComposerOpen(true);
     if (window.matchMedia("(max-width: 767px)").matches) {
       setMobileNavOpen(true);
@@ -594,18 +759,22 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
       {/* Mobile: the sidebar becomes a slide-over so the conversation gets the
           full viewport. md+ keeps the fixed rail. */}
       {mobileNavOpen ? (
-        <div
+        <button
+          type="button"
           className="fixed inset-0 z-30 bg-black/60 md:hidden"
           onClick={() => setMobileNavOpen(false)}
-          aria-hidden
+          aria-label="Close channels panel"
         />
       ) : null}
       <aside
         className={`${
-          mobileNavOpen ? "flex" : "hidden"
-        } fixed inset-y-0 left-0 z-40 w-72 max-w-[85vw] shrink-0 flex-col border-r border-[var(--glass-border)] bg-[var(--bg-secondary)] max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)] md:static md:z-auto md:w-64 md:max-w-none md:bg-[var(--bg-secondary)]/70 ${
+          mobileNavOpen
+            ? "visible translate-x-0"
+            : "invisible pointer-events-none -translate-x-full md:visible md:pointer-events-auto"
+        } fixed inset-y-0 left-0 z-40 flex w-80 max-w-[calc(100vw-1rem)] shrink-0 flex-col border-r border-[var(--glass-border)] bg-[var(--bg-secondary)] shadow-2xl shadow-black/50 transition-transform duration-200 ease-out max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)] md:static md:z-auto md:w-64 md:max-w-none md:translate-x-0 md:bg-[var(--bg-secondary)]/70 md:shadow-none ${
           sidebarCollapsed ? "md:hidden" : "md:flex"
         }`}
+        aria-label="Channels, people, and agents"
       >
         <div className="border-b border-[var(--glass-border)] px-4 py-4">
           <div className="flex items-center gap-2">
@@ -614,12 +783,25 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
             </div>
             <button
               type="button"
+              onClick={toggleSidebarSearch}
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[var(--text-secondary)] transition-colors hover:bg-white/5 hover:text-white ${
+                sidebarSearchOpen ? "bg-white/[0.06] text-cyan-300" : ""
+              }`}
+              aria-label={sidebarSearchOpen ? "Close sidebar search" : "Search sidebar"}
+              aria-expanded={sidebarSearchOpen}
+              aria-controls="chat-sidebar-search"
+              title="Search"
+            >
+              <Search className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
               onClick={() => setMobileNavOpen(false)}
-              className="rounded-md px-2 py-1 text-lg leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white md:hidden"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[var(--text-secondary)] hover:bg-white/5 hover:text-white md:hidden"
               aria-label="Close channels panel"
               title="Close"
             >
-              ×
+              <X className="h-4 w-4" />
             </button>
             <button
               type="button"
@@ -647,30 +829,100 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
           <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 text-xs">
             <AppNav compact />
           </div>
+          {sidebarSearchOpen ? (
+            <div
+              id="chat-sidebar-search"
+              className="relative mt-3"
+            >
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
+              <input
+                ref={sidebarSearchRef}
+                type="search"
+                value={sidebarQuery}
+                onChange={(event) => {
+                  const nextQuery = event.target.value;
+                  setSidebarQuery(nextQuery);
+                  if (nextQuery.trim()) {
+                    setCollapsedSections({
+                      channels: false,
+                      direct: false,
+                      people: false,
+                      agents: false,
+                    });
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setSidebarQuery("");
+                    setSidebarSearchOpen(false);
+                  }
+                }}
+                placeholder="Search channels and people"
+                className="w-full rounded-xl border border-[var(--glass-border)] bg-black/25 py-2.5 pl-9 pr-8 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-cyan-400/35 focus:ring-2 focus:ring-cyan-400/10"
+                aria-label="Search channels, people, and agents"
+              />
+              {sidebarQuery ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSidebarQuery("");
+                    sidebarSearchRef.current?.focus();
+                  }}
+                  className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-zinc-500 hover:bg-white/5 hover:text-white"
+                  aria-label="Clear sidebar search"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-2">
-          <div className="flex items-center justify-between px-2 pb-1 pt-2 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
-            <span>Channels</span>
-            {workspaceRole !== "guest" ? (
+        <div ref={sidebarScrollRef} className="min-h-0 flex-1 overflow-y-auto p-2">
+          {normalizedSidebarQuery && sidebarResultCount === 0 ? (
+            <div className="mx-2 mt-3 rounded-xl border border-dashed border-white/10 px-3 py-5 text-center">
+              <p className="text-xs text-zinc-500">No matches for “{sidebarQuery.trim()}”.</p>
               <button
                 type="button"
-                onClick={openChannelComposer}
-                className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
-                aria-label="Create channel"
-                title="Create channel"
+                onClick={() => {
+                  setSidebarQuery("");
+                  sidebarSearchRef.current?.focus();
+                }}
+                className="mt-2 text-xs text-cyan-400 hover:text-cyan-300"
               >
-                +
+                Clear search
               </button>
-            ) : null}
-          </div>
-          {channelComposerOpen ? (
-            <form
-              className="mx-1 mb-2 rounded-xl border border-[var(--glass-border)] bg-[var(--bg-primary)] p-2.5"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void createChannel();
-              }}
-            >
+            </div>
+          ) : null}
+          <SidebarSectionHeader
+            label="Channels"
+            count={filteredWorkspaceChannels.length}
+            controls="chat-sidebar-channels"
+            collapsed={collapsedSections.channels}
+            onToggle={() => toggleSidebarSection("channels")}
+            action={
+              workspaceRole !== "guest" ? (
+                <button
+                  type="button"
+                  onClick={openChannelComposer}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
+                  aria-label="Create channel"
+                  title="Create channel"
+                >
+                  +
+                </button>
+              ) : null
+            }
+          />
+          <div id="chat-sidebar-channels">
+            {!collapsedSections.channels && channelComposerOpen ? (
+              <form
+                className="mx-1 mb-2 rounded-xl border border-[var(--glass-border)] bg-[var(--bg-primary)] p-2.5"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void createChannel();
+                }}
+              >
               <label
                 htmlFor="new-channel-name"
                 className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-[var(--text-secondary)]"
@@ -739,64 +991,76 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                   {creatingChannel ? "Creating…" : "Create"}
                 </button>
               </div>
-            </form>
-          ) : null}
-          {channels
-            .filter((channel) => channel.kind === "channel")
-            .map((channel) => (
-              <button
-                key={channel.id}
-                onClick={() => selectChannel(channel.id)}
-                className={`flex w-full items-center rounded-lg px-3 py-2 text-left text-sm ${
-                  channel.id === activeId
-                    ? "bg-[var(--bg-tertiary)] text-white"
-                    : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
-                }`}
-              >
-                <span className="mr-2">#</span>
-                {channel.visibility === "private" ? (
-                  <span className="mr-1 text-[10px] text-zinc-500">●</span>
-                ) : null}
-                <span className="truncate">{channel.name}</span>
-              </button>
-            ))}
-          <div className="px-2 pb-1 pt-5 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
-            Direct
-          </div>
-          {channels
-            .filter((channel) => channel.kind === "dm")
-            .map((channel) => (
-              <button
-                key={channel.id}
-                onClick={() => selectChannel(channel.id)}
-                className={`flex w-full items-center rounded-lg px-3 py-2 text-left text-sm ${
-                  channel.id === activeId
-                    ? "bg-[var(--bg-tertiary)] text-white"
-                    : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
-                }`}
-              >
-                <span className="mr-2 text-[var(--accent-green)]">●</span>
-                <span className="truncate">{channel.name}</span>
-              </button>
-            ))}
-          <div className="flex items-center justify-between px-2 pb-1 pt-5 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
-            <span>People</span>
-            {workspaceRole === "admin" ? (
-              <button
-                type="button"
-                onClick={() => setPeopleInviteOpen(true)}
-                className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
-                aria-label="Invite people"
-                title="Invite people"
-              >
-                +
-              </button>
+              </form>
             ) : null}
+            {!collapsedSections.channels
+              ? filteredWorkspaceChannels.map((channel) => (
+                  <button
+                    key={channel.id}
+                    onClick={() => selectChannel(channel.id)}
+                    className={`flex w-full items-center rounded-lg px-3 py-2 text-left text-sm ${
+                      channel.id === activeId
+                        ? "bg-[var(--bg-tertiary)] text-white"
+                        : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
+                    }`}
+                  >
+                    <span className="mr-2">#</span>
+                    {channel.visibility === "private" ? (
+                      <span className="mr-1 text-[10px] text-zinc-500">●</span>
+                    ) : null}
+                    <span className="truncate">{channel.name}</span>
+                  </button>
+                ))
+              : null}
           </div>
-          {workspaceRole !== "guest"
-            ? people
-                .filter((person) => person.user_id !== currentUserId)
-                .map((person) => (
+          <SidebarSectionHeader
+            label="Direct"
+            count={filteredDirectChannels.length}
+            controls="chat-sidebar-direct"
+            collapsed={collapsedSections.direct}
+            onToggle={() => toggleSidebarSection("direct")}
+          />
+          <div id="chat-sidebar-direct">
+            {!collapsedSections.direct
+              ? filteredDirectChannels.map((channel) => (
+                  <button
+                    key={channel.id}
+                    onClick={() => selectChannel(channel.id)}
+                    className={`flex w-full items-center rounded-lg px-3 py-2 text-left text-sm ${
+                      channel.id === activeId
+                        ? "bg-[var(--bg-tertiary)] text-white"
+                        : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
+                    }`}
+                  >
+                    <span className="mr-2 text-[var(--accent-green)]">●</span>
+                    <span className="truncate">{channel.name}</span>
+                  </button>
+                ))
+              : null}
+          </div>
+          <SidebarSectionHeader
+            label="People"
+            count={workspaceRole === "guest" ? 0 : filteredTeammates.length}
+            controls="chat-sidebar-people"
+            collapsed={collapsedSections.people}
+            onToggle={() => toggleSidebarSection("people")}
+            action={
+              workspaceRole === "admin" ? (
+                <button
+                  type="button"
+                  onClick={() => setPeopleInviteOpen(true)}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-base leading-none text-[var(--text-secondary)] hover:bg-white/5 hover:text-white"
+                  aria-label="Invite people"
+                  title="Invite people"
+                >
+                  +
+                </button>
+              ) : null
+            }
+          />
+          <div id="chat-sidebar-people">
+            {!collapsedSections.people && workspaceRole !== "guest"
+              ? filteredTeammates.map((person) => (
                   <button
                     key={person.user_id}
                     onClick={() => void openPersonDm(person)}
@@ -811,33 +1075,51 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
                     </span>
                   </button>
                 ))
-            : null}
-          {workspaceRole !== "guest" &&
-          people.filter((person) => person.user_id !== currentUserId).length ===
-            0 ? (
-            <p className="px-3 py-2 text-xs text-zinc-600">
-              No teammates yet.
-            </p>
-          ) : null}
-          <div className="px-2 pb-1 pt-5 text-[10px] uppercase tracking-widest text-[var(--text-secondary)]">
-            Agents
+              : null}
+            {!collapsedSections.people &&
+            workspaceRole !== "guest" &&
+            teammates.length === 0 &&
+            !normalizedSidebarQuery ? (
+              <p className="px-3 py-2 text-xs text-zinc-600">
+                No teammates yet.
+              </p>
+            ) : null}
           </div>
-          {workspaceRole !== "guest" ? agents.map((agent) => (
-            <button
-              key={agent.id}
-              onClick={() => void openAgentDm(agent)}
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-white"
-            >
-              <span className={agent.deviceOnline ? "text-emerald-400" : "text-zinc-600"}>◆</span>
-              <span className="min-w-0">
-                <span className="block truncate">{agent.name}</span>
-                <span className="block truncate text-[10px] opacity-60">
-                  {agent.harness}
-                  {agent.model ? ` · ${agent.model}` : ""}
-                </span>
-              </span>
-            </button>
-          )) : null}
+          <SidebarSectionHeader
+            label="Agents"
+            count={workspaceRole === "guest" ? 0 : filteredAgents.length}
+            controls="chat-sidebar-agents"
+            collapsed={collapsedSections.agents}
+            onToggle={() => toggleSidebarSection("agents")}
+          />
+          <div id="chat-sidebar-agents">
+            {!collapsedSections.agents && workspaceRole !== "guest"
+              ? filteredAgents.map((agent) => (
+                  <button
+                    key={agent.id}
+                    onClick={() => void openAgentDm(agent)}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-white"
+                  >
+                    <span
+                      className={
+                        agent.deviceOnline
+                          ? "text-emerald-400"
+                          : "text-zinc-600"
+                      }
+                    >
+                      ◆
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate">{agent.name}</span>
+                      <span className="block truncate text-[10px] opacity-60">
+                        {agent.harness}
+                        {agent.model ? ` · ${agent.model}` : ""}
+                      </span>
+                    </span>
+                  </button>
+                ))
+              : null}
+          </div>
         </div>
       </aside>
 
