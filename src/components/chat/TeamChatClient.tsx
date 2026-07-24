@@ -778,7 +778,10 @@ export function TeamChatClient({ initialChannelId }: { initialChannelId?: string
       >
         <div className="border-b border-[var(--glass-border)] px-4 py-4">
           <div className="flex items-center gap-2">
-            <div className="min-w-0 flex-1 truncate font-display text-sm tracking-wider">
+            <div
+              className="min-w-0 flex-1 truncate text-sm font-semibold tracking-normal text-[var(--text-primary)]"
+              title={workspaceName}
+            >
               {workspaceName}
             </div>
             <button
