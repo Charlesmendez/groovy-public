@@ -3,7 +3,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { createRequire } from "module";
-import { promptForCredentials as promptForCredentialsPrompt } from "./platform/prompt/index.mjs";
+import { promptForCredentials as promptForCredentialsPrompt, promptForSecret } from "./platform/prompt/index.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -72,7 +72,87 @@ function openDb() {
   )`);
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS credentials_domain_username_uq ON credentials(domain, username)");
   db.exec("CREATE INDEX IF NOT EXISTS credentials_domain_last_used_idx ON credentials(domain, COALESCE(last_used_at, updated_at) DESC)");
+  db.exec(`CREATE TABLE IF NOT EXISTS workspace_secrets (
+    workspace_id TEXT NOT NULL,
+    secret_id TEXT NOT NULL,
+    secret_key TEXT NOT NULL,
+    enc_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT,
+    PRIMARY KEY (workspace_id, secret_id)
+  )`);
   return { db, dbPath };
+}
+
+function normalizeSecretIdentity({ workspaceId, secretId, key }) {
+  const workspace = String(workspaceId || "").trim();
+  const id = String(secretId || "").trim();
+  const secretKey = String(key || "").trim().toUpperCase();
+  if (!workspace) throw new Error("missing_workspace_id");
+  if (!id) throw new Error("missing_secret_id");
+  if (!/^[A-Z][A-Z0-9_]{1,127}$/.test(secretKey)) throw new Error("invalid_secret_key");
+  return { workspace, id, secretKey };
+}
+
+export async function workspaceSecretGetMeta(identity) {
+  let db = null;
+  try {
+    const { workspace, id, secretKey } = normalizeSecretIdentity(identity);
+    db = openDb().db;
+    const row = db.prepare("SELECT secret_key, updated_at FROM workspace_secrets WHERE workspace_id = ? AND secret_id = ?").get(workspace, id);
+    return { ok: true, configured: !!row, key: row?.secret_key || secretKey, updatedAt: row?.updated_at || null };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally { try { db?.close(); } catch {} }
+}
+
+// Connector-internal only. Never return this result through relay RPC.
+export async function workspaceSecretGetValue(identity) {
+  let db = null;
+  try {
+    const { workspace, id, secretKey } = normalizeSecretIdentity(identity);
+    db = openDb().db;
+    const row = db.prepare("SELECT secret_key, enc_json FROM workspace_secrets WHERE workspace_id = ? AND secret_id = ?").get(workspace, id);
+    if (!row) return { ok: true, configured: false };
+    if (row.secret_key !== secretKey) return { ok: false, error: "secret_key_mismatch" };
+    const value = decryptSecret({ masterKey: await getOrCreateMasterKeyBytes(), enc: JSON.parse(row.enc_json) });
+    db.prepare("UPDATE workspace_secrets SET last_used_at = ? WHERE workspace_id = ? AND secret_id = ?").run(new Date().toISOString(), workspace, id);
+    return { ok: true, configured: true, value };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally { try { db?.close(); } catch {} }
+}
+
+export async function workspaceSecretRequest(identity) {
+  let db = null;
+  try {
+    const { workspace, id, secretKey } = normalizeSecretIdentity(identity);
+    const prompted = await promptForSecret({ name: String(identity?.name || secretKey), reason: String(identity?.reason || `Allow assigned Minds and skills to use ${secretKey}.`) });
+    if (!prompted?.ok) return prompted;
+    const now = new Date().toISOString();
+    const enc = encryptSecret({ masterKey: await getOrCreateMasterKeyBytes(), plaintext: prompted.value });
+    db = openDb().db;
+    db.prepare(`INSERT INTO workspace_secrets(workspace_id, secret_id, secret_key, enc_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(workspace_id, secret_id) DO UPDATE SET secret_key=excluded.secret_key, enc_json=excluded.enc_json, updated_at=excluded.updated_at`)
+      .run(workspace, id, secretKey, JSON.stringify(enc), now, now);
+    return { ok: true, configured: true, key: secretKey, updatedAt: now };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally { try { db?.close(); } catch {} }
+}
+
+export async function workspaceSecretDelete(identity) {
+  let db = null;
+  try {
+    const { workspace, id } = normalizeSecretIdentity(identity);
+    db = openDb().db;
+    db.prepare("DELETE FROM workspace_secrets WHERE workspace_id = ? AND secret_id = ?").run(workspace, id);
+    return { ok: true, configured: false };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  } finally { try { db?.close(); } catch {} }
 }
 
 async function getOrCreateMasterKeyBytes() {

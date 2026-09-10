@@ -25,6 +25,11 @@ import { appUrl, createMainWindow } from "./window";
 log.initialize();
 log.transports.file.level = "info";
 
+// Groovy owns one notification tone in the renderer. Native notification
+// banners are silent so macOS cannot substitute a second sound depending on
+// whether the conversation is currently visible.
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 function connectorResourcesDir(): string {
   // Packaged: <App>.app/Contents/Resources/connector (electron-builder
   // extraResources). Dev: apps/desktop/resources/connector (populated by
@@ -75,14 +80,35 @@ if (!gotLock) {
     await cleanup(true);
   });
 
+  const installReadyUpdateWhenBackgrounded = () => {
+    if (quitting) return;
+    if (updater.getStatus().state !== "ready") return;
+    if (
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      mainWindow.isVisible() &&
+      !mainWindow.isMinimized()
+    ) {
+      return;
+    }
+    void updater.quitAndInstall();
+  };
+  updater.onStatus((status) => {
+    if (status.state === "ready") installReadyUpdateWhenBackgrounded();
+  });
+
   const showWindow = (): BrowserWindow => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
+      void updater.checkIfStale();
       return mainWindow;
     }
     mainWindow = createMainWindow(hostedUiUpdater);
+    mainWindow.on("focus", () => void updater.checkIfStale());
+    mainWindow.on("hide", installReadyUpdateWhenBackgrounded);
+    mainWindow.on("minimize", () => setImmediate(installReadyUpdateWhenBackgrounded));
     mainWindow.on("close", (event) => {
       // Closing the window keeps the app (and connector) alive in the tray.
       if (!quitting) {
@@ -132,7 +158,12 @@ if (!gotLock) {
     showWindow();
   });
 
-  app.on("activate", () => showWindow());
+  app.on("activate", () => {
+    showWindow();
+    // Dock activation is an explicit foreground transition and a natural
+    // moment to pick up a newly published licensed Desktop release.
+    void updater.checkIfStale();
+  });
 
   // We stay alive in the tray even with all windows closed (all platforms).
   app.on("window-all-closed", () => {

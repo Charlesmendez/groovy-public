@@ -17,6 +17,7 @@ import {
   Code,
   Edit2,
 } from "lucide-react";
+import type { DatagranProvider } from "@/lib/datagran/prompts";
 
 // Platform icons (logos when available, otherwise colored initials)
 const PLATFORM_CONFIG: Record<string, {
@@ -150,12 +151,14 @@ export type PlatformType =
   | "web_pixel";
 
 // Map internal platform names to Datagran API provider names
-const PLATFORM_TO_PROVIDER: Partial<Record<PlatformType, string>> = {
+const PLATFORM_TO_PROVIDER: Partial<Record<PlatformType, DatagranProvider>> = {
   // Keep empty unless Datagran provider keys diverge from our UI keys.
 };
 
 // Get the Datagran provider name for a platform
-export function getDatagranProvider(platform: PlatformType): string {
+export function getDatagranProvider(
+  platform: PlatformType,
+): DatagranProvider {
   return PLATFORM_TO_PROVIDER[platform] || platform;
 }
 

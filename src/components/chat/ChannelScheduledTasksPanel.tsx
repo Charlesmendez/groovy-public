@@ -62,18 +62,23 @@ function statusLabel(status: string): string {
 function TaskCard({
   task,
   busy,
+  running,
   actionsDisabled,
   onAction,
+  onRun,
 }: {
   task: ChannelScheduledTask;
   busy: boolean;
+  running: boolean;
   actionsDisabled: boolean;
   onAction: (
     taskId: string,
     action: ChannelScheduleAction,
   ) => Promise<void>;
+  onRun: (taskId: string) => Promise<void>;
 }) {
   const lastRun = relativeTime(task.lastRunAt);
+  const showRunAction = Boolean(task.canRun && task.deviceId);
   return (
     <article
       className={`rounded-2xl border p-3.5 transition ${
@@ -134,11 +139,11 @@ function TaskCard({
         </div>
       </div>
 
-      <div className="mt-3 flex items-center justify-between gap-3">
-        <div className="min-w-0">
+      <div className="mt-3">
+        <div className="min-h-5 min-w-0">
           {task.lastStatus ? (
             <span
-              className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] ${statusClasses(
+              className={`inline-flex max-w-full whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] ${statusClasses(
                 task.lastStatus,
               )}`}
             >
@@ -150,25 +155,54 @@ function TaskCard({
           )}
         </div>
         {task.canManage ? (
-          <div className="flex shrink-0 items-center gap-1">
+          <div
+            className={`mt-2.5 grid w-full gap-1.5 ${
+              showRunAction ? "grid-cols-3" : "grid-cols-2"
+            }`}
+          >
+            {showRunAction ? (
+              <button
+                type="button"
+                disabled={actionsDisabled || running}
+                onClick={() => void onRun(task.id)}
+                className="flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-emerald-400/20 bg-emerald-400/[0.06] px-2 text-[11px] text-emerald-200 transition hover:bg-emerald-400/[0.11] disabled:opacity-40"
+                aria-label={running ? "Task is running" : "Run task now"}
+                title={
+                  running
+                    ? "Task is running"
+                    : "Run this task now"
+                }
+              >
+                {running ? (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                ) : (
+                  <Play className="h-3.5 w-3.5 shrink-0" />
+                )}
+                <span className="truncate">
+                  {running ? "Running" : "Run now"}
+                </span>
+              </button>
+            ) : null}
             <button
               type="button"
               disabled={actionsDisabled}
               onClick={() =>
                 void onAction(task.id, task.enabled ? "pause" : "resume")
               }
-              className="flex h-8 items-center justify-center gap-1.5 rounded-lg border border-white/[0.08] px-2.5 text-[11px] text-zinc-500 transition hover:border-white/15 hover:bg-white/[0.04] hover:text-zinc-200 disabled:opacity-40"
+              className="flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-white/[0.08] px-2 text-[11px] text-zinc-500 transition hover:border-white/15 hover:bg-white/[0.04] hover:text-zinc-200 disabled:opacity-40"
               aria-label={task.enabled ? "Pause task" : "Resume task"}
               title={task.enabled ? "Pause task" : "Resume task"}
             >
               {busy ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
               ) : task.enabled ? (
-                <Pause className="h-3.5 w-3.5" />
+                <Pause className="h-3.5 w-3.5 shrink-0" />
               ) : (
-                <Play className="h-3.5 w-3.5" />
+                <Play className="h-3.5 w-3.5 shrink-0" />
               )}
-              <span>{task.enabled ? "Pause" : "Resume"}</span>
+              <span className="truncate">
+                {task.enabled ? "Pause" : "Resume"}
+              </span>
             </button>
             <button
               type="button"
@@ -176,16 +210,20 @@ function TaskCard({
                 actionsDisabled || !task.enabled || task.skipNextRun
               }
               onClick={() => void onAction(task.id, "skip")}
-              className="flex h-8 items-center justify-center gap-1.5 rounded-lg border border-white/[0.08] px-2.5 text-[11px] text-zinc-500 transition hover:border-amber-400/20 hover:bg-amber-400/[0.05] hover:text-amber-200 disabled:opacity-35"
+              className="flex h-8 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-white/[0.08] px-2 text-[11px] text-zinc-500 transition hover:border-amber-400/20 hover:bg-amber-400/[0.05] hover:text-amber-200 disabled:opacity-35"
               aria-label="Skip next run"
               title="Skip next run"
             >
-              <SkipForward className="h-3.5 w-3.5" />
-              <span>{task.skipNextRun ? "Skipped" : "Skip next"}</span>
+              <SkipForward className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">
+                {task.skipNextRun ? "Skipped" : "Skip next"}
+              </span>
             </button>
           </div>
         ) : (
-          <span className="shrink-0 text-[10px] text-zinc-700">View only</span>
+          <span className="mt-2 block text-[10px] text-zinc-700">
+            View only
+          </span>
         )}
       </div>
     </article>
@@ -199,8 +237,10 @@ export function ChannelScheduledTasksPanel({
   error,
   migrationPending,
   busyTaskId,
+  runningTaskIds,
   canCreate,
   onAction,
+  onRun,
   onClose,
   onRefresh,
   onCreatePrompt,
@@ -211,11 +251,13 @@ export function ChannelScheduledTasksPanel({
   error: string | null;
   migrationPending: boolean;
   busyTaskId: string | null;
+  runningTaskIds: Set<string>;
   canCreate: boolean;
   onAction: (
     taskId: string,
     action: ChannelScheduleAction,
   ) => Promise<void>;
+  onRun: (taskId: string) => Promise<void>;
   onClose: () => void;
   onRefresh: () => void;
   onCreatePrompt: () => void;
@@ -400,8 +442,10 @@ export function ChannelScheduledTasksPanel({
                       key={task.id}
                       task={task}
                       busy={busyTaskId === task.id}
+                      running={runningTaskIds.has(task.id)}
                       actionsDisabled={busyTaskId !== null}
                       onAction={onAction}
+                      onRun={onRun}
                     />
                   ))}
                 </div>

@@ -2,6 +2,7 @@ import type {
   HarnessProfile,
   HarnessProfileToolPolicy,
 } from "./harnessProfiles";
+import { HOME_DECISION_TOOLS, isHomeDataTool } from "../homeInbox/dataContracts";
 
 /**
  * Runtime policy copied onto ToolExecutionContext. Keeping this as plain data
@@ -16,6 +17,14 @@ export type ToolPolicyExecutionContext = {
   agentRoster: string[] | null;
   memoryScope: "shared" | "profile";
   memoryScopeId: string | null;
+  /**
+   * A trusted Team Chat entry point may let a workspace member manage the
+   * current channel's schedules even when the channel uses an external Mind.
+   * The schedule executor still revalidates the actor and channel in the DB.
+   */
+  canManageTeamChatSchedules: boolean;
+  /** Workspace-wide grants require a freshly verified admin speaker. */
+  canManageWorkspaceAssignments: boolean;
 };
 
 const EXTERNAL_DEFAULT_TOOLS = new Set([
@@ -43,6 +52,32 @@ const CHANNEL_AGENT_TOOLS = new Set([
   "consult_agent",
 ]);
 
+const CHANNEL_SKILL_MANAGEMENT_TOOLS = new Set([
+  "list_channel_skills",
+  "create_channel_skill",
+  "update_channel_skill_actions",
+  "assign_channel_skill",
+  "remove_channel_skill",
+]);
+
+const CHANNEL_SCHEDULE_MANAGEMENT_TOOLS = new Set([
+  "schedule_create",
+  "schedule_list",
+  "schedule_update",
+  "schedule_pause",
+  "schedule_resume",
+  "schedule_cancel_next",
+  "schedule_delete",
+]);
+
+const WORKSPACE_SKILL_MANAGEMENT_TOOLS = new Set([
+  "list_skills_and_docs",
+  "assign_skill_or_doc",
+  "remove_skill_or_doc_assignment",
+  "list_workspace_secret_assignments",
+  "set_workspace_secret_assignment",
+]);
+
 const EXTERNAL_HARD_BLOCKED_NAMES = new Set([
   "terminal_exec",
   "code_cli_run",
@@ -53,11 +88,15 @@ const EXTERNAL_HARD_BLOCKED_NAMES = new Set([
   "runtime_branch_parallel",
   "assign_skill_or_doc",
   "remove_skill_or_doc_assignment",
+  "list_workspace_secret_assignments",
+  "set_workspace_secret_assignment",
 ]);
 
 const EXTERNAL_HARD_BLOCKED_PREFIXES = [
   "browser_",
+  "chat_",
   "credential_",
+  "email_",
   "obsidian_",
   "whatsapp_",
   "telegram_",
@@ -100,6 +139,8 @@ export function buildToolPolicyExecutionContext(args: {
    * the safer default of intersecting the caller boundary with the Mind roster.
    */
   agentRosterMode?: "intersect" | "replace";
+  canManageTeamChatSchedules?: boolean;
+  canManageWorkspaceAssignments?: boolean;
 }): ToolPolicyExecutionContext {
   const profile = args.profile ?? null;
   const profileId =
@@ -129,12 +170,18 @@ export function buildToolPolicyExecutionContext(args: {
       profile?.memoryScope === "profile"
         ? args.memoryScopeId || profileId
         : null,
+    canManageTeamChatSchedules:
+      args.canManageTeamChatSchedules === true &&
+      (args.provider === "team_chat" || args.provider === "team_chat_guest"),
+    canManageWorkspaceAssignments:
+      args.canManageWorkspaceAssignments === true,
   };
 }
 
 export function isConnectorToolName(toolName: string): boolean {
   if (toolName === "files_agent_request") return false;
   return (
+    toolName === "run_skill_action" ||
     toolName.startsWith("terminal_") ||
     toolName.startsWith("code_") ||
     toolName === "computer_use_action" ||
@@ -157,9 +204,66 @@ export function toolPolicyDenialReason(
   toolName: string,
   context?: ToolPolicyExecutionContext | null,
 ): string | null {
-  if (!context) return null;
   const name = String(toolName || "").trim();
   if (!name) return "Harness tool policy blocked an unnamed tool.";
+  if (isHomeDataTool(name) && context?.provider !== "home_inbox")
+    return `Harness tool policy blocked "${name}": Home data requires a server-bound Inbox decision.`;
+
+  // Inbox owns all cadence, messaging, transitions and side effects. Apply this
+  // before the generic skill/delegation shortcuts, even if a Mind is later
+  // edited into an internal/all-tools profile. data_query is not yet a proven
+  // read-only boundary and must not provide an indirect sending escape hatch.
+  if (context?.provider === "home_inbox") {
+    const allowlist = normalizedAllowlist(context.policy);
+    if (!HOME_DECISION_TOOLS.includes(name) || !allowlist?.has(name)) {
+      return `Harness tool policy blocked "${name}": Home Inbox decisions cannot schedule, send, delegate or use unverified data adapters.`;
+    }
+    // These names have a stronger provider + explicit grant boundary above;
+    // they must not fall through to the generic external capability catalog.
+    if (isHomeDataTool(name)) return null;
+  }
+
+  if (name === "app_navigate") {
+    if (
+      !context ||
+      context.surface !== "internal" ||
+      context.provider !== "private_live_voice"
+    ) {
+      return `Harness tool policy blocked "${name}": in-app navigation is available only to authenticated Live voice turns.`;
+    }
+    return null;
+  }
+
+  // Cross-channel Chat resolution and sending are global app commands. They
+  // must never be reachable from a channel Mind (including an internal one),
+  // a guest turn, or an unscoped/public caller.
+  if (name === "chat_resolve_channel" || name === "chat_send_message") {
+    const trustedChatProvider =
+      context?.provider === "dashboard" ||
+      context?.provider === "private_live_voice";
+    if (
+      !context ||
+      context.surface !== "internal" ||
+      !trustedChatProvider
+    ) {
+      return `Harness tool policy blocked "${name}": Groovy Chat commands are available only to authenticated dashboard and Live voice turns.`;
+    }
+  }
+
+  // Native Email tools use private per-user Gmail credentials. A Team Chat
+  // round executes with the workspace billing owner's integrations, so even an
+  // internal channel Mind must not receive this capability on behalf of a
+  // different speaker. Keep the boundary exact and fail closed when unscoped.
+  if (name.startsWith("email_")) {
+    const trustedEmailProvider =
+      context?.provider === "dashboard" ||
+      context?.provider === "private_live_voice";
+    if (!context || context.surface !== "internal" || !trustedEmailProvider) {
+      return `Harness tool policy blocked "${name}": private Email workspace tools are available only to authenticated dashboard and Live voice turns.`;
+    }
+  }
+
+  if (!context) return null;
 
   // Public API turns can never reach a connector, even if a profile is
   // accidentally changed back to an internal/all-tools policy.
@@ -170,7 +274,51 @@ export function toolPolicyDenialReason(
     return `Harness tool policy blocked "${name}": connector tools are unavailable to ${context.provider === "api" ? "public API" : "cloud scheduler"} turns.`;
   }
 
+  // Skill bodies can only be resolved through a trusted, fail-closed
+  // assignment scope. Reading an enabled skill is intrinsic to honoring that
+  // assignment, including for custom allowlisted Minds.
+  if (name === "read_skill_or_doc") return null;
+  if (name === "run_skill_action") return null;
+
+  if (CHANNEL_SKILL_MANAGEMENT_TOOLS.has(name)) {
+    const isTeamChat =
+      context.provider === "team_chat" ||
+      context.provider === "team_chat_guest";
+    return isTeamChat
+      ? null
+      : `Harness tool policy blocked "${name}": channel skill management is available only in Team Chat.`;
+  }
+
+  if (CHANNEL_SCHEDULE_MANAGEMENT_TOOLS.has(name)) {
+    const isTeamChat =
+      context.provider === "team_chat" ||
+      context.provider === "team_chat_guest";
+    if (isTeamChat && context.canManageTeamChatSchedules) return null;
+  }
+
+  if (
+    WORKSPACE_SKILL_MANAGEMENT_TOOLS.has(name) &&
+    (context.provider === "team_chat" ||
+      context.provider === "team_chat_guest")
+  ) {
+    return context.canManageWorkspaceAssignments
+      ? null
+      : `Harness tool policy blocked "${name}": workspace-wide assignment management requires the current Team Chat speaker to be a workspace admin.`;
+  }
+
   if (context.surface === "external") {
+    // Team Chat is a local-machine operating surface, including channels that
+    // contain guests. The connected Mind may use the owner's local shell just
+    // as it can in the dashboard; connector execution still goes through the
+    // same relay/device boundary and tool-level operating instructions.
+    if (
+      name === "terminal_exec" &&
+      (context.provider === "team_chat" ||
+        context.provider === "team_chat_guest")
+    ) {
+      return null;
+    }
+
     if (
       EXTERNAL_HARD_BLOCKED_NAMES.has(name) ||
       EXTERNAL_HARD_BLOCKED_PREFIXES.some((prefix) => name.startsWith(prefix))

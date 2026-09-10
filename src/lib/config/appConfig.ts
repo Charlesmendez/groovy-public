@@ -30,11 +30,24 @@ function normalizedRelayUrl(value: string | undefined): string | null {
 
 export function getConfiguredAppUrl(): string | null {
   return (
-    normalizedHttpUrl(process.env.GROOVY_APP_URL) ||
-    normalizedHttpUrl(process.env.NEXT_PUBLIC_APP_URL) ||
+    getCanonicalAppUrl() ||
     normalizedHttpUrl(
       process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined
     )
+  );
+}
+
+/**
+ * Stable public origin for server-to-server callbacks.
+ *
+ * VERCEL_URL is intentionally excluded: it identifies the current deployment
+ * alias, which may be a preview hostname that strict downstream allowlists
+ * reject.
+ */
+export function getCanonicalAppUrl(): string | null {
+  return (
+    normalizedHttpUrl(process.env.GROOVY_APP_URL) ||
+    normalizedHttpUrl(process.env.NEXT_PUBLIC_APP_URL)
   );
 }
 

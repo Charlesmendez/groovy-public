@@ -6,6 +6,10 @@ import type { DatagranProvider } from "@/lib/datagran/prompts";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { ensureOrchestratorIntegrationAssignment } from "@/lib/integrations/assignments";
 import {
+  DATAGRAN_CONNECTION_HEALTH_CHECKS,
+  isDatagranAuthorizationRequiredError,
+} from "@/lib/datagran/connectionHealth";
+import {
   getOrCreateWorkspaceForUser,
   isWorkspaceOperatorRole,
 } from "@/lib/workspaces";
@@ -23,52 +27,12 @@ type DatagranConfigRow = {
   provider?: unknown;
   connection_id?: unknown;
   created_at?: unknown;
+  updated_at?: unknown;
   datagran_api_key_enc?: unknown;
   agents?: { name?: unknown } | Array<{ name?: unknown }> | null;
 };
 
 type ConnectionUiStatus = "connected" | "error" | "expired";
-
-const DATAGRAN_PROVIDER_REAUTH_CAPABLE = new Set<DatagranProvider>([
-  "facebook_ads",
-  "facebook_leads",
-  "instagram",
-  "google_ads",
-  "google_calendar",
-  "gmail",
-  "linkedin_ads",
-  "google_drive",
-  "tiktok",
-  "salesforce",
-]);
-
-const DATAGRAN_CONNECTION_HEALTH_CHECKS: Partial<
-  Record<
-    DatagranProvider,
-    {
-      method: "GET" | "POST";
-      endpoint: string;
-      body?: unknown;
-    }
-  >
-> = {
-  gmail: {
-    method: "GET",
-    endpoint: "/api/proxy/gmail/gmail/v1/users/me/profile",
-  },
-  google_calendar: {
-    method: "GET",
-    endpoint: "/api/proxy/google-calendar/calendar/v3/users/me/calendarList?maxResults=1",
-  },
-  google_drive: {
-    method: "GET",
-    endpoint: "/api/proxy/google-drive/drive/v3/about?fields=user",
-  },
-  salesforce: {
-    method: "GET",
-    endpoint: "/api/proxy/salesforce/services/data",
-  },
-};
 
 function toStringOrEmpty(value: unknown) {
   if (typeof value === "string") return value;
@@ -107,11 +71,6 @@ function toProvider(value: unknown): DatagranProvider | null {
   return null;
 }
 
-function supportsDatagranProviderReauth(provider: unknown): boolean {
-  const normalized = toProvider(provider);
-  return normalized ? DATAGRAN_PROVIDER_REAUTH_CAPABLE.has(normalized) : false;
-}
-
 function getAgentName(
   agents: DatagranConfigRow["agents"],
   provider: DatagranProvider | null
@@ -121,82 +80,6 @@ function getAgentName(
   if (name) return name;
   if (!provider) return "Unknown";
   return provider.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase());
-}
-
-function isAuthorizationRequiredError(
-  status: number,
-  data: unknown,
-  provider?: string
-): boolean {
-  if (!supportsDatagranProviderReauth(provider)) return false;
-
-  if (status === 401) return true;
-
-  if (status === 403 && data && typeof data === "object") {
-    const d = data as Record<string, unknown>;
-    const rootError =
-      d.error && typeof d.error === "object"
-        ? (d.error as Record<string, unknown>)
-        : null;
-    const msg = `${
-      typeof d.message === "string" ? d.message : ""
-    } ${typeof rootError?.message === "string" ? rootError.message : ""}`.toLowerCase();
-    const nested = Array.isArray(rootError?.errors) ? rootError.errors : [];
-    const details = Array.isArray(rootError?.details) ? rootError.details : [];
-    const reasons = [
-      ...nested.map((x) =>
-        x && typeof x === "object" && typeof (x as Record<string, unknown>).reason === "string"
-          ? ((x as Record<string, unknown>).reason as string)
-          : ""
-      ),
-      ...details.map((x) =>
-        x && typeof x === "object" && typeof (x as Record<string, unknown>).reason === "string"
-          ? ((x as Record<string, unknown>).reason as string)
-          : ""
-      ),
-    ].filter(Boolean);
-    if (
-      msg.includes("insufficient authentication scopes") ||
-      msg.includes("insufficient permission") ||
-      reasons.includes("ACCESS_TOKEN_SCOPE_INSUFFICIENT") ||
-      reasons.includes("insufficientPermissions")
-    ) {
-      return true;
-    }
-  }
-
-  if (data && typeof data === "object") {
-    const d = data as Record<string, unknown>;
-    if (d.status === "authorization_required") return true;
-    if (d.error === "authorization_required") return true;
-    if (
-      typeof d.error === "string" &&
-      /token.*expired|invalid.*token|authorization.*required|requires reauthorization|reauthorization/i.test(
-        d.error
-      )
-    ) {
-      return true;
-    }
-    if (
-      typeof d.message === "string" &&
-      /token.*expired|invalid.*token|authorization.*required|requires reauthorization|reauthorization/i.test(
-        d.message
-      )
-    ) {
-      return true;
-    }
-  }
-
-  if (
-    typeof data === "string" &&
-    /token.*expired|invalid.*token|authorization.*required|requires reauthorization|reauthorization/i.test(
-      data
-    )
-  ) {
-    return true;
-  }
-
-  return false;
 }
 
 async function datagranApiCall(
@@ -296,7 +179,13 @@ async function resolveConnectionStatus(
     return { status: "connected" };
   }
 
-  if (isAuthorizationRequiredError(result.status, result.data, provider)) {
+  if (
+    isDatagranAuthorizationRequiredError(
+      result.status,
+      result.data,
+      provider,
+    )
+  ) {
     return { status: "expired", statusMessage: "Needs re-authentication" };
   }
 
@@ -306,7 +195,7 @@ async function resolveConnectionStatus(
   };
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
@@ -329,6 +218,7 @@ export async function GET() {
       provider,
       connection_id,
       created_at,
+      updated_at,
       datagran_api_key_enc,
       agents!datagran_agent_configs_agent_id_fkey(name)
     `)
@@ -341,16 +231,26 @@ export async function GET() {
 
   const defaultDatagranApiKey = toStringOrEmpty(process.env.DATAGRAN_API_KEY);
   const rows = (data || []) as DatagranConfigRow[];
+  const skipHealth =
+    new URL(request.url).searchParams.get("health") === "skip";
   const connections = await Promise.all(
     rows.map(async (row) => {
       const provider = toProvider(row.provider);
-      const statusInfo = await resolveConnectionStatus(row, defaultDatagranApiKey);
+      const statusInfo = skipHealth
+        ? toOptionalString(row.connection_id)
+          ? { status: "connected" as const }
+          : {
+              status: "error" as const,
+              statusMessage: "Missing connection ID",
+            }
+        : await resolveConnectionStatus(row, defaultDatagranApiKey);
       return {
         agentId: toStringOrEmpty(row.agent_id),
         provider,
         name: getAgentName(row.agents, provider),
         connectionId: toOptionalString(row.connection_id),
         createdAt: toOptionalString(row.created_at),
+        updatedAt: toOptionalString(row.updated_at),
         status: statusInfo.status,
         statusMessage: statusInfo.statusMessage,
       };
@@ -399,6 +299,91 @@ export async function POST(req: Request) {
 
   // Case 1: Update existing agent with connection ID
   if (agentId) {
+    const { data: current, error: currentError } = await admin
+      .from("datagran_agent_configs")
+      .select("provider,connection_id")
+      .eq("agent_id", agentId)
+      .eq("user_id", ownerUserId)
+      .maybeSingle();
+    if (currentError) {
+      return NextResponse.json(
+        { error: currentError.message || "Failed to load connection" },
+        { status: 500 },
+      );
+    }
+    if (!current) {
+      return NextResponse.json(
+        { error: "Datagran config not found for this user" },
+        { status: 404 },
+      );
+    }
+    const previousConnectionId = toStringOrEmpty(current.connection_id).trim();
+    if (
+      current.provider === "gmail" &&
+      previousConnectionId &&
+      previousConnectionId !== connectionId
+    ) {
+      for (const table of [
+        "email_mailbox_preferences",
+        "email_classification_feedback",
+        "email_sender_affinity_cache",
+        "inbox_actions",
+      ]) {
+        const { error: remapError } = await admin
+          .from(table)
+          .update({ connection_id: connectionId })
+          .eq("user_id", ownerUserId)
+          .eq("connection_id", previousConnectionId);
+        if (remapError) {
+          return NextResponse.json(
+            {
+              error:
+                remapError.message ||
+                "Failed to preserve Gmail workspace history",
+            },
+            { status: 500 },
+          );
+        }
+      }
+      const { data: snippets, error: snippetsError } = await admin
+        .from("email_snippets")
+        .select("id,mailbox_connection_ids")
+        .eq("user_id", ownerUserId);
+      if (snippetsError) {
+        return NextResponse.json(
+          { error: snippetsError.message || "Failed to preserve snippets" },
+          { status: 500 },
+        );
+      }
+      for (const snippet of snippets || []) {
+        const mailboxIds = Array.isArray(snippet.mailbox_connection_ids)
+          ? snippet.mailbox_connection_ids.map((value) =>
+              toStringOrEmpty(value).trim(),
+            )
+          : [];
+        if (!mailboxIds.includes(previousConnectionId)) continue;
+        const { error: snippetError } = await admin
+          .from("email_snippets")
+          .update({
+            mailbox_connection_ids: Array.from(
+              new Set(
+                mailboxIds.map((value) =>
+                  value === previousConnectionId ? connectionId : value,
+                ),
+              ),
+            ),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", snippet.id)
+          .eq("user_id", ownerUserId);
+        if (snippetError) {
+          return NextResponse.json(
+            { error: snippetError.message || "Failed to preserve snippets" },
+            { status: 500 },
+          );
+        }
+      }
+    }
     const { data: updated, error } = await admin
       .from("datagran_agent_configs")
       .update({

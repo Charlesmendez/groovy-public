@@ -11,6 +11,7 @@ import Link from "next/link";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { HARNESS_PROFILE_TEMPLATES } from "@/lib/orchestrator/profileTemplates";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import { HomeInboxConnection } from "@/components/settings/HomeInboxConnection";
 import {
   MODEL_CATALOG,
   inferProviderForModelId,
@@ -84,7 +85,10 @@ type ProfileCapabilities = {
   inheritWorkspaceIntegrations: boolean;
   skills: CapabilitySkill[];
   integrations: CapabilityIntegration[];
+  secrets: Array<{ id: string; name: string; key: string; description: string; granted: boolean }>;
 };
+
+type MindTemplate = (typeof HARNESS_PROFILE_TEMPLATES)[number];
 
 const TOOL_OPTIONS = [
   ["web_search", "Web search"],
@@ -95,11 +99,14 @@ const TOOL_OPTIONS = [
   ["wiki_file_learning", "Wiki learning"],
   ["files_agent_request", "Files agent"],
   ["data_query", "Approved data sources"],
+  ["home_data_operations", "Discover Home data · Inbox only"],
+  ["home_data_read", "Read Home data · Inbox only"],
   ["list_agents", "List agents"],
   ["assign_task", "Assign work"],
   ["consult_agent", "Consult agents"],
   ["schedule_list", "Read schedules"],
   ["schedule_create", "Create schedules"],
+  ["schedule_update", "Update schedules"],
 ] as const;
 
 const EXTERNAL_TOOL_OPTIONS = new Set([
@@ -111,6 +118,8 @@ const EXTERNAL_TOOL_OPTIONS = new Set([
   "wiki_file_learning",
   "files_agent_request",
   "data_query",
+  "home_data_operations",
+  "home_data_read",
 ]);
 const EXTERNAL_DEFAULT_TOOLS = [
   "web_search",
@@ -194,6 +203,8 @@ export function MindsManager({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showTemplates, setShowTemplates] = useState(false);
+  const [pendingTemplate, setPendingTemplate] = useState<MindTemplate | null>(null);
+  const [newMindName, setNewMindName] = useState("");
   const [agents, setAgents] = useState<Agent[]>([]);
   const [keys, setKeys] = useState<ApiKeyRow[]>([]);
   const [plaintextKey, setPlaintextKey] = useState<string | null>(null);
@@ -395,16 +406,29 @@ export function MindsManager({
     }
   };
 
-  const createFromTemplate = async (tpl: (typeof HARNESS_PROFILE_TEMPLATES)[number]) => {
-    const name = window.prompt("Name this mind:", tpl.key === "default" ? "My Mind" : tpl.name);
-    if (!name?.trim()) return;
+  const beginCreateFromTemplate = (tpl: MindTemplate) => {
+    setPendingTemplate(tpl);
+    setNewMindName(tpl.key === "default" ? "My Mind" : tpl.name);
+    setError(null);
+  };
+
+  const cancelCreateFromTemplate = () => {
+    if (busy) return;
+    setPendingTemplate(null);
+    setNewMindName("");
+  };
+
+  const createFromTemplate = async () => {
+    const tpl = pendingTemplate;
+    const name = newMindName.trim();
+    if (!tpl || !name || busy) return;
     const res = await call(() =>
       fetch("/api/harness/profiles", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...tpl.body,
-          name: name.trim(),
+          name,
           ...(workspaceId && workspaceRole === "admin"
             ? { workspace_id: workspaceId }
             : {}),
@@ -415,6 +439,8 @@ export function MindsManager({
       const data = await res.json().catch(() => null);
       if (data?.profile) openProfile(data.profile);
       setShowTemplates(false);
+      setPendingTemplate(null);
+      setNewMindName("");
     }
   };
 
@@ -550,6 +576,9 @@ export function MindsManager({
             integrationIds: capabilities.integrations
               .filter((integration) => integration.granted)
               .map((integration) => integration.id),
+            secretIds: capabilities.secrets
+              .filter((secret) => secret.granted)
+              .map((secret) => secret.id),
           }),
         },
       );
@@ -669,7 +698,7 @@ reply = requests.post(
               <button
                 key={tpl.key}
                 disabled={busy}
-                onClick={() => void createFromTemplate(tpl)}
+                onClick={() => beginCreateFromTemplate(tpl)}
                 className="min-w-0 max-w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-left transition-colors hover:border-cyan-400/40"
               >
                 <div className="text-sm font-medium">{tpl.name}</div>
@@ -679,7 +708,76 @@ reply = requests.post(
           </div>
         )}
 
-        {error && (
+        {pendingTemplate ? (
+          <div
+            className="fixed inset-0 z-[100] flex items-end justify-center bg-black/70 p-0 backdrop-blur-sm sm:items-center sm:p-6"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) cancelCreateFromTemplate();
+            }}
+          >
+            <form
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="new-mind-title"
+              className="w-full rounded-t-2xl border border-white/10 bg-[var(--bg-secondary)] p-5 shadow-2xl sm:max-w-md sm:rounded-2xl"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createFromTemplate();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") cancelCreateFromTemplate();
+              }}
+            >
+              <h2 id="new-mind-title" className="text-base font-semibold text-white">
+                Create a new Mind
+              </h2>
+              <p className="mt-1 text-sm text-zinc-400">
+                Starting from {pendingTemplate.name}. You can customize everything after creation.
+              </p>
+              <label htmlFor="new-mind-name" className={labelCls}>
+                Mind name
+              </label>
+              <input
+                id="new-mind-name"
+                autoFocus
+                required
+                maxLength={80}
+                value={newMindName}
+                onChange={(event) => setNewMindName(event.target.value)}
+                className={inputCls}
+                placeholder="My Mind"
+              />
+              {error ? (
+                <div
+                  role="alert"
+                  className="mt-3 rounded-lg border border-red-400/40 bg-red-400/10 px-3 py-2 text-sm text-red-300"
+                >
+                  {error}
+                </div>
+              ) : null}
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={cancelCreateFromTemplate}
+                  className="rounded-lg border border-white/10 px-4 py-2 text-sm text-zinc-300 hover:bg-white/5 disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={busy || !newMindName.trim()}
+                  className="rounded-lg border border-cyan-400/40 bg-cyan-400/10 px-4 py-2 text-sm text-cyan-300 hover:bg-cyan-400/20 disabled:opacity-40"
+                >
+                  {busy ? "Creating…" : "Create Mind"}
+                </button>
+              </div>
+            </form>
+          </div>
+        ) : null}
+
+        {error && !pendingTemplate && (
           <div className="mb-4 rounded-lg border border-red-400/40 bg-red-400/10 px-3 py-2 text-sm text-red-300">
             {error}
           </div>
@@ -1450,6 +1548,23 @@ reply = requests.post(
                       )}
                     </section>
 
+                    <section className="rounded-xl border border-white/10 bg-black/20 p-3">
+                      <div className="flex items-start justify-between gap-2">
+                        <div><h3 className="text-xs font-medium text-zinc-300">Local secrets</h3><p className="mt-1 text-[11px] text-zinc-600">Grant named secrets to this Mind. The same secret must also be granted to a skill before its local action can use it.</p></div>
+                        <Link href="/settings/secrets" className="shrink-0 text-[11px] text-cyan-300">Manage secrets</Link>
+                      </div>
+                      {capabilities.secrets.length ? (
+                        <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                          {capabilities.secrets.map((secret) => (
+                            <label key={secret.id} className="flex items-start gap-2 rounded-lg border border-white/10 p-2.5 text-xs text-zinc-300">
+                              <input className="mt-0.5" type="checkbox" checked={secret.granted} onChange={() => setCapabilities((current) => current ? { ...current, secrets: current.secrets.map((item) => item.id === secret.id ? { ...item, granted: !item.granted } : item) } : current)}/>
+                              <span><span className="block">{secret.name}</span><code className="text-[10px] text-zinc-600">{secret.key}</code></span>
+                            </label>
+                          ))}
+                        </div>
+                      ) : <p className="mt-2 text-[11px] text-zinc-600">No workspace secrets declared.</p>}
+                    </section>
+
                     <div className="flex justify-end border-t border-white/10 pt-3">
                       <button
                         disabled={capabilitiesBusy}
@@ -1464,6 +1579,8 @@ reply = requests.post(
                   </div>
                 )}
               </div>
+
+              {selected && <HomeInboxConnection key={selected.id} profileId={selected.id} />}
 
               {draft.surface === "external" ? (
                 <div className="mt-6 min-w-0 max-w-full overflow-hidden rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-4">

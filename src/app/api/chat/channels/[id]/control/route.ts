@@ -13,6 +13,17 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { parseTeamChatControlRequest } from "@/lib/teamChat";
 import { sendTeamChatPush } from "@/lib/notifications/webPush";
+import { publicTeamChatAgentProgress } from "@/lib/chat/agentTaskProgress";
+import {
+  chatMessageSyncCursorMatches,
+  parseChatMessageSyncCursor,
+  type ChatMessageSyncCursor,
+} from "@/lib/chat/messageSync";
+import { publicOrchestratorProgress } from "@/lib/chat/orchestratorProgress";
+import {
+  TEAM_CHAT_CONTROLLABLE_ORCHESTRATOR_RUN_STATUSES,
+  TEAM_CHAT_VISIBLE_ORCHESTRATOR_RUN_STATUSES,
+} from "@/lib/chat/orchestratorRunState";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +43,7 @@ type ActiveAgentTask = {
   notify: AgentTaskNotifyTargets | null;
   trace_id: string | null;
   turn_id: string | null;
+  created_at: string;
 };
 
 function text(value: unknown): string {
@@ -82,7 +94,7 @@ async function listActiveAgentTasks(
   const { data, error } = await admin
     .from("agent_tasks")
     .select(
-      "id,user_id,agent_id,status,title,prompt,context,result_meta,orchestrator_session_id,requested_channel,notify,trace_id,turn_id",
+      "id,user_id,agent_id,status,title,prompt,context,result_meta,orchestrator_session_id,requested_channel,notify,trace_id,turn_id,created_at",
     )
     .eq("requested_channel", `team_chat:${channelId}`)
     .in("status", ["queued", "running", "awaiting_approval"])
@@ -108,8 +120,58 @@ async function publicAgentTasks(
     title: task.title || "Agent task",
     agentId: task.agent_id,
     agentName: names.get(task.agent_id) || "Agent",
+    canDecide: true,
     traceId: task.trace_id,
+    startedAt: task.created_at,
+    threadRootMessageId:
+      typeof task.result_meta?.thread_root_message_id === "string"
+        ? task.result_meta.thread_root_message_id
+        : null,
+    ...publicTeamChatAgentProgress(task.result_meta),
   }));
+}
+
+async function reconcileTimelineMessages(
+  admin: SupabaseClient,
+  channelId: string,
+  knownLatest: ChatMessageSyncCursor | null,
+) {
+  const { data: latest, error: latestError } = await admin
+    .from("chat_messages")
+    .select("id,created_at")
+    .eq("channel_id", channelId)
+    .is("thread_root_message_id", null)
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (latestError) throw new Error(latestError.message);
+
+  const latestCursor = parseChatMessageSyncCursor(
+    latest?.id,
+    latest?.created_at,
+  );
+  if (!latestCursor) {
+    return knownLatest ? { messages: [], hasOlder: false } : null;
+  }
+  if (chatMessageSyncCursorMatches(latestCursor, knownLatest)) {
+    return null;
+  }
+
+  const { data, error } = await admin
+    .from("chat_messages")
+    .select("*")
+    .eq("channel_id", channelId)
+    .is("thread_root_message_id", null)
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(51);
+  if (error) throw new Error(error.message);
+  const rows = data || [];
+  return {
+    messages: rows.slice(0, 50).reverse(),
+    hasOlder: rows.length > 50,
+  };
 }
 
 async function cancelAgentTask(
@@ -176,8 +238,10 @@ async function cancelAgentTask(
   const requestId = text(resultMeta.relay_request_id);
   if (previousStatus !== "running" || !requestId) return null;
   try {
-    await deliverCancellation(requestId);
-    return null;
+    const terminationConfirmed = await deliverCancellation(requestId);
+    return terminationConfirmed
+      ? null
+      : "The task was canceled, but the connector found no matching local process, so process termination was not confirmed.";
   } catch (cancelError) {
     // The durable task is already canceled. Its completion route and runner
     // both reject canceled results, so an unreachable connector cannot revive
@@ -188,31 +252,73 @@ async function cancelAgentTask(
   }
 }
 
-export async function GET(_req: Request, { params }: Params) {
+export async function GET(req: Request, { params }: Params) {
   const { id } = await params;
   const visible = await resolveVisibleChannel(id);
   if (visible instanceof NextResponse) return visible;
 
-  const admin = createSupabaseAdminClient();
-  const [{ data: activeRun, error: runError }, tasks] = await Promise.all([
-    admin
-      .from("chat_orchestrator_runs")
-      .select(
-        "id,trace_id,status,profile_id,started_by,control_requested_by,started_at,control_requested_at",
+  const url = new URL(req.url);
+  const syncMessages = url.searchParams.get("syncMessages") === "1";
+  const knownLatest = syncMessages
+    ? parseChatMessageSyncCursor(
+        url.searchParams.get("latestMessageId"),
+        url.searchParams.get("latestMessageCreatedAt"),
       )
-      .eq("channel_id", id)
-      .in("status", ["running", "stop_requested", "redirect_requested"])
-      .order("started_at", { ascending: false })
-      .limit(1)
-      .maybeSingle(),
-    listActiveAgentTasks(admin, id),
-  ]);
+    : null;
+  const admin = createSupabaseAdminClient();
+  const [{ data: activeRun, error: runError }, tasks, messageWindow] =
+    await Promise.all([
+      admin
+        .from("chat_orchestrator_runs")
+        .select(
+          "id,trace_id,status,profile_id,started_by,control_requested_by,started_at,control_requested_at,thread_root_message_id",
+        )
+        .eq("channel_id", id)
+        .in("status", TEAM_CHAT_VISIBLE_ORCHESTRATOR_RUN_STATUSES)
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      listActiveAgentTasks(admin, id),
+      syncMessages
+        ? reconcileTimelineMessages(admin, id, knownLatest)
+        : Promise.resolve(null),
+    ]);
   if (runError) {
     return NextResponse.json({ error: runError.message }, { status: 500 });
   }
+  const { data: progressMessage, error: progressError } = activeRun
+    ? await admin
+        .from("chat_messages")
+        .select("metadata")
+        .eq("channel_id", id)
+        .contains("metadata", { orchestrator_run_id: activeRun.id })
+        .limit(1)
+        .maybeSingle()
+    : { data: null, error: null };
+  if (progressError) {
+    console.warn("[team-chat] orchestrator_progress_read_failed", {
+      channelId: id,
+      runId: activeRun?.id,
+      error: progressError.message,
+    });
+  }
+  const progressMetadata =
+    progressMessage?.metadata &&
+    typeof progressMessage.metadata === "object" &&
+    !Array.isArray(progressMessage.metadata)
+      ? (progressMessage.metadata as Record<string, unknown>)
+      : {};
   return NextResponse.json({
-    orchestrator: activeRun || null,
+    orchestrator: activeRun
+      ? {
+          ...activeRun,
+          progress: publicOrchestratorProgress(
+            progressMetadata.orchestrator_progress,
+          ),
+        }
+      : null,
     agents: await publicAgentTasks(admin, tasks),
+    messageWindow,
   });
 }
 
@@ -240,6 +346,110 @@ export async function POST(req: Request, { params }: Params) {
       );
     }
     try {
+      if (action === "approve" || action === "reject") {
+        if (task.status !== "awaiting_approval") {
+          return NextResponse.json(
+            { error: "That task is no longer awaiting approval" },
+            { status: 409 },
+          );
+        }
+        let decidedTask =
+          action === "approve"
+            ? await approveAgentTask({
+                userId: task.user_id,
+                taskId: task.id,
+                decidedBy: `team_chat:${id}:${visible.user.id}`,
+              })
+            : await rejectAgentTask({
+                userId: task.user_id,
+                taskId: task.id,
+                decidedBy: `team_chat:${id}:${visible.user.id}`,
+              });
+        if (!decidedTask) {
+          return NextResponse.json(
+            { error: "That task is no longer awaiting approval" },
+            { status: 409 },
+          );
+        }
+        if (action === "approve") {
+          const { data: taskOwner } =
+            await admin.auth.admin.getUserById(task.user_id);
+          decidedTask = await kickAgentTask({
+            taskId: task.id,
+            userId: task.user_id,
+            userEmail: taskOwner.user?.email || null,
+            baseUrl: new URL(req.url).origin,
+          });
+        }
+        const agentName =
+          (await publicAgentTasks(admin, [task]))[0]?.agentName ||
+          "the agent";
+        const controllerName = await displayName(
+          admin,
+          visible.user.id,
+        );
+        const controlMessage =
+          action === "approve"
+            ? decidedTask.status === "failed"
+              ? `${controllerName} approved ${agentName}, but the task could not start: ${decidedTask.error || "unknown error"}.`
+              : `${controllerName} approved ${agentName} to start: ${task.title || "Agent task"}.`
+            : `${controllerName} rejected ${agentName} task: ${task.title || "Agent task"}.`;
+        const { data: systemMessage, error: systemMessageError } = await admin
+          .from("chat_messages")
+          .insert({
+            channel_id: id,
+            author_type: "system",
+            content: controlMessage,
+            metadata: {
+              kind: "agent_task_decision",
+              action,
+              target: "agent",
+              task_id: task.id,
+              controlled_by: visible.user.id,
+            },
+          })
+          .select("id")
+          .single();
+        if (systemMessageError || !systemMessage) {
+          console.error("[team-chat] agent approval message failed", {
+            channelId: id,
+            taskId: task.id,
+            error:
+              systemMessageError?.message ||
+              "Approval update message was not returned",
+          });
+          return NextResponse.json({
+            ok: true,
+            action,
+            target,
+            taskId: task.id,
+            warning:
+              "The task decision was applied, but its confirmation message could not be posted.",
+          });
+        }
+        await sendTeamChatPush({
+          admin,
+          channelId: id,
+          messageId: String(systemMessage.id),
+          authorType: "system",
+          authorUserId: visible.user.id,
+          authorLabel: "System",
+          content: controlMessage,
+        }).catch((cause) => {
+          console.warn("[team-chat] agent approval push delivery failed", {
+            channelId: id,
+            error:
+              cause instanceof Error ? cause.message : "Unknown push error",
+          });
+        });
+        return NextResponse.json({
+          ok: true,
+          action,
+          target,
+          taskId: task.id,
+        });
+      }
+
       let replacement = null;
       let cancellationWarning: string | null = null;
       if (action === "redirect") {
@@ -264,6 +474,7 @@ export async function POST(req: Request, { params }: Params) {
           traceId: `team-redirect-${randomUUID()}`,
           turnId: task.turn_id,
           resultMeta: {
+            ...(task.result_meta || {}),
             redirected_from_task_id: task.id,
             redirected_by_user_id: visible.user.id,
           },
@@ -322,7 +533,7 @@ export async function POST(req: Request, { params }: Params) {
         const { data: taskOwner } = await admin.auth.admin.getUserById(
           task.user_id,
         );
-        kickAgentTask({
+        replacement = await kickAgentTask({
           taskId: replacement.id,
           userId: task.user_id,
           userEmail: taskOwner.user?.email || null,
@@ -330,11 +541,14 @@ export async function POST(req: Request, { params }: Params) {
         });
       }
       const controlledAgentName =
-        (await publicAgentTasks(admin, [task]))[0]?.agentName || "the agent";
+        (await publicAgentTasks(admin, [task]))[0]?.agentName ||
+        "the agent";
       const controllerName = await displayName(admin, visible.user.id);
       const controlMessage =
         action === "redirect"
-          ? `${controllerName} redirected ${controlledAgentName}: ${direction!}`
+          ? replacement?.status === "failed"
+            ? `${controllerName} redirected ${controlledAgentName}, but the replacement task could not start: ${replacement.error || "unknown error"}.`
+            : `${controllerName} redirected ${controlledAgentName}: ${direction!}`
           : `${controllerName} stopped ${controlledAgentName}.`;
       const { data: systemMessage, error: systemMessageError } = await admin
         .from("chat_messages")
@@ -396,7 +610,7 @@ export async function POST(req: Request, { params }: Params) {
     .from("chat_orchestrator_runs")
     .select("id,trace_id,status")
     .eq("channel_id", id)
-    .in("status", ["running", "stop_requested", "redirect_requested"])
+    .in("status", TEAM_CHAT_CONTROLLABLE_ORCHESTRATOR_RUN_STATUSES)
     .order("started_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -421,7 +635,7 @@ export async function POST(req: Request, { params }: Params) {
       updated_at: now,
     })
     .eq("id", run.id)
-    .in("status", ["running", "stop_requested", "redirect_requested"])
+    .in("status", TEAM_CHAT_CONTROLLABLE_ORCHESTRATOR_RUN_STATUSES)
     .select("id,status")
     .maybeSingle();
   if (updateError || !updated) {

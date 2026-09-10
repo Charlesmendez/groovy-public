@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { DEFAULT_GROOVY_PERSONA_BLOCK } from "./profilePrompt";
+import { DEFAULT_GROOVY_PROFILE, type HarnessProfile } from "./harnessProfiles";
 import {
   buildKernelPrompt,
   buildOrchestratorPrompt,
@@ -56,20 +57,68 @@ test("the full production default prompt matches its reviewed snapshot", () => {
     createHash("sha256").update(value, "utf8").digest("hex");
   const composed = `${prompt.stableInstructions}\n\n${prompt.dynamicContext}\n\n${prompt.terminalInstructions}`;
 
-  assert.equal(prompt.stableInstructions.length, 19_858);
+  assert.equal(prompt.stableInstructions.length, 21_210);
   assert.equal(
     sha256(prompt.stableInstructions),
-    "81bb3192c18b43590f81989eedd7c07cb09d1611d6cc47fd47a091e46aae311e",
+    "a4fc2493e13b0a9dae0bd3423fc0f73d45c37cb7db4a71d7493bf34271fea829",
   );
-  assert.equal(prompt.dynamicContext.length, 746);
+  assert.equal(prompt.dynamicContext.length, 795);
   assert.equal(
     sha256(prompt.dynamicContext),
-    "9512e74d7d0b2fbb860fa21ba9b60771d0a56db7d691b323f6f852e0fc0fa108",
+    "537c0f3ae00b38269b5a5de17901b32c269818a37c3c261f604cec69ee76f625",
   );
-  assert.equal(prompt.terminalInstructions.length, 1_493);
-  assert.equal(composed.length, 22_101);
+  assert.equal(prompt.terminalInstructions.length, 2_077);
+  assert.equal(composed.length, 24_086);
   assert.equal(
     sha256(composed),
-    "09113c879a62be26429cf8fa2728a2a34dd14e2f13075815258a02a91b108354",
+    "ca87cbc811332d4fff145e2b275160a7112e7eb92cf5c48d8e346ca517906e73",
+  );
+});
+
+test("a custom Mind augments but cannot replace the Groovy orchestration kernel", () => {
+  const customMind: HarnessProfile = {
+    ...DEFAULT_GROOVY_PROFILE,
+    id: "internal-ops",
+    name: "InternalOps",
+    slug: "internalops",
+    personaPrompt: "You are a witty operations teammate.",
+    purpose: "Route requests to the correct worker.",
+    customInstructions: "Be concise.",
+  };
+  const prompt = buildOrchestratorPrompt(
+    "",
+    "",
+    ["chat"],
+    [],
+    false,
+    "2026-07-25T00:00:00.000Z",
+    undefined,
+    [],
+    false,
+    false,
+    false,
+    undefined,
+    {
+      role: "main",
+      mode: "read_only",
+      maxBranches: 1,
+      maxTurnsPerBranch: 3,
+      activeBranches: 0,
+    },
+    false,
+    false,
+    false,
+    customMind,
+  );
+
+  assert.ok(prompt.stableInstructions.startsWith(customMind.personaPrompt!));
+  assert.ok(prompt.stableInstructions.includes("## HOW YOU WORK"));
+  assert.ok(prompt.stableInstructions.includes("## TOOL SELECTION PROTOCOL"));
+  assert.ok(prompt.stableInstructions.includes("## ERROR HANDLING & EFFICIENCY"));
+  assert.ok(prompt.terminalInstructions.includes("Mind profile boundary:"));
+  assert.ok(
+    prompt.terminalInstructions.includes(
+      "It never replaces Groovy's orchestration kernel",
+    ),
   );
 });

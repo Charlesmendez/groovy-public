@@ -1,14 +1,6 @@
 "use client";
 
-/**
- * Groovy landing page — the agent harness.
- *
- * The hero is a self-playing simulation of the real product: an orchestrator
- * receiving a command, dispatching two named agents (Claude Code + Codex),
- * a plan approval, and the WhatsApp completion ping. Show, don't tell.
- */
-
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { MultiplayerSection } from "@/components/marketing/MultiplayerSection";
 import Image from "next/image";
@@ -20,22 +12,25 @@ import {
   Brain,
   CalendarClock,
   Check,
-  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   CreditCard,
   Database,
   FileText,
   KeyRound,
+  LayoutGrid,
   Laptop,
   Loader2,
   Lock,
   Mail,
   Menu,
   MessageCircle,
+  Search,
+  Send,
   Server,
   Shield,
   Sparkles,
   Terminal,
-  Wifi,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -45,10 +40,9 @@ import {
 // ---------------------------------------------------------------------------
 
 const NAV_LINKS = [
-  { label: "Integrations", href: "/integrations" },
-  { label: "Download", href: "/account/downloads" },
+  { label: "Product", href: "#product" },
   { label: "Pricing", href: "#pricing" },
-  { label: "Setup", href: "/setup" },
+  { label: "Source", href: "https://github.com/Charlesmendez/groovy-public" },
   { label: "Sign in", href: "/login" },
 ];
 
@@ -73,6 +67,31 @@ const HOW_IT_WORKS = [
     command: "✓ Fixter finished · 2 files changed · +41 −12",
     description:
       "Watch every agent work live in the grid. Risky work waits for your approval. Done work pings your phone. Transcripts, diffs, and costs are all on the record.",
+  },
+];
+
+const CHAT_FEATURES: Array<{
+  icon: LucideIcon;
+  title: string;
+  description: string;
+}> = [
+  {
+    icon: MessageCircle,
+    title: "A shared room, not a bot inbox",
+    description:
+      "Keep decisions, files, threads, and AI work together where the whole team can see the context.",
+  },
+  {
+    icon: Brain,
+    title: "Bring the right intelligence in",
+    description:
+      "Mention a Mind for company knowledge or an agent for real work. Groovy routes the request without making you switch tools.",
+  },
+  {
+    icon: CalendarClock,
+    title: "Conversations that keep working",
+    description:
+      "Turn a message into a scheduled task, get live progress, and receive the result back in the same channel.",
   },
 ];
 
@@ -247,342 +266,478 @@ const pricingToneClasses: Record<string, { badge: string; icon: string; accent: 
   },
 };
 
-// ---------------------------------------------------------------------------
-// Hero simulation — a scripted loop of the real product
-// ---------------------------------------------------------------------------
+const PRODUCT_SLIDES = [
+  { label: "Command Center", icon: LayoutGrid },
+  { label: "Chat", icon: MessageCircle },
+  { label: "Email", icon: Mail },
+] as const;
 
-const DEMO_COMMAND = "@Fixter fix the flaky auth test, then have Reviewer check it";
-
-type DemoAgentState = "idle" | "working" | "done";
-
-type DemoFrame = {
-  typedChars: number;
-  orchestratorLine: string | null;
-  fixter: DemoAgentState;
-  fixterLog: string[];
-  reviewer: DemoAgentState;
-  reviewerLog: string[];
-  tasks: Array<{ label: string; status: "queued" | "running" | "done" }>;
-  toast: string | null;
-};
-
-const IDLE_FRAME: DemoFrame = {
-  typedChars: 0,
-  orchestratorLine: null,
-  fixter: "idle",
-  fixterLog: [],
-  reviewer: "idle",
-  reviewerLog: [],
-  tasks: [],
-  toast: null,
-};
-
-function useHeroDemo() {
-  const [frame, setFrame] = useState<DemoFrame>(IDLE_FRAME);
-  const cancelledRef = useRef(false);
-
-  useEffect(() => {
-    cancelledRef.current = false;
-    const sleep = (ms: number) =>
-      new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-    const run = async () => {
-      // Respect reduced motion: show the finished state, no loop.
-      if (
-        typeof window !== "undefined" &&
-        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-      ) {
-        setFrame({
-          typedChars: DEMO_COMMAND.length,
-          orchestratorLine: "Both tasks complete. Diff is clean — Reviewer approved.",
-          fixter: "done",
-          fixterLog: ["ran tests · 1 flaky", "fixed race in auth.test.ts", "✓ 14/14 passing"],
-          reviewer: "done",
-          reviewerLog: ["read diff · +41 −12", "✓ approved: race fixed correctly"],
-          tasks: [
-            { label: "Fix flaky auth test", status: "done" },
-            { label: "Review Fixter's diff", status: "done" },
-          ],
-          toast: "✅ Fixter finished: flaky auth test fixed",
-        });
-        return;
-      }
-
-      while (true) {
-        if (cancelledRef.current) return;
-        setFrame(IDLE_FRAME);
-        await sleep(900);
-
-        // 1. Type the command
-        for (let i = 1; i <= DEMO_COMMAND.length; i++) {
-          if (cancelledRef.current) return;
-          setFrame((f) => ({ ...f, typedChars: i }));
-          await sleep(26);
-        }
-        await sleep(500);
-
-        // 2. Orchestrator queues on Fixter
-        if (cancelledRef.current) return;
-        setFrame((f) => ({
-          ...f,
-          orchestratorLine: "Queued on Fixter (Claude Code · Opus 4.7). Reviewer is on deck.",
-          tasks: [{ label: "Fix flaky auth test", status: "queued" }],
-        }));
-        await sleep(1100);
-
-        // 3. Fixter works
-        if (cancelledRef.current) return;
-        setFrame((f) => ({
-          ...f,
-          fixter: "working",
-          tasks: [{ label: "Fix flaky auth test", status: "running" }],
-        }));
-        const fixterLines = [
-          "ran tests · 1 flaky",
-          "found race in auth.test.ts:88",
-          "await session.ready() before assert",
-          "✓ 14/14 passing",
-        ];
-        for (const line of fixterLines) {
-          if (cancelledRef.current) return;
-          setFrame((f) => ({ ...f, fixterLog: [...f.fixterLog, line] }));
-          await sleep(950);
-        }
-
-        // 4. Fixter done → Reviewer starts
-        if (cancelledRef.current) return;
-        setFrame((f) => ({
-          ...f,
-          fixter: "done",
-          reviewer: "working",
-          tasks: [
-            { label: "Fix flaky auth test", status: "done" },
-            { label: "Review Fixter's diff", status: "running" },
-          ],
-        }));
-        await sleep(700);
-        const reviewerLines = ["read diff · +41 −12", "✓ approved: race fixed correctly"];
-        for (const line of reviewerLines) {
-          if (cancelledRef.current) return;
-          setFrame((f) => ({ ...f, reviewerLog: [...f.reviewerLog, line] }));
-          await sleep(1000);
-        }
-
-        // 5. Wrap: reviewer done, toast, final orchestrator line
-        if (cancelledRef.current) return;
-        setFrame((f) => ({
-          ...f,
-          reviewer: "done",
-          tasks: [
-            { label: "Fix flaky auth test", status: "done" },
-            { label: "Review Fixter's diff", status: "done" },
-          ],
-          toast: "✅ Fixter finished: flaky auth test fixed",
-          orchestratorLine: "Both tasks complete. Diff is clean — Reviewer approved.",
-        }));
-        await sleep(4200);
-      }
-    };
-
-    void run();
-    return () => {
-      cancelledRef.current = true;
-    };
-  }, []);
-
-  return frame;
+function ProductShell({ active, children }: { active: number; children: React.ReactNode }) {
+  return (
+    <div className="h-full overflow-hidden rounded-2xl border border-white/15 bg-[#09090d] shadow-2xl shadow-black/50">
+      <div className="flex h-12 items-center gap-3 border-b border-white/10 px-3 sm:h-14 sm:px-5">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-white sm:mr-2">
+          <Image src="/sloth_no_bg.png" alt="" width={26} height={26} className="h-5 w-5 sm:h-6 sm:w-6" />
+          <span className="hidden sm:inline">Groovy</span>
+        </div>
+        <div className="flex items-center gap-1 rounded-xl border border-white/10 bg-black/30 p-1">
+          {PRODUCT_SLIDES.map((slide, index) => {
+            const Icon = slide.icon;
+            return (
+              <span
+                key={slide.label}
+                className={`flex h-7 w-7 items-center justify-center rounded-lg sm:h-8 sm:w-8 ${
+                  active === index
+                    ? "border border-cyan-400/25 bg-cyan-400/10 text-cyan-300"
+                    : "text-zinc-600"
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+              </span>
+            );
+          })}
+        </div>
+        <div className="ml-auto flex items-center gap-2 text-[9px] text-zinc-500 sm:text-[10px]">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+          Connected
+        </div>
+      </div>
+      {children}
+    </div>
+  );
 }
 
-function DemoAgentTile({
-  name,
-  harness,
-  model,
-  state,
-  log,
-  accent,
-}: {
-  name: string;
-  harness: string;
-  model: string;
-  state: DemoAgentState;
-  log: string[];
-  accent: "orange" | "emerald";
-}) {
-  const accentClasses =
-    accent === "orange"
-      ? { chip: "bg-orange-500/10 text-orange-300", beam: "via-orange-400" }
-      : { chip: "bg-emerald-500/10 text-emerald-300", beam: "via-emerald-400" };
+function CommandCenterPreview() {
   return (
-    <div
-      className={`relative rounded-xl border bg-black/30 overflow-hidden transition-colors duration-500 ${
-        state === "working" ? "border-white/20" : "border-white/10"
-      }`}
-    >
-      {state === "working" && (
-        <div className="absolute top-0 left-0 right-0 h-[2px] overflow-hidden">
-          <div
-            className={`h-full w-1/3 bg-gradient-to-r from-transparent ${accentClasses.beam} to-transparent animate-[harness-beam_1.6s_linear_infinite]`}
-          />
+    <div className="h-[300px] p-3 sm:h-[420px] sm:p-5">
+      <div className="mb-3 flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-2 sm:mb-4 sm:p-3">
+        <div className="flex items-center gap-2 text-[10px] font-medium text-zinc-300 sm:text-xs">
+          <LayoutGrid className="h-3.5 w-3.5 text-cyan-300" /> Workspace layout
         </div>
-      )}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5">
-        <span
-          className={`w-1.5 h-1.5 rounded-full transition-colors duration-500 ${
-            state === "working"
-              ? "bg-cyan-400 animate-pulse"
-              : state === "done"
-                ? "bg-emerald-400"
-                : "bg-zinc-700"
-          }`}
-        />
-        <span className="text-xs font-semibold text-white">{name}</span>
-        <span className={`text-[9px] px-1.5 py-px rounded ${accentClasses.chip}`}>{harness}</span>
-        <span className="ml-auto text-[9px] font-mono text-zinc-600">{model}</span>
+        <div className="hidden rounded-lg border border-white/10 bg-black/25 px-3 py-1.5 text-[10px] text-zinc-400 sm:block">
+          Agents <span className="ml-1 text-white">3 / 8</span>
+        </div>
+        <div className="ml-auto rounded-lg bg-cyan-500 px-3 py-1.5 text-[10px] font-semibold text-black sm:text-xs">
+          + New agent
+        </div>
       </div>
-      <div className="px-3 py-2 h-[92px] font-mono text-[10px] leading-relaxed text-zinc-500 overflow-hidden">
-        <AnimatePresence initial={false}>
-          {log.length === 0 ? (
-            <span className="text-zinc-700">idle — awaiting dispatch</span>
-          ) : (
-            log.slice(-4).map((line) => (
-              <motion.div
-                key={line}
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                className={line.startsWith("✓") ? "text-emerald-400/90" : undefined}
-              >
-                {line}
-              </motion.div>
-            ))
-          )}
-        </AnimatePresence>
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        {[
+          {
+            initial: "C",
+            name: "Code",
+            model: "Codex · GPT-5.6 Sol",
+            text: "Implemented the draft sync fix. All checks are passing.",
+            prompt: "Ask Code…",
+          },
+          {
+            initial: "R",
+            name: "Reviewer",
+            model: "Claude Code · Opus",
+            text: "Reviewed the diff. No blocking issues found.",
+            prompt: "Ask Reviewer…",
+          },
+        ].map((agent, index) => (
+          <div
+            key={agent.name}
+            className={`${index === 1 ? "hidden sm:block" : "block"} rounded-xl border border-white/10 bg-white/[0.025] p-3 sm:p-4`}
+          >
+            <div className="flex items-center gap-2">
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/[0.06] text-[10px] font-semibold text-white">
+                {agent.initial}
+              </span>
+              <div>
+                <div className="text-xs font-semibold text-white sm:text-sm">{agent.name}</div>
+                <div className="text-[9px] text-cyan-300 sm:text-[10px]">{agent.model}</div>
+              </div>
+              <div className="ml-auto flex items-center gap-1.5 text-[9px] text-emerald-400 sm:text-[10px]">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> Ready
+              </div>
+            </div>
+            <div className="mt-3 rounded-lg bg-black/35 p-3 text-[10px] leading-relaxed text-zinc-400 sm:mt-5 sm:text-xs">
+              {agent.text}
+            </div>
+            <div className="mt-3 flex items-center rounded-lg border border-white/10 px-3 py-2 text-[10px] text-zinc-600 sm:mt-4 sm:text-xs">
+              {agent.prompt}
+              <Send className="ml-auto h-3.5 w-3.5 text-cyan-400" />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-black/25 p-2.5 text-[10px] text-zinc-500 sm:mt-4 sm:p-3 sm:text-xs">
+        <span className="rounded-lg bg-white/[0.05] px-2 py-1 text-zinc-300">Groovy</span>
+        <span className="rounded-lg border border-cyan-400/20 px-2 py-1 text-cyan-300">Auto</span>
+        <span className="truncate">Ask anything, or @mention an agent…</span>
       </div>
     </div>
   );
 }
 
-function HeroDemo() {
-  const frame = useHeroDemo();
-
-  // Decorative product simulation: no interactive elements, hidden from
-  // assistive tech so the tiny mono text is never announced or focusable.
+function ChatPreview() {
   return (
-    <div className="relative" aria-hidden="true">
-      {/* Glow */}
-      <div className="absolute -inset-6 bg-gradient-to-br from-cyan-500/10 via-transparent to-violet-500/10 rounded-3xl blur-2xl pointer-events-none" />
-
-      <div className="relative rounded-2xl border border-white/10 bg-zinc-950/90 backdrop-blur-xl shadow-2xl overflow-hidden">
-        {/* Window chrome */}
-        <div className="flex items-center gap-1.5 px-4 py-2.5 border-b border-white/5 bg-white/[0.02]">
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-          <span className="w-2.5 h-2.5 rounded-full bg-zinc-700" />
-          <span className="ml-3 text-[10px] font-mono text-zinc-600">groovy — harness</span>
-          <span className="ml-auto flex items-center gap-1 text-[9px] text-emerald-400">
-            <Wifi className="w-2.5 h-2.5" /> connector online
-          </span>
+    <div className="flex h-[300px] flex-col sm:h-[420px]">
+      <div className="flex items-center border-b border-white/10 px-4 py-3 sm:px-6">
+        <div>
+          <div className="text-xs font-semibold text-white sm:text-sm"># launch-room</div>
+          <div className="text-[9px] text-zinc-600 sm:text-[10px]">People and agents, one conversation</div>
         </div>
+        <div className="ml-auto rounded-lg border border-white/10 px-2.5 py-1.5 text-[9px] text-zinc-400 sm:text-[10px]">
+          Huddle
+        </div>
+      </div>
 
-        <div className="p-3 sm:p-4 space-y-3">
-          {/* Command bar */}
-          <div className="rounded-xl border border-cyan-400/20 bg-black/40 px-3 py-2.5 font-mono text-[11px] sm:text-xs">
-            <span className="text-cyan-400 select-none">❯ </span>
-            <span className="text-zinc-100">{DEMO_COMMAND.slice(0, frame.typedChars)}</span>
-            <span className="inline-block w-[7px] h-3.5 bg-cyan-400 ml-px align-middle animate-pulse" />
+      <div className="flex-1 space-y-3 overflow-hidden px-4 py-3 sm:space-y-5 sm:px-6 sm:py-5">
+        <div className="flex gap-2.5">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-violet-500/20 text-[9px] font-semibold text-violet-200">CM</span>
+          <div>
+            <div className="text-[10px] font-semibold text-white sm:text-xs">Carlos <span className="ml-1 font-normal text-zinc-600">9:41 AM</span></div>
+            <p className="mt-1 text-[10px] leading-relaxed text-zinc-300 sm:text-xs">@Groovy summarize today&apos;s customer blockers and give Code the fix we can ship now.</p>
           </div>
-
-          {/* Orchestrator response */}
-          <div className="h-5 px-1">
-            <AnimatePresence mode="wait">
-              {frame.orchestratorLine && (
-                <motion.div
-                  key={frame.orchestratorLine}
-                  initial={{ opacity: 0, y: 3 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  className="flex items-center gap-1.5 text-[10px] sm:text-[11px] text-zinc-400"
-                >
-                  <Brain className="w-3 h-3 text-violet-400 shrink-0" />
-                  {frame.orchestratorLine}
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-
-          {/* Agent grid */}
-          <div className="grid grid-cols-2 gap-3">
-            <DemoAgentTile
-              name="Fixter"
-              harness="Claude Code"
-              model="opus-4.7"
-              state={frame.fixter}
-              log={frame.fixterLog}
-              accent="orange"
-            />
-            <DemoAgentTile
-              name="Reviewer"
-              harness="Codex"
-              model="gpt-5.6-sol"
-              state={frame.reviewer}
-              log={frame.reviewerLog}
-              accent="emerald"
-            />
-          </div>
-
-          {/* Task rail */}
-          <div className="rounded-xl border border-white/5 bg-white/[0.02] px-3 py-2 min-h-[58px]">
-            <div className="text-[9px] uppercase tracking-widest text-zinc-600 mb-1.5">Tasks</div>
-            <div className="space-y-1">
-              <AnimatePresence initial={false}>
-                {frame.tasks.length === 0 ? (
-                  <span className="text-[10px] font-mono text-zinc-700">—</span>
-                ) : (
-                  frame.tasks.map((task) => (
-                    <motion.div
-                      key={task.label}
-                      initial={{ opacity: 0, x: -6 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      className="flex items-center gap-2 text-[10px] sm:text-[11px]"
-                    >
-                      {task.status === "running" ? (
-                        <Loader2 className="w-3 h-3 text-cyan-300 animate-spin shrink-0" />
-                      ) : task.status === "done" ? (
-                        <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
-                      ) : (
-                        <span className="w-3 h-3 rounded-full border border-zinc-700 shrink-0" />
-                      )}
-                      <span
-                        className={task.status === "done" ? "text-zinc-500" : "text-zinc-300"}
-                      >
-                        {task.label}
-                      </span>
-                    </motion.div>
-                  ))
-                )}
-              </AnimatePresence>
+        </div>
+        <div className="flex gap-2.5">
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-cyan-400/20 bg-cyan-400/10 text-cyan-300">✦</span>
+          <div>
+            <div className="text-[10px] font-semibold text-cyan-300 sm:text-xs">Groovy <span className="ml-1 font-normal text-zinc-600">9:42 AM</span></div>
+            <p className="mt-1 text-[10px] leading-relaxed text-zinc-300 sm:text-xs">Three blockers found. The draft sync issue is reproducible, so I sent it to Code.</p>
+            <div className="mt-2 inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.025] px-2.5 py-1.5 text-[9px] text-zinc-400 sm:text-[10px]">
+              <Loader2 className="h-3 w-3 animate-spin text-cyan-300" /> Code is working
             </div>
           </div>
         </div>
+      </div>
 
-        {/* WhatsApp toast */}
-        <AnimatePresence>
-          {frame.toast && (
-            <motion.div
-              initial={{ opacity: 0, y: 16, scale: 0.96 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 8 }}
-              className="absolute bottom-3 right-3 flex items-center gap-2 rounded-xl border border-emerald-400/20 bg-zinc-900/95 backdrop-blur px-3 py-2 shadow-xl"
-            >
-              <MessageCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <div>
-                <div className="text-[9px] text-zinc-500">WhatsApp</div>
-                <div className="text-[10px] text-zinc-200">{frame.toast}</div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+      <div className="m-3 rounded-xl border border-white/10 bg-black/25 p-3 sm:m-4">
+        <div className="text-[10px] text-zinc-600 sm:text-xs">Message #launch-room or mention an AI teammate…</div>
+        <div className="mt-3 flex items-center text-zinc-600">
+          <span className="text-xs">B &nbsp; / &nbsp; @</span>
+          <Send className="ml-auto h-4 w-4 text-cyan-400" />
+        </div>
       </div>
     </div>
+  );
+}
+
+function EmailPreview() {
+  const messages = [
+    { initials: "JP", sender: "Jack", subject: "Re: Proposal follow-up", tag: "Draft ready", tone: "violet" },
+    { initials: "AC", sender: "Acme Cloud", subject: "Your weekly usage report", tag: "Worth reading", tone: "orange" },
+    { initials: "ML", sender: "Maya", subject: "Launch checklist", tag: "Needs reply", tone: "cyan" },
+  ];
+
+  return (
+    <div className="h-[300px] sm:h-[420px]">
+      <div className="border-b border-white/10 p-3 sm:p-4">
+        <div className="flex items-center rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-[10px] text-zinc-600 sm:text-xs">
+          <Search className="mr-2 h-3.5 w-3.5" /> Search every mailbox
+          <span className="ml-auto text-zinc-700">/</span>
+        </div>
+        <div className="mt-2 flex items-center gap-2 text-[9px] text-zinc-500 sm:text-[10px]">
+          <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" /> Checking for new mail across 3 mailboxes
+          <span className="ml-auto">Done → Noise</span>
+        </div>
+      </div>
+
+      <div className="border-b border-white/10 px-4 py-2 text-[9px] font-medium uppercase tracking-[0.16em] text-zinc-500 sm:px-5 sm:text-[10px]">
+        Ready to send <span className="ml-2 normal-case tracking-normal text-zinc-700">AI drafts waiting for your eyes</span>
+      </div>
+
+      <div className="divide-y divide-white/[0.07]">
+        {messages.map((message, index) => (
+          <div key={message.subject} className={`${index === 2 ? "hidden sm:flex" : "flex"} items-start gap-3 px-4 py-3 sm:px-5 sm:py-4`}>
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.06] text-[9px] font-semibold text-zinc-300 sm:h-9 sm:w-9 sm:text-[10px]">
+              {message.initials}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-medium text-zinc-200 sm:text-xs">{message.sender}</span>
+                <span className="ml-auto text-[8px] text-zinc-700 sm:text-[9px]">9:24 AM</span>
+              </div>
+              <div className="mt-0.5 truncate text-[10px] text-white sm:text-xs">{message.subject}</div>
+              <div className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-white/10 px-2 py-1 text-[8px] text-zinc-400 sm:text-[9px]">
+                <span className={`h-1.5 w-1.5 rounded-full ${
+                  message.tone === "violet" ? "bg-violet-400" : message.tone === "orange" ? "bg-orange-400" : "bg-cyan-400"
+                }`} />
+                {message.tag}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProductCarousel() {
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const interval = window.setInterval(() => {
+      setActive((current) => (current + 1) % PRODUCT_SLIDES.length);
+    }, 6000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const setPrevious = () => setActive((current) => (current - 1 + PRODUCT_SLIDES.length) % PRODUCT_SLIDES.length);
+  const setNext = () => setActive((current) => (current + 1) % PRODUCT_SLIDES.length);
+
+  return (
+    <div aria-label="Groovy product tour" className="relative">
+      <div className="mb-4 flex items-center justify-center gap-2" role="tablist" aria-label="Product areas">
+        {PRODUCT_SLIDES.map((slide, index) => {
+          const Icon = slide.icon;
+          return (
+            <button
+              key={slide.label}
+              type="button"
+              role="tab"
+              aria-selected={active === index}
+              onClick={() => setActive(index)}
+              className={`flex items-center gap-2 rounded-full border px-3 py-2 text-[11px] font-medium transition-colors sm:px-4 sm:text-xs ${
+                active === index
+                  ? "border-cyan-400/30 bg-cyan-400/10 text-white"
+                  : "border-white/10 bg-white/[0.025] text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {slide.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="pointer-events-none absolute inset-x-8 top-16 bottom-0 rounded-[3rem] bg-gradient-to-r from-cyan-500/15 via-violet-500/10 to-emerald-500/10 blur-3xl" />
+      <div className="relative">
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.div
+            key={active}
+            initial={{ opacity: 0, x: 18 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: -18 }}
+            transition={{ duration: 0.25 }}
+          >
+            <ProductShell active={active}>
+              {active === 0 ? <CommandCenterPreview /> : active === 1 ? <ChatPreview /> : <EmailPreview />}
+            </ProductShell>
+          </motion.div>
+        </AnimatePresence>
+
+        <button
+          type="button"
+          onClick={setPrevious}
+          aria-label="Show previous product screen"
+          className="absolute left-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-white/10 bg-black/70 text-zinc-300 backdrop-blur transition-colors hover:bg-zinc-900 sm:-left-4 sm:h-9 sm:w-9"
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={setNext}
+          aria-label="Show next product screen"
+          className="absolute right-2 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-white/10 bg-black/70 text-zinc-300 backdrop-blur transition-colors hover:bg-zinc-900 sm:-right-4 sm:h-9 sm:w-9"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ChatShowcase() {
+  return (
+    <section
+      id="chat"
+      className="relative z-10 scroll-mt-24 border-t border-white/5 px-6 py-24"
+    >
+      <div className="mx-auto grid max-w-6xl items-center gap-12 lg:grid-cols-[0.88fr_1.12fr]">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
+        >
+          <div className="mb-3 text-xs font-mono text-cyan-400">
+            {"// groovy chat"}
+          </div>
+          <h2 className="max-w-xl text-3xl font-bold leading-tight text-white sm:text-4xl">
+            Where people and AI work in the same room.
+          </h2>
+          <p className="mt-5 max-w-xl text-base leading-7 text-zinc-400">
+            Groovy Chat is the shared surface for your team, your company
+            knowledge, and your live agents. Ask once, keep the context in the
+            channel, and let the result come back to everyone.
+          </p>
+
+          <div className="mt-8 space-y-5">
+            {CHAT_FEATURES.map((feature) => {
+              const Icon = feature.icon;
+              return (
+                <div key={feature.title} className="flex gap-3">
+                  <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-cyan-400/15 bg-cyan-400/[0.05]">
+                    <Icon className="h-3.5 w-3.5 text-cyan-300" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-semibold text-zinc-100">
+                      {feature.title}
+                    </h3>
+                    <p className="mt-1 text-sm leading-6 text-zinc-500">
+                      {feature.description}
+                    </p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <Link
+            href="/chat"
+            className="group mt-8 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-sm font-medium text-white transition hover:border-cyan-400/25 hover:bg-cyan-400/[0.06]"
+          >
+            Open Groovy Chat
+            <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+          </Link>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 24 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true }}
+          transition={{ delay: 0.1 }}
+          className="overflow-hidden rounded-3xl border border-white/10 bg-[#0a0b0e] shadow-2xl shadow-cyan-950/20"
+        >
+          <div className="flex h-11 items-center border-b border-white/[0.07] px-4">
+            <div className="flex gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-full bg-red-400/60" />
+              <span className="h-2.5 w-2.5 rounded-full bg-amber-400/60" />
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/60" />
+            </div>
+            <div className="mx-auto flex items-center gap-1.5 text-[11px] text-zinc-500">
+              <MessageCircle className="h-3 w-3 text-cyan-400" />
+              Groovy Chat
+            </div>
+            <span className="text-[9px] font-mono text-emerald-400">
+              3 online
+            </span>
+          </div>
+
+          <div className="grid min-h-[430px] sm:grid-cols-[150px_1fr]">
+            <aside className="hidden border-r border-white/[0.06] bg-white/[0.015] p-3 sm:block">
+              <div className="mb-3 text-[9px] font-mono uppercase tracking-[0.18em] text-zinc-600">
+                Channels
+              </div>
+              {([
+                ["# launch-room", true],
+                ["# customer-ops", false],
+                ["# engineering", false],
+              ] as const).map(([name, active]) => (
+                <div
+                  key={name}
+                  className={`mb-1 rounded-lg px-2.5 py-2 text-[11px] ${
+                    active
+                      ? "bg-cyan-400/[0.08] text-cyan-100"
+                      : "text-zinc-500"
+                  }`}
+                >
+                  {name}
+                </div>
+              ))}
+              <div className="mb-2 mt-6 text-[9px] font-mono uppercase tracking-[0.18em] text-zinc-600">
+                AI teammates
+              </div>
+              <div className="flex items-center gap-2 px-2 py-1.5 text-[10px] text-zinc-400">
+                <span className="flex h-5 w-5 items-center justify-center rounded-md bg-violet-400/10 text-violet-300">
+                  <Brain className="h-3 w-3" />
+                </span>
+                Scout Mind
+              </div>
+              <div className="flex items-center gap-2 px-2 py-1.5 text-[10px] text-zinc-400">
+                <span className="flex h-5 w-5 items-center justify-center rounded-md bg-cyan-400/10 text-cyan-300">
+                  <Bot className="h-3 w-3" />
+                </span>
+                Fixter Agent
+              </div>
+            </aside>
+
+            <div className="flex min-w-0 flex-col">
+              <div className="flex h-12 items-center border-b border-white/[0.06] px-4">
+                <div>
+                  <div className="text-xs font-semibold text-white">
+                    # launch-room
+                  </div>
+                  <div className="text-[9px] text-zinc-600">
+                    The work and the decisions, together
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex-1 space-y-5 p-4 sm:p-5">
+                <div className="flex gap-3">
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-orange-400/10 text-[10px] font-semibold text-orange-200">
+                    CM
+                  </span>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-medium text-zinc-200">
+                        Carlos
+                      </span>
+                      <span className="text-[9px] text-zinc-700">9:41 AM</span>
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-zinc-400">
+                      <span className="text-cyan-300">@Scout</span> summarize
+                      today&apos;s customer blockers and ask Fixter to handle
+                      anything we can ship now.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex gap-3">
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-400/10 text-violet-300">
+                    <Brain className="h-3.5 w-3.5" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-medium text-violet-200">
+                        Scout
+                      </span>
+                      <span className="rounded-full bg-violet-400/[0.08] px-1.5 py-0.5 text-[8px] text-violet-300">
+                        Mind
+                      </span>
+                    </div>
+                    <div className="mt-2 rounded-xl border border-violet-400/10 bg-violet-400/[0.035] p-3 text-[11px] leading-5 text-zinc-400">
+                      I found three blockers across support and email. Two need
+                      decisions; the attachment issue is reproducible and ready
+                      for Fixter.
+                    </div>
+                    <div className="mt-2 inline-flex items-center gap-2 rounded-lg border border-cyan-400/10 bg-cyan-400/[0.04] px-2.5 py-1.5 text-[9px] text-cyan-200">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      Fixter is working · attachment preview
+                    </div>
+                  </div>
+                </div>
+
+                <div className="ml-11 flex items-center gap-2 rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2.5">
+                  <CalendarClock className="h-3.5 w-3.5 text-emerald-300" />
+                  <div>
+                    <div className="text-[10px] text-zinc-300">
+                      Customer pulse scheduled
+                    </div>
+                    <div className="text-[9px] text-zinc-600">
+                      Every weekday at 5:00 PM · posts here
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="m-3 flex items-center gap-2 rounded-xl border border-white/[0.09] bg-white/[0.025] px-3 py-2.5 text-[10px] text-zinc-600">
+                Message #launch-room or mention an AI teammate…
+                <MessageCircle className="ml-auto h-3.5 w-3.5 text-zinc-700" />
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      </div>
+    </section>
   );
 }
 
@@ -633,7 +788,7 @@ export default function LandingPage() {
               alt="Groovy"
               width={400}
               height={112}
-              className="h-20 sm:h-28 w-auto -my-3 sm:-my-4"
+              className="-my-2 h-16 w-auto sm:h-20"
               unoptimized
               priority
             />
@@ -643,7 +798,7 @@ export default function LandingPage() {
             initial={{ opacity: 0, x: 20 }}
             animate={mounted ? { opacity: 1, x: 0 } : {}}
             transition={{ duration: 0.6 }}
-            className="hidden md:flex items-center gap-2 lg:gap-4"
+            className="hidden xl:flex items-center gap-2 lg:gap-4"
           >
             {NAV_LINKS.map((item) =>
               item.href.startsWith("#") ? (
@@ -672,7 +827,7 @@ export default function LandingPage() {
             </Link>
           </motion.div>
 
-          <div className="md:hidden flex items-center gap-2">
+          <div className="xl:hidden flex items-center gap-2">
             <Link
               href="/dashboard"
               className="px-3 py-2 rounded-lg bg-gradient-to-r from-cyan-500 to-cyan-600 text-black font-medium text-xs shadow-lg shadow-cyan-500/20"
@@ -696,7 +851,7 @@ export default function LandingPage() {
               initial={{ opacity: 0, y: -8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
-              className="md:hidden border-t border-white/5 bg-zinc-950/95 backdrop-blur-xl"
+              className="xl:hidden border-t border-white/5 bg-zinc-950/95 backdrop-blur-xl"
             >
               <div className="px-4 py-3 grid grid-cols-2 gap-2">
                 {NAV_LINKS.map((item) => (
@@ -716,58 +871,63 @@ export default function LandingPage() {
       </header>
 
       {/* ── Hero ─────────────────────────────────────────────────────────── */}
-      <section className="relative z-10 pt-40 sm:pt-48 pb-20 px-6">
-        <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-12 lg:gap-10 items-center">
+      <section id="product" className="relative z-10 scroll-mt-24 px-4 pb-20 pt-28 sm:px-6 sm:pt-32">
+        <div className="mx-auto max-w-6xl">
           <motion.div
             initial={{ opacity: 0, y: 24 }}
             animate={mounted ? { opacity: 1, y: 0 } : {}}
             transition={{ duration: 0.7 }}
+            className="text-center"
           >
-            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/[0.03] mb-6">
-              <Terminal className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="text-xs font-mono text-zinc-400">the agent harness</span>
-            </div>
-
-            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white leading-[1.05] tracking-tight mb-6">
-              Run agents like a team,{" "}
-              <br className="hidden sm:block" />
-              <span className="text-gradient">not like tabs.</span>
+            <h1 className="text-5xl font-bold leading-[0.98] tracking-[-0.045em] text-white sm:text-6xl lg:text-7xl">
+              All in one AI harness:
             </h1>
 
-            <p className="text-lg sm:text-xl text-zinc-400 leading-relaxed mb-8 max-w-xl">
-              Groovy turns Claude&nbsp;Code and Codex into a workforce. One
-              orchestrator you talk to — from team chat, WhatsApp, or an API
-              your customers use — and named agents that do the work in your
-              repos, on your machines, with your keys.
-            </p>
-
-            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 mb-6">
-              <Link
-                href="/dashboard"
-                className="group flex items-center gap-2 px-6 py-3.5 rounded-xl bg-gradient-to-r from-cyan-500 to-cyan-600 text-black font-semibold shadow-xl shadow-cyan-500/25 hover:shadow-cyan-500/40 transition-all"
-              >
-                Start free trial
-                <ArrowRight className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" />
-              </Link>
-              <a
-                href="#how"
-                className="flex items-center gap-2 px-6 py-3.5 rounded-xl border border-white/15 bg-white/[0.03] text-white font-medium hover:bg-white/[0.06] transition-all"
-              >
-                See it work
-              </a>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-2xl font-medium text-zinc-300 sm:text-3xl">
+              <span className="inline-flex items-center gap-2">
+                <Terminal className="h-5 w-5 text-cyan-400" /> Coding
+              </span>
+              <span aria-hidden="true" className="text-zinc-700">·</span>
+              <span className="inline-flex items-center gap-2">
+                <MessageCircle className="h-5 w-5 text-violet-400" /> Chat
+              </span>
+              <span aria-hidden="true" className="text-zinc-700">·</span>
+              <span className="inline-flex items-center gap-2">
+                <Mail className="h-5 w-5 text-emerald-400" /> Email
+              </span>
             </div>
 
-            <p className="text-xs text-zinc-600 font-mono">
-              5-day free trial · your API keys · macOS &amp; Windows
-            </p>
+            <div className="mt-6 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-4 py-2 text-sm font-medium text-zinc-300">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              Fully source-available
+            </div>
+
+            <div className="mt-7 flex flex-col items-center justify-center gap-3 sm:flex-row">
+              <Link
+                href="/dashboard"
+                className="group flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-500 to-cyan-600 px-6 py-3.5 font-semibold text-black shadow-xl shadow-cyan-500/25 transition-all hover:shadow-cyan-500/40"
+              >
+                Start free trial
+                <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+              </Link>
+              <a
+                href="https://github.com/Charlesmendez/groovy-public"
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-xl border border-white/15 bg-white/[0.03] px-6 py-3.5 font-medium text-white transition-all hover:bg-white/[0.06]"
+              >
+                View source
+              </a>
+            </div>
           </motion.div>
 
           <motion.div
             initial={{ opacity: 0, y: 32 }}
             animate={mounted ? { opacity: 1, y: 0 } : {}}
-            transition={{ duration: 0.7, delay: 0.15 }}
+            transition={{ duration: 0.8, delay: 0.12 }}
+            className="relative mx-auto mt-12 max-w-5xl"
           >
-            <HeroDemo />
+            <ProductCarousel />
           </motion.div>
         </div>
       </section>
@@ -791,6 +951,8 @@ export default function LandingPage() {
           </motion.p>
         </div>
       </section>
+
+      <ChatShowcase />
 
       {/* ── Multiplayer AI: the new architecture ─────────────────────────── */}
       <MultiplayerSection />

@@ -12,6 +12,7 @@ import {
   FileText,
   GitBranch,
   HelpCircle,
+  Pencil,
   Laptop2,
   Loader2,
   LockKeyhole,
@@ -26,6 +27,10 @@ import {
 } from "lucide-react";
 import { useRelay, type RelayMessage } from "@/hooks/useRelay";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import {
+  defaultSkillActionsManifest,
+  skillActionsManifestRelativePath,
+} from "@/lib/skills-manager/actionManifestAuthoring";
 
 type Target = "all" | "flow" | "claude" | "codex";
 type ArtifactType = "skill" | "instruction_doc";
@@ -62,6 +67,9 @@ type Artifact = {
   lifecycle: string;
   metadata?: Record<string, unknown>;
   risk_flags?: string[];
+  content_snapshot?: string | null;
+  content_snapshot_truncated?: boolean;
+  content_snapshot_updated_at?: string | null;
   updated_at?: string | null;
 };
 
@@ -188,6 +196,9 @@ function formatSkillsActionError(json: Record<string, unknown>, fallback: string
       .filter(Boolean)
       .join("\n");
   }
+  if (errorCode === "artifact_changed_on_remote") {
+    return "This skill changed on GitHub after you opened it. Pull from GitHub, review the latest instructions, and edit again. Your newer GitHub version was not overwritten.";
+  }
   return errorCode || fallback;
 }
 
@@ -218,14 +229,18 @@ function slugify(value: string) {
 }
 
 function targetBadgeClass(target: Target) {
-  if (target === "flow") return "border-emerald-400/25 bg-emerald-500/10 text-emerald-200";
-  if (target === "claude") return "border-cyan-400/25 bg-cyan-500/10 text-cyan-200";
-  if (target === "codex") return "border-sky-400/25 bg-sky-500/10 text-sky-200";
-  return "border-white/10 bg-white/5 text-zinc-300";
+  return target === "all"
+    ? "border-white/15 bg-white/[0.07] text-zinc-200"
+    : "border-cyan-400/30 bg-cyan-500/10 text-cyan-100";
 }
 
 function riskLabel(flag: string) {
   return flag.replace(/_/g, " ");
+}
+
+function artifactActions(artifact: Artifact) {
+  const manifest = asRecord(asRecord(artifact.metadata).groovyActions);
+  return Array.isArray(manifest.actions) ? manifest.actions.map(asRecord) : [];
 }
 
 function defaultSkillContent(name: string, targets: Target[]) {
@@ -283,6 +298,8 @@ export function SkillsManagerContent({
   const [onlineDevices, setOnlineDevices] = useState<Map<string, RelayMessage>>(new Map());
   const [helpOpen, setHelpOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editingArtifact, setEditingArtifact] = useState<Artifact | null>(null);
+  const [editContent, setEditContent] = useState("");
   const [selectedRepoId, setSelectedRepoId] = useState<string>("");
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
   const [agentTarget, setAgentTarget] = useState<Target>("flow");
@@ -296,6 +313,10 @@ export function SkillsManagerContent({
   const [createPath, setCreatePath] = useState("skills/security-review/SKILL.md");
   const [createTargets, setCreateTargets] = useState<Target[]>(["all"]);
   const [createContent, setCreateContent] = useState(defaultSkillContent("Security Review", ["all"]));
+  const [createActionsEnabled, setCreateActionsEnabled] = useState(false);
+  const [createActionsContent, setCreateActionsContent] = useState(
+    defaultSkillActionsManifest,
+  );
 
   const loadState = useCallback(async () => {
     setLoading(true);
@@ -394,6 +415,14 @@ export function SkillsManagerContent({
       ) || null
     );
   }, [artifacts, createKind, createPath, selectedRepoId]);
+  const createActionsPath = useMemo(() => {
+    if (createKind !== "skill") return "";
+    try {
+      return skillActionsManifestRelativePath(createPath);
+    } catch {
+      return "groovy-actions.json";
+    }
+  }, [createKind, createPath]);
 
   const filteredRuntimeSkills = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -441,6 +470,10 @@ export function SkillsManagerContent({
       setCreateContent(defaultInstructionContent(createName || filename.replace(/\.md$/i, ""), createTargets));
     }
   }, [createKind, createName, createTargets]);
+
+  useEffect(() => {
+    if (createKind !== "skill") setCreateActionsEnabled(false);
+  }, [createKind]);
 
   async function postAction(body: Record<string, unknown>, busy: string, successMessage?: string) {
     setBusyKey(busy);
@@ -543,11 +576,55 @@ export function SkillsManagerContent({
         name: createName,
         targets: createTargets,
         overwrite: Boolean(existingCreateArtifact),
+        actionsManifest:
+          createKind === "skill" && createActionsEnabled
+            ? createActionsContent
+            : undefined,
       },
       "create_artifact",
-      existingCreateArtifact ? "Artifact updated and pushed to the repo." : "Artifact created and pushed to the repo."
+      createActionsEnabled
+        ? `${existingCreateArtifact ? "Skill updated" : "Skill created"} with groovy-actions.json and pushed to the repo.`
+        : existingCreateArtifact
+          ? "Artifact updated and pushed to the repo."
+          : "Artifact created and pushed to the repo."
     );
     if (result) setCreateOpen(false);
+  };
+
+  const openArtifactEditor = (artifact: Artifact) => {
+    if (artifact.content_snapshot_truncated) {
+      setError("This file is too large for the browser editor. Edit it in the connected Git repository, then pull the latest version into Groovy.");
+      return;
+    }
+    if (!artifact.content_snapshot) {
+      setError("Groovy does not have an editable snapshot yet. Pull the latest version from GitHub, then try again.");
+      return;
+    }
+    setEditingArtifact(artifact);
+    setEditContent(artifact.content_snapshot);
+    setError(null);
+  };
+
+  const saveArtifactEdit = async () => {
+    if (!editingArtifact || !activeDeviceId) return;
+    const result = await postAction(
+      {
+        action: "create_artifact",
+        repositoryId: editingArtifact.repository_id,
+        deviceId: activeDeviceId,
+        artifactType: editingArtifact.artifact_type,
+        relativePath: editingArtifact.relative_path,
+        content: editContent,
+        name: editingArtifact.name,
+        targets: editingArtifact.targets,
+        overwrite: true,
+        expectedCommitSha: editingArtifact.commit_sha,
+        commitMessage: `Edit ${editingArtifact.name} in Groovy`,
+      },
+      `edit:${editingArtifact.id}`,
+      "Instructions saved and pushed to GitHub."
+    );
+    if (result) setEditingArtifact(null);
   };
 
   const exportRuntimeSkill = async (skill: RuntimeSkill) => {
@@ -682,7 +759,7 @@ export function SkillsManagerContent({
             ) : null}
             <div>
               <div className="flex items-center gap-2">
-                <ShieldCheck className="h-5 w-5 text-emerald-300" />
+                <ShieldCheck className="h-5 w-5 text-zinc-300" />
                 <h1 className="text-lg font-semibold">Skills &amp; Docs</h1>
               </div>
               <p className="text-xs text-zinc-500">
@@ -712,36 +789,39 @@ export function SkillsManagerContent({
       </div>
 
       <main className="mx-auto grid max-w-7xl gap-5 px-4 py-6 sm:px-6 lg:grid-cols-[360px_1fr]">
-        <section className="rounded-2xl border border-cyan-400/20 bg-gradient-to-r from-cyan-500/10 to-violet-500/10 p-5 lg:col-span-2">
+        <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5 lg:col-span-2">
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div className="max-w-2xl">
               <h2 className="text-base font-semibold text-white">
-                One library, assigned exactly where you need it
+                A skill starts with one Markdown file
               </h2>
               <p className="mt-1 text-sm leading-relaxed text-zinc-300">
-                Skills are reusable playbooks. Instruction docs are Markdown context and rules.
-                Assign either globally to the orchestrator, Claude, or Codex, or only to one
-                selected agent.
+                <span className="font-mono text-white">SKILL.md</span> tells an agent when to use a skill and what steps to follow.
+                Most skills need only this file. Advanced skills can add scripts, references, or a
+                <span className="font-mono text-white"> groovy-actions.json</span> file when they need a safe, secret-backed API action.
+              </p>
+              <p className="mt-2 text-xs text-zinc-500">
+                Use <strong className="text-zinc-300">Create skill or doc</strong>, choose Skill, then select <strong className="text-zinc-300">Add API actions</strong> to create both files together.
               </p>
             </div>
             <div className="grid shrink-0 grid-cols-3 gap-2 text-center text-[11px] text-zinc-300">
-              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">1. Sync library</div>
-              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">2. Assign</div>
-              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">3. Agents use it</div>
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">1. Write instructions</div>
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">2. Assign a Mind</div>
+              <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2">3. Test in Chat</div>
             </div>
           </div>
         </section>
         <section className="space-y-4">
-          <div className="rounded-xl border border-emerald-400/20 bg-emerald-500/10 p-4">
+          <div className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
             <div className="flex items-start gap-3">
-              <LockKeyhole className="mt-0.5 h-5 w-5 shrink-0 text-emerald-300" />
+              <LockKeyhole className="mt-0.5 h-5 w-5 shrink-0 text-zinc-400" />
               <div>
-                <div className="text-sm font-medium text-emerald-100">
+                <div className="text-sm font-medium text-zinc-200">
                   {state?.privacy?.storesContents
                     ? "Cross-surface Markdown snapshots enabled"
                     : "Repo contents stay local"}
                 </div>
-                <p className="mt-1 text-xs leading-relaxed text-emerald-100/75">
+                <p className="mt-1 text-xs leading-relaxed text-zinc-500">
                   {state?.privacy?.summary ||
                     "Groovy stores metadata, assignments, and bounded snapshots of assigned Markdown so the same capability works in Chat, Command Center, messaging, and API runs. The connector still performs repository discovery and writes locally."}
                 </p>
@@ -755,7 +835,7 @@ export function SkillsManagerContent({
                 <h2 className="text-sm font-semibold">Connector</h2>
                 <p className="text-xs text-zinc-500">Repo access uses this machine&apos;s local Git CLI.</p>
               </div>
-              <Laptop2 className={activeDeviceId ? "h-5 w-5 text-cyan-300" : "h-5 w-5 text-zinc-600"} />
+              <Laptop2 className={activeDeviceId ? "h-5 w-5 text-zinc-300" : "h-5 w-5 text-zinc-600"} />
             </div>
             <div className="rounded-lg border border-white/10 bg-black/20 p-3">
               <div className="flex items-center gap-2 text-sm">
@@ -783,7 +863,7 @@ export function SkillsManagerContent({
 
           <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
             <div className="mb-3 flex items-center gap-2">
-              <GitBranch className="h-4 w-4 text-cyan-300" />
+              <GitBranch className="h-4 w-4 text-zinc-400" />
               <h2 className="text-sm font-semibold">Connect Library Repo</h2>
             </div>
             <div className="space-y-3">
@@ -814,7 +894,7 @@ export function SkillsManagerContent({
                 type="button"
                 onClick={() => void connectRepo()}
                 disabled={!isAdmin || !repoUrl.trim() || busyKey === "connect_repo"}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 px-3 py-2 text-sm font-semibold text-black transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-white px-3 py-2 text-sm font-semibold text-black transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {busyKey === "connect_repo" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
                 Connect Library
@@ -845,7 +925,7 @@ export function SkillsManagerContent({
                       key={repo.id}
                       className={`w-full rounded-lg border p-3 text-left transition ${
                         active
-                          ? "border-cyan-400/35 bg-cyan-500/10"
+                          ? "border-white/25 bg-white/[0.07]"
                           : "border-white/10 bg-black/20 hover:bg-white/[0.06]"
                       }`}
                     >
@@ -872,7 +952,7 @@ export function SkillsManagerContent({
                           onClick={() => void syncRepo(repo.id)}
                           disabled={!activeDeviceId || repoSyncBusy}
                           title={!activeDeviceId ? "Start the Groovy Connector first" : "Retry syncing this repo"}
-                          className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-amber-300/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 transition hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-50"
+                          className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {repoSyncBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
                           Retry Sync
@@ -899,19 +979,11 @@ export function SkillsManagerContent({
             </div>
           )}
 
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-            {[
-              ["Repos", repositories.length, "text-cyan-300"],
-              ["Artifacts", artifacts.length, "text-emerald-300"],
-              ["Runtime", runtimeSkills.length, "text-violet-300"],
-              ["Assignments", assignments.length, "text-sky-300"],
-              ["Synced", syncs.filter((sync) => sync.status === "synced").length, "text-amber-300"],
-            ].map(([label, value, color]) => (
-              <div key={String(label)} className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
-                <div className="text-xs uppercase tracking-wide text-zinc-500">{label}</div>
-                <div className={`mt-1 text-2xl font-semibold ${color}`}>{value}</div>
-              </div>
-            ))}
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl border border-white/10 bg-white/[0.025] px-4 py-3 text-xs text-zinc-500">
+            <span><strong className="font-medium text-zinc-300">{artifacts.length}</strong> skills &amp; docs</span>
+            <span><strong className="font-medium text-zinc-300">{assignments.length}</strong> assignments</span>
+            {runtimeSkills.length > 0 && <span><strong className="font-medium text-zinc-300">{runtimeSkills.length}</strong> agent-authored</span>}
+            <span className="ml-auto"><strong className="font-medium text-zinc-300">{syncs.filter((sync) => sync.status === "synced").length}</strong> of {repositories.length} repos synced</span>
           </div>
 
           {activeRepoNeedsAttention && (
@@ -954,24 +1026,35 @@ export function SkillsManagerContent({
           )}
 
           {runtimeSkills.length > 0 && (
-            <div className="rounded-xl border border-violet-400/20 bg-violet-500/10 p-4">
+            <details className="group rounded-xl border border-white/10 bg-white/[0.035] p-4">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 text-zinc-400" />
+                    <h2 className="text-sm font-semibold text-zinc-200">Agent-authored skills</h2>
+                  </div>
+                  <p className="mt-1 text-xs text-zinc-500">Advanced: skills created by agents in the runtime registry.</p>
+                </div>
+                <span className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-xs text-zinc-400">{filteredRuntimeSkills.length}</span>
+              </summary>
+              <div className="mt-4 border-t border-white/10 pt-4">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
                   <div className="flex items-center gap-2">
-                    <Sparkles className="h-4 w-4 text-violet-200" />
-                    <h2 className="text-base font-semibold text-violet-50">Agent-Authored Skills</h2>
+                    <Sparkles className="h-4 w-4 text-zinc-400" />
+                    <h2 className="text-base font-semibold text-zinc-200">Runtime registry</h2>
                   </div>
-                  <p className="mt-1 text-xs text-violet-100/70">
+                  <p className="mt-1 text-xs text-zinc-500">
                     Created through Orchestrator and stored in the runtime skill registry.
                   </p>
                 </div>
-                <span className="rounded-md border border-violet-300/20 bg-black/20 px-2 py-1 text-xs text-violet-100">
+                <span className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-xs text-zinc-400">
                   {filteredRuntimeSkills.length} shown
                 </span>
               </div>
 
               {filteredRuntimeSkills.length === 0 ? (
-                <div className="mt-4 rounded-lg border border-dashed border-violet-300/20 p-4 text-xs text-violet-100/65">
+                <div className="mt-4 rounded-lg border border-dashed border-white/10 p-4 text-xs text-zinc-500">
                   No runtime skills match the current search.
                 </div>
               ) : (
@@ -984,36 +1067,36 @@ export function SkillsManagerContent({
                       latestVersion?.validation_status ||
                       "unvalidated";
                     return (
-                      <div key={skill.id} className="rounded-lg border border-violet-300/15 bg-black/20 p-3">
+                      <div key={skill.id} className="rounded-lg border border-white/10 bg-black/20 p-3">
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
-                              <Sparkles className="h-4 w-4 text-violet-200" />
+                              <Sparkles className="h-4 w-4 text-zinc-400" />
                               <h3 className="truncate text-sm font-semibold text-white">{skill.name}</h3>
                             </div>
-                            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-violet-100/65">
+                            <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-zinc-500">
                               {skill.description || "Orchestrator runtime skill"}
                             </p>
                           </div>
-                          <span className="rounded-md border border-violet-300/20 bg-violet-500/10 px-2 py-1 text-[10px] uppercase text-violet-100">
+                          <span className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[10px] uppercase text-zinc-400">
                             {skill.lifecycle}
                           </span>
                         </div>
-                        <div className="mt-3 grid gap-2 text-xs text-violet-100/70 sm:grid-cols-2">
+                        <div className="mt-3 grid gap-2 text-xs text-zinc-400 sm:grid-cols-2">
                           <div className="truncate">
-                            <span className="text-violet-100/45">Agent:</span> {skill.agent_name}
+                            <span className="text-zinc-600">Agent:</span> {skill.agent_name}
                           </div>
                           <div className="truncate">
-                            <span className="text-violet-100/45">Tool:</span> skill_{skill.slug}
+                            <span className="text-zinc-600">Tool:</span> skill_{skill.slug}
                           </div>
                           <div>
-                            <span className="text-violet-100/45">Versions:</span> {skill.versions.length || skill.latest_version || 1}
+                            <span className="text-zinc-600">Versions:</span> {skill.versions.length || skill.latest_version || 1}
                           </div>
                           <div>
-                            <span className="text-violet-100/45">Validation:</span> {validationStatus}
+                            <span className="text-zinc-600">Validation:</span> {validationStatus}
                           </div>
                         </div>
-                        <div className="mt-3 flex items-center justify-end border-t border-violet-300/10 pt-3">
+                        <div className="mt-3 flex items-center justify-end border-t border-white/10 pt-3">
                           <button
                             type="button"
                             onClick={() => void exportRuntimeSkill(skill)}
@@ -1030,14 +1113,14 @@ export function SkillsManagerContent({
                                   ? "Start the Groovy Connector first"
                                   : "Write this runtime skill into the selected skills repo"
                             }
-                            className="flex items-center gap-2 rounded-lg border border-violet-300/20 bg-violet-500/10 px-3 py-2 text-xs text-violet-50 transition hover:bg-violet-500/15 disabled:opacity-50"
+                            className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
                           >
                             {busyKey === `export_runtime:${skill.id}` ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
                             ) : (
                               <GitBranch className="h-3.5 w-3.5" />
                             )}
-                            Sync to Repo
+                            Export to GitHub
                           </button>
                         </div>
                       </div>
@@ -1045,7 +1128,8 @@ export function SkillsManagerContent({
                   })}
                 </div>
               )}
-            </div>
+              </div>
+            </details>
           )}
 
           <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
@@ -1062,32 +1146,35 @@ export function SkillsManagerContent({
                   type="button"
                   onClick={() => activeRepo && void syncRepo(activeRepo.id)}
                   disabled={!activeRepo || !activeDeviceId || busyKey === `sync:${activeRepo?.id}`}
-                  className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
+                  className="flex items-center gap-2 rounded-lg border border-white/10 bg-transparent px-3 py-2 text-xs text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 disabled:opacity-50"
                 >
                   {busyKey === `sync:${activeRepo?.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                  Sync
+                  Pull from GitHub
                 </button>
                 <button
                   type="button"
                   onClick={() => activeRepo && void pushRepoChanges(activeRepo.id, activeRepo.label || "Repo")}
                   disabled={!isAdmin || !activeRepo || !activeDeviceId || busyKey === `push:${activeRepo?.id}`}
-                  className="flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100 transition hover:bg-cyan-500/15 disabled:opacity-50"
+                  className="flex items-center gap-2 rounded-lg border border-white/10 bg-transparent px-3 py-2 text-xs text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 disabled:opacity-50"
                 >
                   {busyKey === `push:${activeRepo?.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                  Push Changes
+                  Push local changes
                 </button>
                 <button
                   type="button"
                   onClick={() => void preflight(agentTarget === "claude" || agentTarget === "codex" ? agentTarget : "flow", selectedAgentId || null)}
                   disabled={!activeDeviceId || busyKey?.startsWith("preflight:")}
-                  className="flex items-center gap-2 rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100 transition hover:bg-emerald-500/15 disabled:opacity-50"
+                  className="flex items-center gap-2 rounded-lg border border-white/10 bg-transparent px-3 py-2 text-xs text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 disabled:opacity-50"
                 >
                   {busyKey?.startsWith("preflight:") ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
                   Prepare for selected agent
                 </button>
                 <button
                   type="button"
-                  onClick={() => setCreateOpen(true)}
+                  onClick={() => {
+                    setError(null);
+                    setCreateOpen(true);
+                  }}
                   disabled={!isAdmin || repositories.length === 0}
                   className="flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-xs font-semibold text-black transition hover:bg-zinc-200 disabled:opacity-50"
                 >
@@ -1140,7 +1227,7 @@ export function SkillsManagerContent({
               filteredArtifacts.map((artifact) => {
                 const repo = repoById.get(artifact.repository_id);
                 const isSkill = artifact.artifact_type === "skill";
-                const artifactRepoPushBusy = busyKey === `push:${artifact.repository_id}`;
+                const actions = artifactActions(artifact);
                 const agentAssignments = assignments.filter(
                   (assignment) =>
                     assignment.enabled &&
@@ -1179,9 +1266,9 @@ export function SkillsManagerContent({
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           {isSkill ? (
-                            <Sparkles className="h-4 w-4 text-emerald-300" />
+                            <Sparkles className="h-4 w-4 text-zinc-300" />
                           ) : (
-                            <FileText className="h-4 w-4 text-amber-300" />
+                            <FileText className="h-4 w-4 text-zinc-400" />
                           )}
                           <h3 className="truncate text-sm font-semibold">{artifact.name}</h3>
                         </div>
@@ -1195,13 +1282,13 @@ export function SkillsManagerContent({
                         </span>
                         <button
                           type="button"
-                          onClick={() => void pushRepoChanges(artifact.repository_id, artifact.name)}
-                          disabled={!isAdmin || !activeDeviceId || artifactRepoPushBusy}
-                          title={!activeDeviceId ? "Start the Groovy Connector first" : "Commit and push local repo changes"}
-                          className="flex min-h-8 items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100 transition hover:bg-cyan-500/15 disabled:opacity-50"
+                          onClick={() => openArtifactEditor(artifact)}
+                          disabled={!isAdmin || !activeDeviceId || !artifact.content_snapshot || artifact.content_snapshot_truncated}
+                          title={!activeDeviceId ? "Start the Groovy Connector first" : "Edit this Markdown file and save it to GitHub"}
+                          className="flex min-h-8 items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
                         >
-                          {artifactRepoPushBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
-                          Sync to Repo
+                          <Pencil className="h-3.5 w-3.5" />
+                          Edit instructions
                         </button>
                       </div>
                     </div>
@@ -1215,15 +1302,32 @@ export function SkillsManagerContent({
                           </span>
                         ))}
                         {(artifact.risk_flags || []).map((flag) => (
-                          <span key={flag} className="rounded-md border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-200">
+                          <span key={flag} className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] text-zinc-500">
                             {riskLabel(flag)}
                           </span>
                         ))}
                       </div>
                       <div className="flex items-center justify-between text-zinc-500">
                         <span>{repo?.label || "Repo"}</span>
-                        <span className="font-mono">{shortSha(artifact.commit_sha)}</span>
+                        <span className="font-mono">GitHub {shortSha(artifact.commit_sha)}</span>
                       </div>
+                      {actions.length > 0 ? (
+                        <details className="rounded-lg border border-white/10 bg-black/20 p-3 text-zinc-500">
+                          <summary className="cursor-pointer text-xs font-medium text-zinc-300">Advanced actions · {actions.length}</summary>
+                          <p className="mt-1 leading-relaxed">
+                            This skill also has <span className="font-mono text-zinc-300">groovy-actions.json</span>. It declares the specific operations Groovy may run and which secret names they require. Secret values never belong in this file.
+                          </p>
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {actions.map((action) => (
+                              <span key={asString(action.name)} className="rounded border border-white/10 bg-white/5 px-2 py-1 font-mono text-[10px] text-zinc-400">
+                                {asString(action.name)}
+                              </span>
+                            ))}
+                          </div>
+                        </details>
+                      ) : isSkill ? (
+                        <p className="text-zinc-600">Markdown-only skill — no JSON or code is required.</p>
+                      ) : null}
                     </div>
 
                     <div className="mt-4 border-t border-white/10 pt-4">
@@ -1398,8 +1502,8 @@ export function SkillsManagerContent({
           <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl border border-white/10 bg-zinc-950 p-5 shadow-2xl">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-lg font-semibold">How Skills Manager Works</h2>
-                <p className="mt-1 text-sm text-zinc-400">Use Git as the source of truth. Groovy coordinates sync, assignments, and preflight.</p>
+                <h2 className="text-lg font-semibold">Skills, explained simply</h2>
+                <p className="mt-1 text-sm text-zinc-400">Start with Markdown. Add advanced files only when the skill truly needs them.</p>
               </div>
               <button type="button" onClick={() => setHelpOpen(false)} className="rounded-lg p-2 text-zinc-400 hover:bg-white/5 hover:text-white">
                 <X className="h-5 w-5" />
@@ -1408,25 +1512,24 @@ export function SkillsManagerContent({
 
             <div className="mt-5 grid gap-4 md:grid-cols-2">
               <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
-                <h3 className="text-sm font-semibold text-emerald-200">Step by step</h3>
+                <h3 className="text-sm font-semibold text-zinc-200">What files do I need?</h3>
                 <ol className="mt-3 space-y-2 text-sm text-zinc-300">
-                  <li>1. Create a private repo for agent context.</li>
-                  <li>2. Add `skills/name/SKILL.md` folders and `instructions/**/*.md` docs.</li>
-                  <li>3. Paste the repo URL here.</li>
-                  <li>4. The connector runs local `git clone` using the user&apos;s CLI permissions.</li>
-                  <li>5. Assign skills/docs to Flow, Claude, Codex, or specific agents.</li>
-                  <li>6. Preflight materializes assigned files locally before an agent runs.</li>
+                  <li><span className="font-mono text-white">SKILL.md</span> is the skill. It contains plain-language instructions. This is enough for most skills.</li>
+                  <li><span className="font-mono text-white">groovy-actions.json</span> is optional. It declares approved API or local actions and the secret names they require.</li>
+                  <li><span className="font-mono">scripts/</span> and <span className="font-mono">references/</span> are optional supporting files.</li>
+                  <li>Never put passwords, tokens, or secret values in repository files. Assign secrets in Workspace Settings.</li>
                 </ol>
               </div>
               <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4">
-                <h3 className="text-sm font-semibold text-cyan-200">Recommended repo layout</h3>
+                <h3 className="text-sm font-semibold text-zinc-200">Recommended repo layout</h3>
                 <pre className="mt-3 overflow-x-auto rounded-lg bg-black/35 p-3 text-xs text-zinc-300">{`company-agent-context/
   README.md
   skills/
     security-review/
       SKILL.md
-      scripts/
-      references/
+      groovy-actions.json  # optional
+      scripts/             # optional
+      references/          # optional
   instructions/
     shared/
       AGENTS.md
@@ -1436,6 +1539,19 @@ export function SkillsManagerContent({
       CODEX.md
     flow/
       release-process.md`}</pre>
+              </div>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4 text-sm text-zinc-300">
+                <h3 className="font-semibold text-white">How do I edit a skill?</h3>
+                <p className="mt-2 leading-relaxed">Click <strong>Edit instructions</strong> on a skill card. Groovy opens its <span className="font-mono">SKILL.md</span>; saving creates a Git commit and pushes it to the connected repository.</p>
+                <p className="mt-2 leading-relaxed">You can also edit the file directly on GitHub, then click <strong>Pull from GitHub</strong>.</p>
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.04] p-4 text-sm text-zinc-300">
+                <h3 className="font-semibold text-white">What do the Git buttons mean?</h3>
+                <p className="mt-2"><strong>Pull from GitHub</strong> downloads the repository&apos;s latest version into Groovy.</p>
+                <p className="mt-2"><strong>Push local changes</strong> is advanced recovery for files edited in the Connector&apos;s local checkout. It is not a sync-status indicator.</p>
               </div>
             </div>
 
@@ -1449,18 +1565,64 @@ export function SkillsManagerContent({
         </div>
       )}
 
+      {editingArtifact && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-2xl border border-white/10 bg-zinc-950 p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold">Edit {editingArtifact.name}</h2>
+                <p className="mt-1 text-sm text-zinc-400">
+                  You are editing <span className="font-mono text-zinc-200">{editingArtifact.relative_path}</span>. Saving creates a Git commit and pushes it to {repoById.get(editingArtifact.repository_id)?.label || "the connected repository"}.
+                </p>
+              </div>
+              <button type="button" onClick={() => setEditingArtifact(null)} className="rounded-lg p-2 text-zinc-400 hover:bg-white/5 hover:text-white">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.04] p-3 text-xs leading-relaxed text-zinc-400">
+              Edit the plain-language instructions here. If this skill has advanced actions, this editor does not change <span className="font-mono">groovy-actions.json</span> or any secret values.
+            </div>
+            <textarea
+              value={editContent}
+              onChange={(event) => setEditContent(event.target.value)}
+              className="mt-4 min-h-[480px] w-full rounded-xl border border-white/10 bg-black/35 p-4 font-mono text-xs leading-relaxed text-zinc-100 outline-none focus:border-cyan-400/40"
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" onClick={() => setEditingArtifact(null)} className="rounded-lg border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 hover:bg-white/10">
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveArtifactEdit()}
+                disabled={!activeDeviceId || busyKey === `edit:${editingArtifact.id}` || editContent === editingArtifact.content_snapshot}
+                className="flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-black hover:bg-zinc-200 disabled:opacity-50"
+              >
+                {busyKey === `edit:${editingArtifact.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Save and push to GitHub
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {createOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="max-h-[90vh] w-full max-w-4xl overflow-y-auto rounded-2xl border border-white/10 bg-zinc-950 p-5 shadow-2xl">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-lg font-semibold">Create Repo Artifact</h2>
-                <p className="mt-1 text-sm text-zinc-400">The connector writes this file into the local repo checkout. Flow does not persist the body.</p>
+                <h2 className="text-lg font-semibold">Create skill or instruction doc</h2>
+                <p className="mt-1 text-sm text-zinc-400">Save both files together in one commit and push them to the selected GitHub repository.</p>
               </div>
               <button type="button" onClick={() => setCreateOpen(false)} className="rounded-lg p-2 text-zinc-400 hover:bg-white/5 hover:text-white">
                 <X className="h-5 w-5" />
               </button>
             </div>
+
+            {error ? (
+              <div className="mt-4 whitespace-pre-wrap rounded-xl border border-rose-400/25 bg-rose-500/10 p-3 text-sm text-rose-100">
+                {error}
+              </div>
+            ) : null}
 
             <div className="mt-5 grid gap-4 lg:grid-cols-[300px_1fr]">
               <div className="space-y-3">
@@ -1477,14 +1639,14 @@ export function SkillsManagerContent({
                   <button
                     type="button"
                     onClick={() => setCreateKind("skill")}
-                    className={`rounded-lg border px-3 py-2 text-sm ${createKind === "skill" ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100" : "border-white/10 bg-black/20 text-zinc-300"}`}
+                    className={`rounded-lg border px-3 py-2 text-sm ${createKind === "skill" ? "border-white/25 bg-white/10 text-white" : "border-white/10 bg-black/20 text-zinc-400"}`}
                   >
                     Skill
                   </button>
                   <button
                     type="button"
                     onClick={() => setCreateKind("instruction_doc")}
-                    className={`rounded-lg border px-3 py-2 text-sm ${createKind === "instruction_doc" ? "border-amber-400/30 bg-amber-500/10 text-amber-100" : "border-white/10 bg-black/20 text-zinc-300"}`}
+                    className={`rounded-lg border px-3 py-2 text-sm ${createKind === "instruction_doc" ? "border-white/25 bg-white/10 text-white" : "border-white/10 bg-black/20 text-zinc-400"}`}
                   >
                     .md Doc
                   </button>
@@ -1502,7 +1664,7 @@ export function SkillsManagerContent({
                   placeholder="instructions/shared/AGENTS.md"
                 />
                 {existingCreateArtifact && (
-                  <div className="rounded-lg border border-cyan-300/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100/80">
+                  <div className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-zinc-400">
                     Existing artifact path. Write will update this artifact.
                   </div>
                 )}
@@ -1534,14 +1696,76 @@ export function SkillsManagerContent({
                   className="flex w-full items-center justify-center gap-2 rounded-lg bg-white px-3 py-2 text-sm font-semibold text-black transition hover:bg-zinc-200 disabled:opacity-50"
                 >
                   {busyKey === "create_artifact" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                  Write to Local Repo
+                  Save and push to GitHub
                 </button>
               </div>
-              <textarea
-                value={createContent}
-                onChange={(e) => setCreateContent(e.target.value)}
-                className="min-h-[430px] w-full rounded-xl border border-white/10 bg-black/35 p-4 font-mono text-xs leading-relaxed text-zinc-100 outline-none focus:border-cyan-400/40"
-              />
+              <div className="space-y-4">
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-zinc-200">
+                        {createKind === "skill" ? "Skill instructions" : "Instruction document"}
+                      </div>
+                      <div className="font-mono text-[11px] text-zinc-500">{createPath}</div>
+                    </div>
+                    <span className="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[10px] text-zinc-400">
+                      Markdown
+                    </span>
+                  </div>
+                  <textarea
+                    value={createContent}
+                    onChange={(e) => setCreateContent(e.target.value)}
+                    className="min-h-[360px] w-full rounded-xl border border-white/10 bg-black/35 p-4 font-mono text-xs leading-relaxed text-zinc-100 outline-none focus:border-cyan-400/40"
+                  />
+                </div>
+
+                {createKind === "skill" ? (
+                  <div className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="max-w-xl">
+                        <div className="flex items-center gap-2 text-sm font-medium text-zinc-200">
+                          <Code2 className="h-4 w-4 text-zinc-400" />
+                          API actions <span className="text-xs font-normal text-zinc-500">Optional</span>
+                        </div>
+                        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+                          Add this only when the skill must call an API. Groovy will create a sibling <span className="font-mono text-zinc-300">groovy-actions.json</span> in the same Git commit.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCreateActionsEnabled((current) => !current)}
+                        className="flex shrink-0 items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-200 transition hover:bg-white/10"
+                      >
+                        {createActionsEnabled ? <X className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                        {createActionsEnabled ? "Remove before saving" : "Add API actions"}
+                      </button>
+                    </div>
+
+                    {createActionsEnabled ? (
+                      <div className="mt-4">
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          <div className="font-mono text-[11px] text-zinc-400">{createActionsPath}</div>
+                          <div className="text-[11px] text-zinc-500">JSON · validated before it is written</div>
+                        </div>
+                        <textarea
+                          value={createActionsContent}
+                          onChange={(event) => setCreateActionsContent(event.target.value)}
+                          spellCheck={false}
+                          className="min-h-[300px] w-full rounded-xl border border-white/10 bg-black/35 p-4 font-mono text-xs leading-relaxed text-zinc-100 outline-none focus:border-cyan-400/40"
+                        />
+                        <div className="mt-3 grid gap-2 text-xs leading-relaxed text-zinc-500 sm:grid-cols-2">
+                          <p>
+                            Replace the example URL, action name, and input fields with the API operation this skill needs.
+                          </p>
+                          <p>
+                            Put only secret <strong className="text-zinc-300">names</strong> such as <span className="font-mono">HIBE_API_KEY</span> here. Add the actual values later in <a href="/settings/secrets" className="text-cyan-300 hover:text-cyan-200">Workspace Settings → Secrets</a>.
+                          </p>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>

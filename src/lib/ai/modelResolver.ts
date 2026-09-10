@@ -8,7 +8,7 @@ export type ProviderId = "openai" | "anthropic" | "xai" | "google";
 export const ANTHROPIC_CONTEXT_1M_BETA = "context-1m-2025-08-07";
 const DEFAULT_ORCHESTRATOR_ANTHROPIC_MODEL = "claude-opus-4-6";
 const DEFAULT_ORCHESTRATOR_OPENAI_MODEL = "gpt-4o";
-const DEFAULT_COMPUTER_USE_MODEL = "claude-sonnet-4-6";
+const DEFAULT_COMPUTER_USE_MODEL = "gpt-5.6-luna";
 const DEFAULT_COMPUTER_USE_BETA = "computer-use-2025-11-24";
 const DEFAULT_FILES_AGENT_MODEL = "claude-opus-4-6";
 const DEFAULT_DATAGRAN_CHAT_MODEL = "claude-opus-4-6";
@@ -75,16 +75,12 @@ export function getOrchestratorAgentSdkFallbackModel(): string {
 }
 
 export function getComputerUseModel(): string {
-  const raw =
+  return (
     firstNonEmptyEnv(
       "COMPUTER_USE_MODEL",
       "BROWSER_AGENT_MODEL",
       "ORCH_COMPUTER_USE_MODEL"
-    ) || DEFAULT_COMPUTER_USE_MODEL;
-  return coerceAnthropicModel(
-    raw,
-    DEFAULT_COMPUTER_USE_MODEL,
-    "COMPUTER_USE_MODEL/BROWSER_AGENT_MODEL/ORCH_COMPUTER_USE_MODEL"
+    ) || DEFAULT_COMPUTER_USE_MODEL
   );
 }
 
@@ -116,6 +112,8 @@ export function getDatagranChatModel(): string {
 // Map display/shorthand names to actual API model identifiers
 const ANTHROPIC_MODEL_MAP: Record<string, string> = {
   // Opus models
+  "claude-opus-5.0": "claude-opus-5",
+  "claude-opus-4.8": "claude-opus-4-8",
   "claude-opus-4.6": "claude-opus-4-6",
   "claude-opus-4.5": "claude-opus-4-5-20251101",
   "claude-opus-4": "claude-opus-4-20250514",
@@ -136,6 +134,9 @@ const ANTHROPIC_MODEL_MAP: Record<string, string> = {
 // https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
 const ANTHROPIC_EXTENDED_THINKING_MODELS = new Set([
   // Opus
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-opus-4-5-20251101",
   "claude-opus-4-1-20250805",
@@ -148,6 +149,9 @@ const ANTHROPIC_EXTENDED_THINKING_MODELS = new Set([
   // Haiku
   "claude-haiku-4-5-20251001",
   // Display names (for convenience)
+  "claude-opus-5.0",
+  "claude-opus-4.8",
+  "claude-opus-4.7",
   "claude-opus-4.6",
   "claude-opus-4.5",
   "claude-opus-4.1",
@@ -168,18 +172,26 @@ function supportsAnthropicContext1MBeta(model: string): boolean {
   return /claude-(sonnet|opus)-4-(6|5)/i.test(resolved);
 }
 
+function hasNativeAnthropic1MContext(model: string): boolean {
+  const resolved = resolveAnthropicModel(model).toLowerCase();
+  return /^claude-(fable-5|opus-(5|4-8)|sonnet-5)$/i.test(resolved);
+}
+
 export function getAnthropicContextProviderOptions(
   provider: ProviderId,
   model: string
 ): { anthropic: { betas: string[] } } | undefined {
   if (provider !== "anthropic") return undefined;
+  if (hasNativeAnthropic1MContext(model)) return undefined;
   if (!supportsAnthropicContext1MBeta(model)) return undefined;
   return { anthropic: { betas: [ANTHROPIC_CONTEXT_1M_BETA] } };
 }
 
 function supportsAnthropicAdaptiveThinking(model: string): boolean {
   const resolved = resolveAnthropicModel(model).toLowerCase();
-  return /claude-(sonnet|opus)-4-6/i.test(resolved);
+  return /^claude-(fable-5|opus-(5|4-(6|7|8))|sonnet-(5|4-6))$/i.test(
+    resolved,
+  );
 }
 
 export function getAnthropicReasoningProviderOptions(
@@ -212,17 +224,18 @@ export function getModelContextBudget(
   if (provider === "anthropic") contextWindowTokens = 200_000;
 
   const enabledBetas = providerOptions?.anthropic?.betas || [];
-  const has1MBeta =
+  const has1MContext =
     provider === "anthropic" &&
-    supportsAnthropicContext1MBeta(model) &&
-    enabledBetas.includes(ANTHROPIC_CONTEXT_1M_BETA);
-  if (has1MBeta) contextWindowTokens = 1_000_000;
+    (hasNativeAnthropic1MContext(model) ||
+      (supportsAnthropicContext1MBeta(model) &&
+        enabledBetas.includes(ANTHROPIC_CONTEXT_1M_BETA)));
+  if (has1MContext) contextWindowTokens = 1_000_000;
 
   // Leave room for system prompt, tool schemas, and generation headroom.
-  const compactionTriggerTokens = has1MBeta
+  const compactionTriggerTokens = has1MContext
     ? 700_000
     : Math.max(120_000, Math.floor(contextWindowTokens * 0.75));
-  const keepRecentTokens = has1MBeta
+  const keepRecentTokens = has1MContext
     ? 180_000
     : Math.max(40_000, Math.floor(contextWindowTokens * 0.2));
 
@@ -290,4 +303,3 @@ export function resolveChatModel(
     }
   }
 }
-

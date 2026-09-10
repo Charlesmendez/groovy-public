@@ -284,12 +284,17 @@ export async function PATCH(
           notify: task.notify,
           source: "orchestrator",
         });
-        kickAgentTask({
+        executionTask = await kickAgentTask({
           taskId: executionTask.id,
           userId: user.id,
           userEmail: user.email || null,
           baseUrl: new URL(req.url).origin,
         });
+        if (executionTask.status === "failed") {
+          throw new Error(
+            executionTask.error || "The execution task could not start",
+          );
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : "Could not queue execution";
         await admin
@@ -363,11 +368,11 @@ export async function PATCH(
   }
 
   if (action === "approve") {
-    const task = await approveAgentTask({ userId: user.id, taskId: id, decidedBy: "dashboard" });
+    let task = await approveAgentTask({ userId: user.id, taskId: id, decidedBy: "dashboard" });
     if (!task) {
       return NextResponse.json({ error: "Task is not awaiting approval" }, { status: 409 });
     }
-    kickAgentTask({
+    task = await kickAgentTask({
       taskId: task.id,
       userId: user.id,
       userEmail: user.email || null,

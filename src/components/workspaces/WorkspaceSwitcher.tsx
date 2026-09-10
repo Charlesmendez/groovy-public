@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { clearChatWorkspaceCaches } from "@/lib/chat/workspaceCache";
 import {
   Building2,
   Check,
@@ -9,6 +11,7 @@ import {
   Lock,
   Mail,
   Plus,
+  Settings2,
   Users,
   X,
 } from "lucide-react";
@@ -44,6 +47,7 @@ export function WorkspaceSwitcher({
   modalOnly = false,
   showPendingGate = true,
   align = "left",
+  workspaceSettingsHref = "/settings",
 }: {
   fallbackName?: string;
   compact?: boolean;
@@ -52,6 +56,7 @@ export function WorkspaceSwitcher({
   modalOnly?: boolean;
   showPendingGate?: boolean;
   align?: "left" | "right";
+  workspaceSettingsHref?: string | null;
 }) {
   const [directory, setDirectory] = useState<WorkspaceDirectory | null>(null);
   const [open, setOpen] = useState(false);
@@ -136,6 +141,9 @@ export function WorkspaceSwitcher({
         throw new Error(payload?.error || "Could not switch workspace");
       }
       onWorkspaceChanged?.(workspace);
+      // Cached sidebar/messages belong to the previous workspace; without
+      // this the next boot paints (and marks read) the wrong channels.
+      clearChatWorkspaceCaches();
       window.location.assign(
         switchDestination.startsWith("/") ? switchDestination : "/dashboard",
       );
@@ -161,6 +169,7 @@ export function WorkspaceSwitcher({
       if (!response.ok) {
         throw new Error(payload?.error || "Could not accept invitation");
       }
+      clearChatWorkspaceCaches();
       window.location.assign("/chat?joined=1");
     } catch (reason) {
       setError(
@@ -186,6 +195,7 @@ export function WorkspaceSwitcher({
       if (!response.ok) {
         throw new Error(payload?.error || "Could not create workspace");
       }
+      clearChatWorkspaceCaches();
       window.location.assign(
         switchDestination.startsWith("/") ? switchDestination : "/dashboard",
       );
@@ -217,7 +227,7 @@ export function WorkspaceSwitcher({
           ) : null}
           <span
             className={`min-w-0 flex-1 truncate font-semibold tracking-normal ${
-              compact ? "hidden text-xs lg:block" : "text-sm"
+              compact ? "hidden text-xs min-[1380px]:block" : "text-sm"
             }`}
           >
             {loading
@@ -239,7 +249,7 @@ export function WorkspaceSwitcher({
         {open ? (
           <div
             role="menu"
-            className={`absolute z-[115] mt-2 w-[min(22rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-white/10 bg-zinc-950/98 p-2 shadow-2xl shadow-black/70 backdrop-blur-xl max-sm:fixed max-sm:left-4 max-sm:right-4 max-sm:top-14 max-sm:mt-0 max-sm:w-auto ${
+            className={`absolute z-[115] mt-2 w-[min(22rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-white/10 bg-zinc-950/98 p-2 shadow-2xl shadow-black/70 backdrop-blur-xl max-sm:fixed max-sm:left-4 max-sm:right-4 max-sm:top-[var(--app-header-offset)] max-sm:mt-0 max-sm:w-auto ${
               align === "right" ? "right-0" : "left-0"
             }`}
           >
@@ -312,6 +322,29 @@ export function WorkspaceSwitcher({
                   </span>
                 </span>
               </button>
+            ) : null}
+
+            {workspaceSettingsHref ? (
+              <div className="mt-2 border-t border-white/[0.07] pt-2">
+                <Link
+                  href={workspaceSettingsHref}
+                  role="menuitem"
+                  onClick={() => setOpen(false)}
+                  className="flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left text-zinc-300 transition hover:bg-white/[0.06] hover:text-white"
+                >
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.05] text-zinc-500">
+                    <Settings2 className="h-4 w-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      Workspace settings
+                    </span>
+                    <span className="block truncate text-[11px] text-zinc-500">
+                      {activeWorkspace?.name || fallbackName}
+                    </span>
+                  </span>
+                </Link>
+              </div>
             ) : null}
 
             {pendingInvites.length > 0 ? (

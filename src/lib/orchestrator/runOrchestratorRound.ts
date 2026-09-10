@@ -6,7 +6,9 @@ import {
   type ProviderId,
   getAnthropicContextProviderOptions,
   getModelContextBudget,
+  getOrchestratorAnthropicModel,
   getOrchestratorAgentSdkFallbackModel,
+  getOrchestratorOpenAiModel,
 } from "@/lib/ai/modelResolver";
 import { resolveKeys, buildToolApiKeys } from "@/lib/keys/resolveKeyMode";
 import { resolveOrchestratorModelOverride } from "@/lib/orchestrator/orchestratorModel";
@@ -53,6 +55,7 @@ import {
 import { estimateTokensFromCostUsd, normalizeTokenUsage } from "@/lib/billing/usage";
 import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
 import {
+  normalizeUsageChargeType,
   usageChargeTypeForKeyMode,
 } from "@/lib/billing/pricing";
 import type { ConnectorClientPlatform } from "@/lib/connector/platform";
@@ -74,15 +77,24 @@ import {
   selectRelevantExtensionRuntimeTools,
 } from "@/lib/extensions/registry";
 import {
-  buildAssignedSkillsPromptContextForUser,
-  preflightAgentSkillsForUser,
+  listAssignedSkillsCatalogForUser,
 } from "@/lib/skills-manager/service";
+import { buildAssignedSkillsCatalogPrompt } from "@/lib/skills-manager/assignedSkills";
 import {
   addAnthropicNativeWebSearchTool,
   getAnthropicAgentSdkBuiltinTools,
   isAnthropicNativeWebSearchEnabled,
   isWebSearchToolName,
 } from "@/lib/orchestrator/anthropicWebSearch";
+import {
+  assertUsableModelRound,
+  EmptyModelResponseError,
+  isInsufficientQuotaError,
+  ModelStreamCompletionError,
+  modelStreamEventError,
+  quotaExhaustedResponseText,
+} from "@/lib/orchestrator/modelStreamReliability";
+import { shouldUseDirectLocalCliForDiagnostic } from "@/lib/orchestrator/localCliRouting";
 
 export type ConnectorExecute = {
   toolCallId: string;
@@ -128,6 +140,7 @@ export type OrchestratorRoundResult =
       files?: Array<{ mediaType: string; base64: string; filename?: string | null }>;
       generatedFiles?: GeneratedFileRef[];
       toolCallsExecuted: string[];
+      stepsUsed?: number;
     }
   | {
       kind: "needs_connector";
@@ -135,6 +148,7 @@ export type OrchestratorRoundResult =
       partialText: string;
       toolCallsExecuted: string[];
       connectorExecutes: ConnectorExecute[];
+      stepsUsed?: number;
     }
   | {
       kind: "ui_open_code";
@@ -142,6 +156,7 @@ export type OrchestratorRoundResult =
       partialText: string;
       toolCallsExecuted: string[];
       uiOpenCode: UiOpenCode;
+      stepsUsed?: number;
     }
   | {
       kind: "browser_task";
@@ -149,6 +164,7 @@ export type OrchestratorRoundResult =
       partialText: string;
       toolCallsExecuted: string[];
       browserTask: BrowserTask;
+      stepsUsed?: number;
     };
 
 type ToolResultInput = {
@@ -170,7 +186,17 @@ export type FilesAgentSession = {
 
 export type RunOrchestratorRoundArgs = {
   supabase: SupabaseClient;
+  /**
+   * Account that owns the runtime capabilities used by this round (provider
+   * keys, agents, integrations, connector devices, and product access).
+   */
   userId: string;
+  /**
+   * Member who initiated the work when runtime capabilities are shared.
+   * Defaults to userId. This affects usage/tool attribution only; it never
+   * changes which member's credentials or local capabilities are used.
+   */
+  usageActorUserId?: string;
   userEmail?: string | null;
   // Stable id for one user "turn" (UI send / WhatsApp message) across connector round-trips
   turnId?: string;
@@ -208,6 +234,18 @@ export type RunOrchestratorRoundArgs = {
   profile?: HarnessProfile | null;
   /** Surface/provider that originated this turn (dashboard, team_chat, api, …). */
   sourceProvider?: string;
+  /** Trusted project-scoped data bridge, only forwarded for Inbox decisions. */
+  homeData?: ToolExecutionContext["homeData"];
+  /** Server-owned reporting sink; never populated from a prompt or tool input. */
+  onUsage?: (observation: import("../homeInbox/usage").HarnessUsageObservation) => Promise<void>;
+  onUsageGap?: () => void;
+  /** Caller-enforced side-effect boundary for this turn. */
+  actionAuthorization?: "default" | "confirmation_required";
+  /**
+   * Preserve direct local-diagnostic routing across connector continuation
+   * rounds whose synthetic tool-result message replaces the original request.
+   */
+  preferDirectLocalDiagnostic?: boolean;
   /** Stable external thread key used to enforce the thread's sticky Mind binding. */
   sourceThreadKey?: string | null;
   /**
@@ -222,6 +260,32 @@ export type RunOrchestratorRoundArgs = {
    * artifact workspace, lifecycle, and target are revalidated during loading.
    */
   additionalSkillArtifactIds?: string[];
+  /** Workspace that owns the assigned skills. Required for multi-workspace channels. */
+  skillWorkspaceId?: string | null;
+  /**
+   * Trusted current-speaker authorization for channel-scoped skill changes.
+   * The executor revalidates this context against current database state.
+   */
+  channelSkillManagement?: {
+    workspaceId: string;
+    channelId: string;
+    actorUserId: string;
+    canCreateSkills: boolean;
+  } | null;
+  /**
+   * Trusted current-speaker authorization for schedules belonging to the
+   * current Team Chat channel. The executor revalidates it against the DB.
+   */
+  channelScheduleManagement?: {
+    workspaceId: string;
+    channelId: string;
+    actorUserId: string;
+  } | null;
+  /** Trusted workspace-admin speaker authorization for assignment changes. */
+  workspaceAssignmentManagement?: {
+    workspaceId: string;
+    actorUserId: string;
+  } | null;
   /**
    * Optional workspace-authored operating brief for a Team Chat channel.
    * Prompt context cannot widen the resolved profile or executor tool policy.
@@ -236,6 +300,8 @@ export type RunOrchestratorRoundArgs = {
   // (assign_task) so the task runner can ping the requesting channel.
   taskNotifyTargets?: import("@/lib/orchestrator/agentTasks").AgentTaskNotifyTargets;
   taskRequestedChannel?: string | null;
+  taskThreadRootMessageId?: string | null;
+  taskContinuationDepth?: number;
   /**
    * Optional caller-enforced worker roster. Team Chat passes the channel's
    * selected agent ids so the Mind cannot discover or delegate to any other
@@ -306,6 +372,8 @@ export type RunOrchestratorRoundArgs = {
     success?: boolean;
     error?: string;
   }) => void;
+  /** Optional trusted-app navigation events emitted by first-party tools. */
+  onUiAction?: ToolExecutionContext["onUiAction"];
 };
 
 function sanitizeMessages(input: ModelMessage[]): ModelMessage[] {
@@ -626,6 +694,12 @@ function isInvalidApiKeyError(err: unknown): boolean {
 }
 
 function isTransientApiError(err: unknown): boolean {
+  if (
+    err instanceof EmptyModelResponseError ||
+    err instanceof ModelStreamCompletionError
+  ) {
+    return true;
+  }
   if (!err || typeof err !== "object") return false;
   const e = err as Record<string, unknown>;
   const status =
@@ -680,6 +754,14 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     cookies,
     codeMode = false,
   } = args;
+  let usageActorUserId = args.usageActorUserId || userId;
+  let usageAttributionMeta =
+    usageActorUserId !== userId
+      ? {
+          usageActorUserId,
+          credentialOwnerUserId: userId,
+        }
+      : {};
 
   const throwIfAborted = () => {
     if (args.abortController?.signal.aborted) {
@@ -833,6 +915,8 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     memoryScopeId: args.memoryScopeId,
     allowedAgentIds: args.allowedAgentIds,
     agentRosterMode: args.agentRosterMode,
+    canManageTeamChatSchedules: Boolean(args.channelScheduleManagement),
+    canManageWorkspaceAssignments: Boolean(args.workspaceAssignmentManagement),
   });
   const memoryScopeId =
     toolPolicy.memoryScope === "profile"
@@ -995,6 +1079,23 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     );
     return null;
   });
+  if (billingWorkspaceId && usageActorUserId !== userId) {
+    const { data: actorMembership, error: actorMembershipError } = await supabase
+      .from("workspace_members")
+      .select("user_id")
+      .eq("workspace_id", billingWorkspaceId)
+      .eq("user_id", usageActorUserId)
+      .maybeSingle();
+    if (actorMembershipError || !actorMembership?.user_id) {
+      console.warn("[billing] shared usage actor is not a workspace member; using runtime owner", {
+        workspaceId: billingWorkspaceId,
+        requestedUsageActorUserId: usageActorUserId,
+        runtimeOwnerUserId: userId,
+      });
+      usageActorUserId = userId;
+      usageAttributionMeta = {};
+    }
+  }
   const integrationOwnerUserId = billingWorkspaceId
     ? await getWorkspaceCapabilityOwnerUserId({
         workspaceId: billingWorkspaceId,
@@ -1047,7 +1148,10 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       usage: params.usage,
       modelCostUsdOverride: params.modelCostUsdOverride || null,
       chargeType: usageChargeType,
-      meta: params.meta,
+      meta: {
+        ...usageAttributionMeta,
+        ...(params.meta || {}),
+      },
     }).catch(() => {});
   };
 
@@ -1090,6 +1194,11 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       const lvl1 = asRecord(outer?.result);
       const lvl2 = asRecord(lvl1?.result);
       const candidates = [outer, lvl1, lvl2];
+      const resultMetaCandidates = [
+        asRecord(outer?.meta),
+        asRecord(lvl1?.meta),
+        asRecord(lvl2?.meta),
+      ];
 
       const usageCandidate =
         (outer && typeof outer.usage === "object" ? (outer.usage as unknown) : null) ||
@@ -1114,6 +1223,11 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       const explicitChargeType = pickString(candidates, "billing_charge_type");
       const authOrigin = pickString(candidates, "billing_auth_origin");
       const authMethod = pickString(candidates, "billing_auth_method");
+      const playwrightDriver = pickString(resultMetaCandidates, "playwrightDriver");
+      const requestedPlaywrightDriver = pickString(
+        resultMetaCandidates,
+        "requestedPlaywrightDriver"
+      );
       const modelForEstimation =
         modelFromPayload || getOrchestratorAgentSdkFallbackModel();
 
@@ -1152,10 +1266,21 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       }
 
       const source = toolName === "code_cli_run" ? "connector_code_cli" : "connector_browser_task";
-      const connectorChargeType = connectorClaudeChargeType;
-      const connectorBillable = true;
+      const connectorChargeType =
+        explicitChargeType === "groovy_key" ||
+        explicitChargeType === "external_key_fee" ||
+        explicitChargeType === "no_charge"
+          ? normalizeUsageChargeType(explicitChargeType)
+          : connectorClaudeChargeType;
+      const connectorProvider: ProviderId =
+        authMethod === "local_codex_login" || /^gpt-|^o[13](?:-|$)/i.test(modelFromPayload || "")
+          ? "openai"
+          : "anthropic";
+      const connectorHarness = connectorProvider === "openai" ? "codex" : "claude";
+      const connectorBillable = connectorChargeType !== "no_charge";
       const usageForBilling = normalizedUsage ?? { inputTokens, outputTokens, totalTokens };
       const meta = {
+        ...usageAttributionMeta,
         toolName,
         toolCallId: tr.toolCallId,
         totalCostUsd,
@@ -1163,19 +1288,23 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
         request_trace_id: traceId,
         authOrigin,
         authMethod,
+        playwrightDriver,
+        requestedPlaywrightDriver,
+        codeCliProvider: connectorHarness,
         echoedChargeType: explicitChargeType,
         chargeType: connectorChargeType,
       };
 
       insertBillingUsageEventBestEffort({
         workspaceId: billingWorkspaceId,
-        userId,
+        userId: usageActorUserId,
         turnId: effectiveTurnId,
         traceId: tr.toolCallId,
         source,
         spanId: "main",
-        provider: "anthropic",
+        provider: connectorProvider,
         model: modelFromPayload || null,
+        harness: connectorHarness,
         inputTokens,
         outputTokens,
         totalTokens,
@@ -1243,6 +1372,20 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       : null);
   const effectiveRuntimeAgentId =
     args.orchestratorAgentId || runtimeScopeForBranchPolicy?.agentId || null;
+  const assignedSkillsCatalog = await listAssignedSkillsCatalogForUser({
+    userId,
+    workspaceId: args.skillWorkspaceId,
+    agentId: effectiveRuntimeAgentId,
+    profileId: harnessProfile?.id || null,
+    additionalArtifactIds: args.additionalSkillArtifactIds,
+    target: "flow",
+  }).catch((error) => {
+    console.warn(
+      "[runOrchestratorRound] skills catalog unavailable:",
+      error instanceof Error ? error.message : String(error),
+    );
+    return { items: [], artifactCount: 0 };
+  });
   const dynamicSkillTools = effectiveRuntimeAgentId
     ? await loadActiveSkillRuntimeTools({
         supabase,
@@ -1256,7 +1399,10 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     supabase,
     userId,
   });
-  const extensionCatalog = await listExtensionsForUser({
+  // A Home project decision must not receive the owner's unscoped extension
+  // catalog (which can describe other clients' installed integrations), even
+  // though executor policy already blocks extension calls on this surface.
+  const extensionCatalog = args.sourceProvider === "home_inbox" ? [] : await listExtensionsForUser({
     supabase,
     userId,
   }).catch((error) => {
@@ -1278,8 +1424,11 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
 
   const toolContext: ToolExecutionContext = {
     userId,
+    usageActorUserId,
     integrationOwnerUserId: integrationOwnerUserId || userId,
     toolPolicy,
+    homeData: args.sourceProvider === "home_inbox" ? args.homeData : undefined,
+    actionAuthorization: args.actionAuthorization || "default",
     harnessProfile,
     traceId,
     abortSignal: args.abortController?.signal,
@@ -1292,9 +1441,28 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     obsidianVaultPath,
     directAgent: parsed.directAgent,
     orchestratorAgentId: effectiveRuntimeAgentId,
+    assignedSkillScope:
+      assignedSkillsCatalog.artifactCount > 0 || args.channelSkillManagement
+        ? {
+            workspaceId: args.skillWorkspaceId,
+            agentId: effectiveRuntimeAgentId,
+            profileId: harnessProfile?.id || null,
+            additionalArtifactIds: [...(args.additionalSkillArtifactIds || [])],
+            target: "flow",
+          }
+        : undefined,
+    channelSkillManagement: args.channelSkillManagement || null,
+    channelScheduleManagement: args.channelScheduleManagement || null,
+    workspaceAssignmentManagement: args.workspaceAssignmentManagement || null,
     orchestratorSessionId: args.orchestratorSessionId || null,
     taskNotifyTargets: args.taskNotifyTargets,
     taskRequestedChannel: args.taskRequestedChannel || null,
+    taskThreadRootMessageId: args.taskThreadRootMessageId || null,
+    taskContinuationDepth:
+      Number.isFinite(Number(args.taskContinuationDepth)) &&
+      Number(args.taskContinuationDepth) >= 0
+        ? Math.floor(Number(args.taskContinuationDepth))
+        : 0,
     branchControllerMode: branchControllerSettings.mode,
     branchControllerMaxBranches: branchControllerSettings.maxBranches,
     branchControllerMaxTurnsPerBranch: branchControllerSettings.maxTurnsPerBranch,
@@ -1333,6 +1501,7 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     webPixelNames: args.webPixelNames,
     onToolStream: args.onToolStream,
     onToolEvent: args.onToolEvent,
+    onUiAction: args.onUiAction,
     // Browser tasks are supported in WhatsApp via connector-side runner (no dashboard loop required).
     disableBrowserTask: false,
     forceVisibleBrowserTask: shouldDispatchScheduledBrowser,
@@ -1344,6 +1513,21 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
   };
 
   const executableTools = createExecutableTools(toolContext, dynamicSkillTools, dynamicExtensionTools);
+  const directLocalDiagnosticMode =
+    typeof executableTools.terminal_exec !== "undefined" &&
+    (args.preferDirectLocalDiagnostic === true ||
+      shouldUseDirectLocalCliForDiagnostic({
+        message: routingText,
+        workerNames: profileAiChatAgents.map((agent) => agent.name),
+      }));
+  if (directLocalDiagnosticMode) {
+    // Make the routing contract deterministic. Prompt preference alone is not
+    // sufficient when a project name also resembles a worker name.
+    delete executableTools.assign_task;
+    delete executableTools.consult_agent;
+    delete executableTools.finalize_plan;
+    delete executableTools.runtime_branch_parallel;
+  }
   if (args.scheduledMode === true) {
     delete executableTools.assign_task;
     delete executableTools.consult_agent;
@@ -1411,6 +1595,7 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
       traceId,
       partialText: "",
       toolCallsExecuted: ["browser_task"],
+      stepsUsed: 1,
       connectorExecutes: [
         {
           toolCallId,
@@ -1476,6 +1661,10 @@ export async function runOrchestratorRound(args: RunOrchestratorRoundArgs): Prom
     parsed.directAgent === "code" ? [] : dynamicExtensionTools
   );
   const extraDynamic: string[] = [];
+  const directLocalCliRule =
+    typeof executableTools.terminal_exec === "undefined"
+      ? ""
+      : `- For a short, bounded local diagnostic or verification, you MUST use \`terminal_exec\` yourself and MUST NOT call \`assign_task\` merely to run those commands. Use the exact matching workspace path from the roster. This includes Vercel auth/project/deployment logs, one-shot Git state, and service health checks. If the user names a project that matches a worker, infer that worker's workspace even when the user does not @mention the worker; a project name is not a worker assignment. Continue through a bounded sequence until the CLI gives decisive evidence; do not answer from assumptions when the local CLI can establish the fact.\n`;
   const channelInstructionBlock = buildChannelInstructionPromptBlock(
     args.channelInstructions,
   );
@@ -1532,7 +1721,10 @@ These are the user's worker agents — real coding harnesses (Claude Code / Code
 ${rosterLines.join("\n")}
 
 Delegation rules:
-- Use \`assign_task\` for any work that should happen in a workspace: coding, refactors, running commands, repo analysis, file generation.
+${directLocalCliRule}- If \`terminal_exec\` is unavailable, delegate workspace work to the matching worker instead of claiming that you ran local commands.
+- Persist through a bounded diagnostic sequence until you have decisive output. Distinguish authentication, workspace/project resolution, scope selection, network access, and the underlying deployment failure. Do not give up after the first failed command or mislabel a sandbox/network failure as missing credentials. Stop repeating equivalent commands once the cause is proven.
+- Use \`assign_task\` for substantial repository analysis, coding, refactors, multi-file work, long debugging loops, or when the user explicitly asks a named worker to do the work. Every call must set \`access_mode\`. Default to \`read_write\` so the user's local Codex/Claude CLI has its normal machine filesystem, terminal, and network permissions. Use \`read_only\` only when the user explicitly asks for a restricted/no-changes task or for plan mode.
+- For Vercel work, run local CLI commands from the matching configured workspace and rely on the machine's existing Vercel CLI login and that workspace's normal Vercel context. Never invent, inject, or hard-code a Vercel project/team/scope/id. If a particular CLI command requires a scope, discover it from live CLI output for that run. When the user explicitly requires read-only worker execution, set \`external_access="vercel_read"\`; otherwise the default \`read_write\` mode already has normal network access.
 - Tasks run in the background — tell the user the task is queued and on which agent; the completion result arrives as a follow-up event.
 - Use \`list_agents\` / \`check_agent_status\` when unsure which agent fits or whether one is busy.
 - Use \`transfer_context\` to hand one agent's findings to another before assigning follow-up work.
@@ -1541,7 +1733,7 @@ Delegation rules:
 - After consultation, reason over the evidence yourself. You may call \`consult_agent\` again with the same planning_session_id for at most two targeted follow-ups when a material gap remains. Do not repeat broad exploration.
 - The final plan must include: goal and non-goals, verified current architecture, evidence-backed files/symbols, ordered implementation steps, migrations/compatibility, tests, risks, and unresolved user decisions.
 - Call \`finalize_plan\` with the synthesized plan before presenting it. The persisted plan then appears for review in the Tasks rail; approval saves it under .claude/plans/ and lets the user choose the execution agent.
-- Use legacy \`assign_task(plan_mode: true)\` only when the user explicitly wants the worker—not the orchestrator—to author the plan.${mentionHint}`);
+- Use legacy \`assign_task(access_mode: "read_only", plan_mode: true)\` only when the user explicitly wants the worker—not the orchestrator—to author the plan.${mentionHint}`);
     } else {
       extraDynamic.push(`\n\n## YOUR WORKER AGENTS
 
@@ -1550,35 +1742,27 @@ ${Array.isArray(args.allowedAgentIds)
   : "The user has no worker agents yet. When they ask for workspace/coding work, suggest creating one from the dashboard grid (pick a name, harness — Claude Code or Codex — and a workspace folder)."}`);
     }
   }
-  if (deviceId) {
-    await preflightAgentSkillsForUser({
-      userId,
-      deviceId,
-      agentId: effectiveRuntimeAgentId,
-      profileId: harnessProfile?.id || null,
-      target: "flow",
-    }).catch((error) => {
-      console.warn(
-        "[runOrchestratorRound] skills preflight failed:",
-        error instanceof Error ? error.message : String(error)
-      );
-    });
+  const skillsCatalogPrompt = buildAssignedSkillsCatalogPrompt(
+    assignedSkillsCatalog.items,
+  );
+  if (skillsCatalogPrompt) extraDynamic.push(`\n\n${skillsCatalogPrompt}`);
+  if (
+    args.channelSkillManagement &&
+    typeof executableTools.assign_channel_skill !== "undefined"
+  ) {
+    const authoringGuidance = args.channelSkillManagement.canCreateSkills
+      ? " When they explicitly ask to author a brand-new skill, use `create_channel_skill`; it writes a standard Git-backed SKILL.md and, whenever executable API or secret-backed actions are needed, a sibling groovy-actions.json through the connected Groovy Connector, then assigns only the new artifact to this channel. Do not stop after describing a required manifest: include it in actionsManifest so the tool creates it. If SKILL.md already exists and needs its manifest added or replaced, use `update_channel_skill_actions` instead of saying the capability is unavailable."
+      : " The current speaker may assign existing skills but cannot author new shared skills unless they are a workspace admin.";
+    extraDynamic.push(`\n\n## Channel skill management
+The current speaker is authorized to manage this Team Chat channel's Skills & Docs. Only when they explicitly ask to inspect or change channel capabilities, use \`list_channel_skills\`, \`assign_channel_skill\`, or \`remove_channel_skill\`. These changes affect only this channel and remain available when guests participate.${authoringGuidance} After assigning or creating a capability, read it only if it clearly applies to the current task.`);
   }
-  const skillsPromptContext = await buildAssignedSkillsPromptContextForUser({
-    userId,
-    deviceId: deviceId || "",
-    agentId: effectiveRuntimeAgentId,
-    profileId: harnessProfile?.id || null,
-    additionalArtifactIds: args.additionalSkillArtifactIds,
-    target: "flow",
-  }).catch((error) => {
-    console.warn(
-      "[runOrchestratorRound] skills context unavailable:",
-      error instanceof Error ? error.message : String(error)
-    );
-    return { text: "", artifactCount: 0 };
-  });
-  if (skillsPromptContext.text) extraDynamic.push(`\n\n${skillsPromptContext.text}`);
+  if (
+    args.workspaceAssignmentManagement &&
+    typeof executableTools.set_workspace_secret_assignment !== "undefined"
+  ) {
+    extraDynamic.push(`\n\n## Workspace assignment management
+The current human speaker is a verified workspace admin. Only when they explicitly ask, you may list or change shared skill and secret assignments across Minds, workers, and skills. Use the workspace assignment tools instead of claiming the Settings UI is required. Secret values are never visible; you can only manage declarations and grants. Resolve exact names before changing anything and report the precise assignments changed.`);
+  }
   const fullDynamicContext =
     promptSegments.dynamicContext +
     extensionCatalogPromptBlock +
@@ -1607,13 +1791,15 @@ ${Array.isArray(args.allowedAgentIds)
       },
       fallbackHistory: history,
       onSummaryUsage: async (summaryUsage) => {
-        if (!summaryUsage.usage) return;
+        if (!summaryUsage.usage) { args.onUsageGap?.(); return; }
         const checkpointSpanId =
           `${roundSpanId}:checkpoint:v${summaryUsage.summaryVersion}`;
+        await args.onUsage?.({ id: checkpointSpanId, provider: summaryUsage.provider,
+          model: summaryUsage.model, usage: summaryUsage.usage });
         if (billingWorkspaceId) {
           await insertBillingUsageEventBestEffort({
             workspaceId: billingWorkspaceId,
-            userId,
+            userId: usageActorUserId,
             turnId: effectiveTurnId,
             traceId,
             source: "durable_context_checkpoint",
@@ -1625,6 +1811,7 @@ ${Array.isArray(args.allowedAgentIds)
             chargeType: usageChargeType,
             agentId: effectiveRuntimeAgentId,
             meta: {
+              ...usageAttributionMeta,
               summarizedMessages: summaryUsage.summarizedMessages,
               summaryVersion: summaryUsage.summaryVersion,
               scopeKey: summaryUsage.scopeKey,
@@ -1817,6 +2004,11 @@ ${Array.isArray(args.allowedAgentIds)
     });
 
     if (compactionResult.didCompact) {
+      if (!compactionResult.summaryUsage) args.onUsageGap?.();
+      if (compactionResult.summaryUsage) await args.onUsage?.({
+        id: `${roundSpanId}:summarize`, provider: compactionResult.summaryUsage.provider,
+        model: compactionResult.summaryUsage.model, usage: compactionResult.summaryUsage.usage,
+      });
       console.log("[runOrchestratorRound] Prompt compacted:", {
         traceId,
         scope: args.orchestratorAgentId ? `agent:${args.orchestratorAgentId}` : "agent:unknown",
@@ -1825,7 +2017,7 @@ ${Array.isArray(args.allowedAgentIds)
       if (billingWorkspaceId && compactionResult.summaryUsage?.usage) {
         insertBillingUsageEventBestEffort({
           workspaceId: billingWorkspaceId,
-          userId,
+          userId: usageActorUserId,
           turnId: effectiveTurnId,
           traceId,
           source: "compaction",
@@ -1836,6 +2028,7 @@ ${Array.isArray(args.allowedAgentIds)
           billable: true,
           chargeType: usageChargeType,
           meta: {
+            ...usageAttributionMeta,
             ...(compactionResult.stats ? { stats: compactionResult.stats } : {}),
           },
         });
@@ -1859,6 +2052,7 @@ ${Array.isArray(args.allowedAgentIds)
       }
     }
   } catch (compactionError) {
+    args.onUsageGap?.();
     console.warn("[runOrchestratorRound] Compaction failed, using original messages:", compactionError);
   }
 
@@ -1889,6 +2083,8 @@ ${Array.isArray(args.allowedAgentIds)
   const connectorExecutes: ConnectorExecute[] = [];
   let uiOpenCode: UiOpenCode | null = null;
   let browserTask: BrowserTask | null = null;
+  let roundStepsUsed = 0;
+  const resolvedStepsUsed = () => Math.max(1, Math.floor(roundStepsUsed || 0));
   // If the model calls a server-side tool and we stop after 1 step, we can end up
   // with no assistant text at all. Keep the last tool output so we can surface it
   // (especially errors) rather than returning an empty WhatsApp reply.
@@ -2054,6 +2250,7 @@ ${Array.isArray(args.allowedAgentIds)
       partialText: text,
       toolCallsExecuted,
       connectorExecutes,
+      stepsUsed: resolvedStepsUsed(),
     };
   };
 
@@ -2062,7 +2259,7 @@ ${Array.isArray(args.allowedAgentIds)
       ? "browser"
       : toolName.startsWith("code_")
       ? "code"
-      : toolName.startsWith("data_")
+      : toolName.startsWith("data_") || toolName === "home_data_operations" || toolName === "home_data_read"
         ? "data"
         : toolName.startsWith("browser_")
           ? "browser"
@@ -2334,8 +2531,15 @@ ${Array.isArray(args.allowedAgentIds)
       cwd: args.codeWorkspaceRootPath || process.cwd(),
       unrestricted: true,
       abortController: args.abortController,
+      callbacks: { onUsage: args.onUsage },
     });
     agentSdkMetrics = sdkResult.metrics || null;
+    roundStepsUsed = Math.max(
+      roundStepsUsed,
+      Number.isFinite(Number(sdkResult.metrics?.numTurns))
+        ? Math.floor(Number(sdkResult.metrics?.numTurns))
+        : 1,
+    );
 
     for (const call of sdkResult.toolCalls) {
       const agent = toolNameToAgent(call.toolName);
@@ -2378,11 +2582,28 @@ ${Array.isArray(args.allowedAgentIds)
     if (sdkResult.text && sdkResult.text.trim()) {
       text = sdkResult.text.trim();
     }
+    assertUsableModelRound({
+      text,
+      toolOutputText: lastToolOutputText,
+      connectorExecuteCount: connectorExecutes.length,
+      hasUiOpenCode: Boolean(uiOpenCode),
+      hasBrowserTask: Boolean(browserTask),
+      generatedFileCount:
+        (finalGeneratedFiles as GeneratedFileRef[] | null)?.length || 0,
+      attachedFileCount:
+        (
+          finalFiles as Array<{
+            mediaType: string;
+            base64: string;
+            filename?: string | null;
+          }> | null
+        )?.length || 0,
+    });
 
     if (billingWorkspaceId) {
       insertBillingUsageEventBestEffort({
         workspaceId: billingWorkspaceId,
-        userId,
+        userId: usageActorUserId,
         turnId: effectiveTurnId,
         traceId,
         source: "orchestrator_round_agent_sdk",
@@ -2393,6 +2614,7 @@ ${Array.isArray(args.allowedAgentIds)
         billable: true,
         chargeType: usageChargeType,
         meta: {
+          ...usageAttributionMeta,
           directAgent: parsed.directAgent,
           maxSteps,
           historyCount: history.length,
@@ -2453,7 +2675,12 @@ ${Array.isArray(args.allowedAgentIds)
       await runWithAgentSdk(preferredSdkApiKey || null);
       usedAgentSdk = true;
     } catch (err) {
+      args.onUsageGap?.();
       if (args.abortController?.signal.aborted) throw err;
+      // Never replay an original turn after a tool may already have produced a
+      // side effect. The durable tool/task result is preferable to duplicate
+      // emails, writes, schedules, or worker dispatches.
+      if (toolCallsExecuted.length > 0) throw err;
       if (
         preferredSdkApiKey &&
         provider === "anthropic" &&
@@ -2469,6 +2696,7 @@ ${Array.isArray(args.allowedAgentIds)
               traceId,
               text: preflight.message,
               toolCallsExecuted: [],
+              stepsUsed: resolvedStepsUsed(),
             };
           }
         }
@@ -2524,13 +2752,13 @@ ${Array.isArray(args.allowedAgentIds)
         await insertBillingToolEventsBestEffort(
           billingToolCalls.map((c) => ({
             workspaceId: billingWorkspaceId,
-            userId,
+            userId: usageActorUserId,
             turnId: effectiveTurnId,
             traceId,
             toolCallId: c.toolCallId,
             toolName: c.toolName,
             agent: c.agent,
-            meta: { request_trace_id: traceId },
+            meta: { ...usageAttributionMeta, request_trace_id: traceId },
           }))
         );
       }
@@ -2546,6 +2774,7 @@ ${Array.isArray(args.allowedAgentIds)
           partialText: text,
           toolCallsExecuted,
           browserTask,
+          stepsUsed: resolvedStepsUsed(),
         };
       }
 
@@ -2556,6 +2785,7 @@ ${Array.isArray(args.allowedAgentIds)
           partialText: text,
           toolCallsExecuted,
           uiOpenCode,
+          stepsUsed: resolvedStepsUsed(),
         };
       }
 
@@ -2592,6 +2822,7 @@ ${Array.isArray(args.allowedAgentIds)
         files: finalFiles || undefined,
         generatedFiles: finalGeneratedFiles || undefined,
         toolCallsExecuted,
+        stepsUsed: resolvedStepsUsed(),
       };
     }
   }
@@ -2608,21 +2839,27 @@ ${Array.isArray(args.allowedAgentIds)
     );
   }
 
-  const runtimeIdentity = buildOrchestratorRuntimeIdentityPrompt({
-    provider,
-    modelName,
-    reasoningEffort: orchestratorModelOverride?.reasoningEffort,
-    engine: "ai-sdk",
-    selectionSource: harnessProfile?.model
-      ? "profile"
-      : args.modelOverride
-        ? "scheduled-override"
-        : orchestratorModelOverride
-          ? "user-selected"
-          : "automatic-default",
-  });
-  const systemMessages =
-    provider === "anthropic"
+  const configuredSelectionSource = harnessProfile?.model
+    ? "profile"
+    : args.modelOverride
+      ? "scheduled-override"
+      : orchestratorModelOverride
+        ? "user-selected"
+        : "automatic-default";
+  const buildSystemMessages = (candidateModelName: string) => {
+    const isRecoveryModel = candidateModelName !== modelName;
+    const runtimeIdentity = buildOrchestratorRuntimeIdentityPrompt({
+      provider,
+      modelName: candidateModelName,
+      reasoningEffort: isRecoveryModel
+        ? null
+        : orchestratorModelOverride?.reasoningEffort,
+      engine: "ai-sdk",
+      selectionSource: isRecoveryModel
+        ? "automatic-default"
+        : configuredSelectionSource,
+    });
+    return provider === "anthropic"
       ? [
           {
             role: "system" as const,
@@ -2642,34 +2879,51 @@ ${Array.isArray(args.allowedAgentIds)
             content: `${systemPrompt}\n\n${runtimeIdentity}`,
           },
         ];
+  };
 
-  const createResult = (currentApiKey: string | null) =>
+  const createResult = (
+    currentApiKey: string | null,
+    candidateModelName: string,
+    candidateProviderOptions: SharedV3ProviderOptions | undefined,
+    billingSpanId: string,
+  ) =>
     streamText({
-      model: resolveChatModel(provider, modelName, currentApiKey ? { apiKey: currentApiKey } : undefined),
-      system: systemMessages,
-      providerOptions: modelProviderOptions,
+      model: resolveChatModel(
+        provider,
+        candidateModelName,
+        currentApiKey ? { apiKey: currentApiKey } : undefined,
+      ),
+      system: buildSystemMessages(candidateModelName),
+      providerOptions: candidateProviderOptions,
       messages: finalMessages,
       tools,
       abortSignal: args.abortController?.signal,
       stopWhen: stopForLegacyRound,
+      onError: () => args.onUsageGap?.(),
+      onAbort: () => args.onUsageGap?.(),
+      onStepFinish: async (event) => {
+        await args.onUsage?.({ id: `${billingSpanId}:${event.response.id}`,
+          provider, model: event.response.modelId || candidateModelName, usage: event.usage });
+      },
       onFinish: async (event) => {
         const text = event.text;
-        const usage = (event as unknown as { usage?: unknown }).usage;
+        const usage = event.totalUsage;
 
         if (billingWorkspaceId) {
           insertBillingUsageEventBestEffort({
             workspaceId: billingWorkspaceId,
-            userId,
+            userId: usageActorUserId,
             turnId: effectiveTurnId,
             traceId,
             source: "orchestrator_round",
-            spanId: roundSpanId,
+            spanId: billingSpanId,
             provider,
-            model: modelName,
+            model: candidateModelName,
             usage,
             billable: true,
             chargeType: usageChargeType,
             meta: {
+              ...usageAttributionMeta,
               directAgent: parsed.directAgent,
               maxSteps,
               historyCount: history.length,
@@ -2678,8 +2932,8 @@ ${Array.isArray(args.allowedAgentIds)
           });
           await billGroovyUsage({
             source: "orchestrator_round",
-            spanId: roundSpanId,
-            model: modelName,
+            spanId: billingSpanId,
+            model: candidateModelName,
             usage,
             meta: {
               directAgent: parsed.directAgent,
@@ -2726,8 +2980,33 @@ ${Array.isArray(args.allowedAgentIds)
       },
     });
 
-  const consumeStream = async (result: ReturnType<typeof createResult>) => {
+  const consumeStream = async (
+    result: ReturnType<typeof createResult>,
+  ): Promise<string | null> => {
+    let finishReason: string | null = null;
     for await (const event of result.fullStream) {
+    if (event.type === "error") {
+      throw modelStreamEventError(event.error);
+    }
+
+    if (event.type === "abort") {
+      throw args.abortController?.signal.reason instanceof Error
+        ? args.abortController.signal.reason
+        : new Error(event.reason || "The model stream was aborted.");
+    }
+
+    if (event.type === "finish" || event.type === "finish-step") {
+      if (event.type === "finish-step") {
+        roundStepsUsed += 1;
+      }
+      finishReason =
+        typeof event.finishReason === "string" ? event.finishReason : finishReason;
+      if (finishReason === "error") {
+        throw new ModelStreamCompletionError(finishReason);
+      }
+      continue;
+    }
+
     if (event.type === "text-delta") {
       text += event.text;
       args.onAssistantTextDelta?.({ text: event.text });
@@ -2917,6 +3196,7 @@ ${Array.isArray(args.allowedAgentIds)
       }
     }
   }
+    return finishReason;
   };
 
   const TRANSIENT_MAX_RETRIES = 2;
@@ -2932,11 +3212,41 @@ ${Array.isArray(args.allowedAgentIds)
     lastToolOutputText = null;
     toolCallsExecuted.length = 0;
     billingToolCalls.length = 0;
+    roundStepsUsed = 0;
   };
 
+  let activeLegacyModelName = modelName;
+  let activeLegacyProviderOptions = modelProviderOptions;
+  let activeBillingSpanId = roundSpanId;
+  let recoveryModelAttempted = false;
   for (let transientAttempt = 0; ; transientAttempt++) {
     try {
-      await consumeStream(createResult(activeApiKey));
+      const finishReason = await consumeStream(
+        createResult(
+          activeApiKey,
+          activeLegacyModelName,
+          activeLegacyProviderOptions,
+          activeBillingSpanId,
+        ),
+      );
+      assertUsableModelRound({
+        text,
+        toolOutputText: lastToolOutputText,
+        connectorExecuteCount: connectorExecutes.length,
+        hasUiOpenCode: Boolean(uiOpenCode),
+        hasBrowserTask: Boolean(browserTask),
+        generatedFileCount:
+          (finalGeneratedFiles as GeneratedFileRef[] | null)?.length || 0,
+        attachedFileCount:
+          (
+            finalFiles as Array<{
+              mediaType: string;
+              base64: string;
+              filename?: string | null;
+            }> | null
+          )?.length || 0,
+        finishReason,
+      });
       break;
     } catch (err) {
       if (args.abortController?.signal.aborted) throw err;
@@ -2952,6 +3262,31 @@ ${Array.isArray(args.allowedAgentIds)
         );
         return buildNeedsConnectorResult();
       }
+      // Quota is an account/project condition, not a model failure. Retrying a
+      // fallback model with the same key only repeats the failure and hides the
+      // actionable provider error behind the generic recovery message.
+      if (isInsufficientQuotaError(err)) {
+        console.warn("[runOrchestratorRound] provider quota exhausted", {
+          traceId,
+          provider,
+          modelName: activeLegacyModelName,
+          keyMode: activeApiKey ? "user" : "groovy",
+        });
+        return {
+          kind: "final",
+          traceId,
+          text: quotaExhaustedResponseText({
+            provider,
+            keyMode: activeApiKey ? "user" : "groovy",
+          }),
+          toolCallsExecuted,
+          stepsUsed: resolvedStepsUsed(),
+        };
+      }
+
+      // Provider recovery is safe only before a tool has run. Retrying the
+      // original prompt after an executed tool could duplicate side effects.
+      if (toolCallsExecuted.length > 0) throw err;
 
       if (activeApiKey && isInvalidApiKeyError(err) && hasServerProviderKey(provider)) {
         console.warn("[runOrchestratorRound] user key invalid; retrying with Groovy key", {
@@ -2966,13 +3301,14 @@ ${Array.isArray(args.allowedAgentIds)
               traceId,
               text: preflight.message,
               toolCallsExecuted: [],
+              stepsUsed: resolvedStepsUsed(),
             };
           }
         }
         usageChargeType = "groovy_key";
         activeApiKey = null;
         resetStreamState();
-        transientAttempt = 0;
+        transientAttempt = -1;
         continue;
       }
 
@@ -2990,6 +3326,42 @@ ${Array.isArray(args.allowedAgentIds)
         continue;
       }
 
+      const recoveryModelName =
+        provider === "openai"
+          ? getOrchestratorOpenAiModel()
+          : provider === "anthropic"
+            ? getOrchestratorAnthropicModel()
+            : activeLegacyModelName;
+      if (
+        !recoveryModelAttempted &&
+        recoveryModelName &&
+        recoveryModelName !== activeLegacyModelName
+      ) {
+        recoveryModelAttempted = true;
+        console.warn(
+          "[runOrchestratorRound] configured model failed; retrying with provider recovery model",
+          {
+            traceId,
+            provider,
+            configuredModel: activeLegacyModelName,
+            recoveryModel: recoveryModelName,
+            error:
+              err instanceof Error
+                ? err.message.slice(0, 300)
+                : String(err).slice(0, 300),
+          },
+        );
+        activeLegacyModelName = recoveryModelName;
+        activeLegacyProviderOptions =
+          provider === "anthropic"
+            ? getAnthropicContextProviderOptions(provider, recoveryModelName)
+            : undefined;
+        activeBillingSpanId = `${roundSpanId}_recovery`;
+        resetStreamState();
+        transientAttempt = -1;
+        continue;
+      }
+
       throw err;
     }
   }
@@ -2998,13 +3370,13 @@ ${Array.isArray(args.allowedAgentIds)
     await insertBillingToolEventsBestEffort(
       billingToolCalls.map((c) => ({
         workspaceId: billingWorkspaceId,
-        userId,
+        userId: usageActorUserId,
         turnId: effectiveTurnId,
         traceId,
         toolCallId: c.toolCallId,
         toolName: c.toolName,
         agent: c.agent,
-        meta: { request_trace_id: traceId },
+        meta: { ...usageAttributionMeta, request_trace_id: traceId },
       }))
     );
   }
@@ -3020,6 +3392,7 @@ ${Array.isArray(args.allowedAgentIds)
       partialText: text,
       toolCallsExecuted,
       browserTask,
+      stepsUsed: resolvedStepsUsed(),
     };
   }
 
@@ -3030,6 +3403,7 @@ ${Array.isArray(args.allowedAgentIds)
       partialText: text,
       toolCallsExecuted,
       uiOpenCode,
+      stepsUsed: resolvedStepsUsed(),
     };
   }
 
@@ -3068,5 +3442,6 @@ ${Array.isArray(args.allowedAgentIds)
     files: finalFiles || undefined,
     generatedFiles: finalGeneratedFiles || undefined,
     toolCallsExecuted,
+    stepsUsed: resolvedStepsUsed(),
   };
 }

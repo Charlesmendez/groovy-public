@@ -18,6 +18,11 @@ import {
   type AgentTaskNotifyTargets,
   type AgentTaskRow,
 } from "@/lib/orchestrator/agentTasks";
+import {
+  agentTaskContinuationLimitReached,
+  normalizeAgentTaskContinuationDepth,
+} from "@/lib/orchestrator/agentTaskContinuationPolicy";
+import { parseAgentTaskAccessMode } from "@/lib/orchestrator/agentTaskExecutionPolicy";
 import type { ToolExecutionContext, ToolResult } from "@/lib/orchestrator/toolExecutor";
 import {
   filterAgentRoster,
@@ -25,12 +30,20 @@ import {
 } from "@/lib/orchestrator/toolPolicy";
 import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
 import {
+  createChannelSkillForUser,
+  updateChannelSkillActionsForUser,
+  listChannelSkillsForUser,
   listSkillsAndDocsForUser,
+  readAssignedSkillForUser,
+  resolveAssignedSkillActionForUser,
+  setChannelSkillAssignmentForUser,
   setSkillAssignmentForUser,
+  listWorkspaceSecretAssignmentsForUser,
+  setWorkspaceSecretAssignmentForUser,
 } from "@/lib/skills-manager/service";
+import { resolveAssignedSkillReference } from "@/lib/skills-manager/assignedSkills";
 import { loadIntegrationAssignments } from "@/lib/integrations/assignments";
 
-const WAIT_INLINE_TIMEOUT_MS = 2 * 60 * 1000;
 const CONSULTATION_TIMEOUT_MS = {
   quick: 2 * 60 * 1000,
   standard: 5 * 60 * 1000,
@@ -130,10 +143,12 @@ async function resolveSkillAssignmentDestination(
   userId: string,
   params: Record<string, unknown>,
   allowedAgentIds?: string[] | null,
+  workspaceId?: string | null,
 ): Promise<
   | {
       ok: true;
       agentId: string | null;
+      profileId?: string | null;
       target: "flow" | "claude" | "codex";
       label: string;
     }
@@ -142,6 +157,19 @@ async function resolveSkillAssignmentDestination(
   const destination = typeof params.destination === "string" ? params.destination : "";
   if (destination === "orchestrator") {
     return { ok: true, agentId: null, target: "flow", label: "the orchestrator" };
+  }
+  if (destination === "mind") {
+    const mindRef = typeof params.mind === "string" ? params.mind.trim() : "";
+    if (!mindRef) return { ok: false, error: "An exact Mind name or id is required." };
+    const admin = createSupabaseAdminClient();
+    let query = admin.from("orchestrator_profiles").select("id,name");
+    query = workspaceId ? query.eq("workspace_id", workspaceId) : query.eq("user_id", userId);
+    const { data: minds, error } = await query;
+    if (error) return { ok: false, error: error.message };
+    const needle = mindRef.toLowerCase();
+    const matches = (minds || []).filter((mind) => [mind.id, mind.name].some((value) => String(value || "").trim().toLowerCase() === needle));
+    if (matches.length !== 1) return { ok: false, error: matches.length ? `Multiple Minds match "${mindRef}".` : `No Mind named "${mindRef}".` };
+    return { ok: true, agentId: null, profileId: String(matches[0].id), target: "flow", label: `Mind ${matches[0].name}` };
   }
   if (destination === "all_claude") {
     if (Array.isArray(allowedAgentIds)) {
@@ -335,6 +363,207 @@ export async function executeAgentDelegationTool(
       });
     }
 
+    if (toolName === "read_skill_or_doc") {
+      const scope = context.assignedSkillScope;
+      if (!scope) {
+        return fail(
+          toolName,
+          startTime,
+          "No enabled Skills & Docs scope is available for this turn.",
+        );
+      }
+      const artifact =
+        typeof params.artifact === "string" ? params.artifact.trim() : "";
+      if (!artifact) {
+        return fail(toolName, startTime, "A skill or doc reference is required.");
+      }
+      const item = await readAssignedSkillForUser({
+        userId,
+        workspaceId: scope.workspaceId,
+        artifact,
+        deviceId: context.deviceId || null,
+        agentId: scope.agentId,
+        profileId: scope.profileId,
+        additionalArtifactIds: scope.additionalArtifactIds,
+        target: scope.target,
+      });
+      return ok(toolName, startTime, item);
+    }
+
+    if (toolName === "run_skill_action") {
+      const scope = context.assignedSkillScope;
+      if (!scope || !context.deviceId) return fail(toolName, startTime, "An assigned skill scope and online local Connector are required.");
+      const artifact = typeof params.artifact === "string" ? params.artifact.trim() : "";
+      const action = typeof params.action === "string" ? params.action.trim() : "";
+      const args = Array.isArray(params.args)
+        ? Object.fromEntries(
+            params.args.flatMap((entry) => {
+              if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+              const name = typeof (entry as { name?: unknown }).name === "string"
+                ? (entry as { name: string }).name.trim()
+                : "";
+              const value = (entry as { value?: unknown }).value;
+              return name && ["string", "number", "boolean"].includes(typeof value)
+                ? [[name, value] as const]
+                : [];
+            }),
+          )
+        : params.args && typeof params.args === "object"
+          ? params.args as Record<string, unknown>
+          : {};
+      const envelope = await resolveAssignedSkillActionForUser({ userId, workspaceId: scope.workspaceId, agentId: scope.agentId, profileId: scope.profileId, additionalArtifactIds: scope.additionalArtifactIds, target: scope.target, artifact, action, args, deviceId: context.deviceId });
+      return ok(toolName, startTime, envelope);
+    }
+
+    if (toolName === "list_channel_skills") {
+      const management = context.channelSkillManagement;
+      if (!management) {
+        return fail(
+          toolName,
+          startTime,
+          "The current speaker is not authorized to manage skills for this channel.",
+        );
+      }
+      const query = typeof params.query === "string" ? params.query.trim() : "";
+      const result = await listChannelSkillsForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        channelId: management.channelId,
+        actorUserId: management.actorUserId,
+        query,
+      });
+      return ok(toolName, startTime, result);
+    }
+
+    if (toolName === "create_channel_skill") {
+      const management = context.channelSkillManagement;
+      if (!management?.canCreateSkills) {
+        return fail(
+          toolName,
+          startTime,
+          "Only a workspace admin can author a new shared skill for this channel.",
+        );
+      }
+      const name = typeof params.name === "string" ? params.name : "";
+      const description =
+        typeof params.description === "string" ? params.description : "";
+      const instructions =
+        typeof params.instructions === "string" ? params.instructions : "";
+      const actionsManifest =
+        typeof params.actionsManifest === "string"
+          ? params.actionsManifest
+          : null;
+      const repository =
+        typeof params.repository === "string" ? params.repository : null;
+      const result = await createChannelSkillForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        channelId: management.channelId,
+        actorUserId: management.actorUserId,
+        deviceId: context.deviceId || "",
+        name,
+        description,
+        instructions,
+        actionsManifest,
+        repository,
+      });
+
+      if (context.assignedSkillScope) {
+        const current = new Set(
+          context.assignedSkillScope.additionalArtifactIds || [],
+        );
+        current.add(result.item.id);
+        context.assignedSkillScope.additionalArtifactIds = [...current];
+      }
+      return ok(toolName, startTime, {
+        ...result,
+        message: `${result.item.name} was created in the Skills & Docs repository and assigned to this channel.`,
+      });
+    }
+
+    if (toolName === "update_channel_skill_actions") {
+      const management = context.channelSkillManagement;
+      if (!management?.canCreateSkills) {
+        return fail(
+          toolName,
+          startTime,
+          "Only a workspace admin can update executable actions for a shared skill.",
+        );
+      }
+      const result = await updateChannelSkillActionsForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        channelId: management.channelId,
+        actorUserId: management.actorUserId,
+        deviceId: context.deviceId || "",
+        artifact: typeof params.artifact === "string" ? params.artifact : "",
+        actionsManifest:
+          typeof params.actionsManifest === "string"
+            ? params.actionsManifest
+            : "",
+      });
+      return ok(toolName, startTime, {
+        ...result,
+        message: `${result.item.name} now has an executable groovy-actions.json manifest.`,
+      });
+    }
+
+    if (
+      toolName === "assign_channel_skill" ||
+      toolName === "remove_channel_skill"
+    ) {
+      const management = context.channelSkillManagement;
+      if (!management) {
+        return fail(
+          toolName,
+          startTime,
+          "The current speaker is not authorized to manage skills for this channel.",
+        );
+      }
+      const artifactRef =
+        typeof params.artifact === "string" ? params.artifact.trim() : "";
+      if (!artifactRef) {
+        return fail(toolName, startTime, "A skill or doc name is required.");
+      }
+      const library = await listChannelSkillsForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        channelId: management.channelId,
+        actorUserId: management.actorUserId,
+        query: artifactRef,
+      });
+      const resolved = resolveAssignedSkillReference(library.items, artifactRef);
+      if (!resolved.ok) return fail(toolName, startTime, resolved.error);
+
+      const enabled = toolName === "assign_channel_skill";
+      const result = await setChannelSkillAssignmentForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        channelId: management.channelId,
+        actorUserId: management.actorUserId,
+        artifactId: resolved.item.id,
+        enabled,
+      });
+
+      // Keep the trusted, in-memory scope current so an assigned skill can be
+      // read later in this same model turn without widening any other scope.
+      if (context.assignedSkillScope) {
+        const current = new Set(
+          context.assignedSkillScope.additionalArtifactIds || [],
+        );
+        if (enabled) current.add(resolved.item.id);
+        else current.delete(resolved.item.id);
+        context.assignedSkillScope.additionalArtifactIds = [...current];
+      }
+
+      return ok(toolName, startTime, {
+        ...result,
+        message: enabled
+          ? `${resolved.item.name} is now assigned to this channel.`
+          : `${resolved.item.name} is no longer assigned to this channel.`,
+      });
+    }
+
     if (
       toolName === "assign_skill_or_doc" ||
       toolName === "remove_skill_or_doc_assignment"
@@ -351,13 +580,16 @@ export async function executeAgentDelegationTool(
         userId,
         params,
         context.toolPolicy?.agentRoster,
+        context.workspaceAssignmentManagement?.workspaceId,
       );
       if (!destination.ok) return fail(toolName, startTime, destination.error);
       const enabled = toolName === "assign_skill_or_doc";
       await setSkillAssignmentForUser({
         userId,
+        workspaceId: context.workspaceAssignmentManagement?.workspaceId,
         artifactId: resolvedArtifact.artifact.id,
         agentId: destination.agentId,
+        profileId: destination.profileId,
         target: destination.target,
         enabled,
       });
@@ -372,6 +604,48 @@ export async function executeAgentDelegationTool(
         applies: enabled ? "next run" : "next run",
         message: `${resolvedArtifact.artifact.name} ${action} ${destination.label}. This change applies on the next run.`,
         manageUrl: "/dashboard/skills",
+      });
+    }
+
+    if (toolName === "list_workspace_secret_assignments") {
+      const management = context.workspaceAssignmentManagement;
+      if (!management) return fail(toolName, startTime, "A verified workspace-admin speaker is required.");
+      const result = await listWorkspaceSecretAssignmentsForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        query: typeof params.query === "string" ? params.query : "",
+      });
+      return ok(toolName, startTime, result);
+    }
+
+    if (toolName === "set_workspace_secret_assignment") {
+      const management = context.workspaceAssignmentManagement;
+      if (!management) return fail(toolName, startTime, "A verified workspace-admin speaker is required.");
+      const state = await listWorkspaceSecretAssignmentsForUser({ userId, workspaceId: management.workspaceId });
+      const exact = (items: Array<Record<string, unknown>>, ref: string, fields: string[]) => {
+        const needle = ref.trim().toLowerCase();
+        return items.filter((item) => fields.some((field) => String(item[field] || "").trim().toLowerCase() === needle));
+      };
+      const secretRef = typeof params.secret === "string" ? params.secret : "";
+      const destination = params.destination === "mind" || params.destination === "worker" || params.destination === "skill" ? params.destination : null;
+      const targetRef = typeof params.target === "string" ? params.target : "";
+      const secrets = exact(state.secrets as Array<Record<string, unknown>>, secretRef, ["id", "key", "name"]);
+      const targetItems = destination === "mind" ? state.minds : destination === "worker" ? state.workers : state.skills;
+      const targets = destination ? exact(targetItems as Array<Record<string, unknown>>, targetRef, destination === "skill" ? ["id", "name", "slug", "relative_path"] : ["id", "name"]) : [];
+      if (secrets.length !== 1) return fail(toolName, startTime, secrets.length ? "Secret reference is ambiguous." : "Secret declaration not found.");
+      if (!destination || targets.length !== 1) return fail(toolName, startTime, targets.length ? "Assignment target is ambiguous." : "Assignment target not found.");
+      const result = await setWorkspaceSecretAssignmentForUser({
+        userId,
+        workspaceId: management.workspaceId,
+        secretId: String(secrets[0].id),
+        destination,
+        destinationId: String(targets[0].id),
+        enabled: params.enabled === true,
+      });
+      return ok(toolName, startTime, {
+        ...result,
+        target: targets[0],
+        message: `${secrets[0].key} was ${params.enabled === true ? "assigned to" : "removed from"} ${targets[0].name}.`,
       });
     }
 
@@ -399,13 +673,60 @@ export async function executeAgentDelegationTool(
       }
 
       const requireApproval = params.require_approval === true;
+      const accessMode = parseAgentTaskAccessMode(params.access_mode);
+      if (!accessMode) {
+        return fail(
+          toolName,
+          startTime,
+          "assign_task requires access_mode=read_only or access_mode=read_write",
+        );
+      }
       const planMode = params.plan_mode === true;
-      const wait = params.wait === true;
+      if (planMode && accessMode !== "read_only") {
+        return fail(
+          toolName,
+          startTime,
+          "assign_task plan_mode requires access_mode=read_only",
+        );
+      }
+      const readOnly = accessMode === "read_only";
+      const externalAccess =
+        params.external_access === "vercel_read" ? "vercel_read" : "none";
+      if (externalAccess !== "none" && !readOnly) {
+        return fail(
+          toolName,
+          startTime,
+          "assign_task external_access is only supported with access_mode=read_only",
+        );
+      }
+      const continuationDepth = normalizeAgentTaskContinuationDepth(
+        context.taskContinuationDepth,
+      );
+      const maxContinuationDepth = Math.max(
+        1,
+        Math.floor(
+          Number(context.branchControllerMaxTurnsPerBranch) || 8,
+        ),
+      );
+      if (
+        agentTaskContinuationLimitReached({
+          depth: continuationDepth,
+          maxTurns: maxContinuationDepth,
+        })
+      ) {
+        return fail(
+          toolName,
+          startTime,
+          `Branch Controller stopped this handoff: the asynchronous orchestrator loop reached its configured ${maxContinuationDepth}-turn limit. Synthesize the available evidence or report the remaining blocker.`,
+        );
+      }
 
       const notify: AgentTaskNotifyTargets = {
         dashboard: true,
         ...(context.taskNotifyTargets || {}),
       };
+      const requestedChannel =
+        context.taskRequestedChannel || "dashboard";
 
       const created = await createAgentTask({
         userId,
@@ -414,10 +735,23 @@ export async function executeAgentDelegationTool(
         title: typeof params.title === "string" ? params.title : null,
         context: typeof params.context === "string" ? params.context : null,
         orchestratorSessionId: context.orchestratorSessionId || null,
-        requestedChannel: context.taskRequestedChannel || "dashboard",
+        requestedChannel,
         notify,
+        resultMeta: {
+          ...(context.usageActorUserId && context.usageActorUserId !== userId
+            ? { usage_actor_user_id: context.usageActorUserId }
+            : {}),
+          ...(context.taskThreadRootMessageId
+            ? { thread_root_message_id: context.taskThreadRootMessageId }
+            : {}),
+          orchestrator_continuation_depth: continuationDepth,
+          ...(externalAccess !== "none"
+            ? { external_access: externalAccess }
+            : {}),
+        },
         requireApproval,
         planMode,
+        readOnly,
         source: "orchestrator",
         traceId: context.traceId || null,
         turnId: context.turnId || null,
@@ -426,11 +760,15 @@ export async function executeAgentDelegationTool(
       if (requireApproval) {
         const { notifyTaskAwaitingApproval } = await import("@/lib/orchestrator/agentTasks");
         await notifyTaskAwaitingApproval(created).catch(() => {});
+        const shortTaskId = created.id.slice(0, 8);
+        const approvalMessage = requestedChannel.startsWith("team_chat:")
+          ? `Task ${shortTaskId} is awaiting the user's approval. An approval card is visible inline in the current Chat with Approve & run and Reject buttons. Tell the user to decide there without switching to Command Center. They can also reply "approve ${shortTaskId}".`
+          : `Task ${shortTaskId} is awaiting the user's approval (they can approve from the dashboard or by replying "approve ${shortTaskId}").`;
         return ok(toolName, startTime, {
           taskId: created.id,
           agent: resolved.agent.name,
           status: "awaiting_approval",
-          message: `Task ${created.id.slice(0, 8)} is awaiting the user's approval (they can approve from the dashboard or by replying "approve ${created.id.slice(0, 8)}").`,
+          message: approvalMessage,
         });
       }
 
@@ -439,30 +777,21 @@ export async function executeAgentDelegationTool(
           ? ` Warning: ${resolved.agent.name}'s device appears offline — the task will fail if the connector does not come online.`
           : "";
 
-      if (wait) {
-        const outcome = await runAgentTask({
-          taskId: created.id,
-          userId,
-          timeoutMs: WAIT_INLINE_TIMEOUT_MS,
-        });
-        return ok(toolName, startTime, {
-          taskId: created.id,
-          agent: resolved.agent.name,
-          status: outcome.task.status,
-          result: outcome.resultText || null,
-          error: outcome.error,
-        });
-      }
-
-      kickAgentTask({ taskId: created.id, userId });
+      const kicked = await kickAgentTask({ taskId: created.id, userId });
+      const failedToStart = kicked.status === "failed";
       return ok(toolName, startTime, {
         taskId: created.id,
         agent: resolved.agent.name,
         harness: resolved.agent.harness,
-        status: "queued",
+        status: kicked.status,
         planMode: planMode || undefined,
-        message: planMode
+        accessMode,
+        message: failedToStart
+          ? `Task ${created.id} could not start on ${resolved.agent.name}: ${kicked.error || "unknown error"}.`
+          : planMode
           ? `Plan task ${created.id} queued on ${resolved.agent.name}. It will draft a plan (no changes). When it finishes, tell the user to review it in the Tasks rail — approving saves it to the workspace's .claude/plans/ and lets them pick which agent executes it.${offlineWarning}`
+          : readOnly
+          ? `Read-only task ${created.id} queued on ${resolved.agent.name} (${resolved.agent.harness}${resolved.agent.model ? `/${resolved.agent.model}` : ""}). Workspace mutation is disabled; the completion result will arrive as a follow-up event.${offlineWarning}`
           : `Task ${created.id} queued on ${resolved.agent.name} (${resolved.agent.harness}${resolved.agent.model ? `/${resolved.agent.model}` : ""}). It runs in the background; the completion result will arrive as a follow-up event.${offlineWarning}`,
       });
     }
@@ -604,6 +933,12 @@ export async function executeAgentDelegationTool(
         requestedChannel: context.taskRequestedChannel || "dashboard",
         notify: { dashboard: true },
         resultMeta: {
+          ...(context.usageActorUserId && context.usageActorUserId !== userId
+            ? { usage_actor_user_id: context.usageActorUserId }
+            : {}),
+          ...(context.taskThreadRootMessageId
+            ? { thread_root_message_id: context.taskThreadRootMessageId }
+            : {}),
           consultation_mode: true,
           planning_session_id: planningSessionId,
           planning_round: round,
@@ -611,7 +946,9 @@ export async function executeAgentDelegationTool(
           planning_objective: objective,
           planning_status: "exploring",
           repository_snapshot: repositorySnapshot,
+          orchestrator_wait_inline: true,
         },
+        readOnly: true,
         source: "orchestrator",
         traceId: context.traceId || null,
         turnId: context.turnId || null,

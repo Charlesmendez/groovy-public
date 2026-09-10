@@ -2,8 +2,14 @@ import type { Metadata, Viewport } from "next";
 import { Outfit, Orbitron, JetBrains_Mono } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
-import { DesktopChatNotificationBridge } from "@/components/desktop/DesktopChatNotificationBridge";
+import "katex/dist/katex.min.css";
+import { ChatNotificationBridge } from "@/components/notifications/ChatNotificationBridge";
+import { ServiceWorkerBridge } from "@/components/notifications/ServiceWorkerBridge";
+import { EmailFocusNotificationBridge } from "@/components/notifications/EmailFocusNotificationBridge";
 import { DesktopUiUpdateBanner } from "@/components/desktop/DesktopUiUpdateBanner";
+import { EmailBackgroundSyncBridge } from "@/components/email/EmailBackgroundSyncBridge";
+import { EmailSendBridge } from "@/components/email/EmailSendBridge";
+import { GlobalVoiceAssistant } from "@/components/voice/GlobalVoiceAssistant";
 import { getAppUrl, getBrandName } from "@/lib/config/appConfig";
 
 const outfit = Outfit({
@@ -36,26 +42,26 @@ const brandName = getBrandName();
 export const metadata: Metadata = {
   metadataBase: siteUrl,
   manifest: "/manifest.webmanifest",
-  title: `${brandName.toUpperCase()} | Command Center`,
-  description: "AI Agent Command Center - Get into your groove",
+  title: `${brandName} | Coding, chat, and email`,
+  description: "An all-in-one AI harness for coding, chat, and email.",
   alternates: {
     canonical: "/",
   },
   openGraph: {
     type: "website",
-    title: `${brandName.toUpperCase()} | Command Center`,
-    description: "AI Agent Command Center - Get into your groove",
+    title: `${brandName} | Coding, chat, and email`,
+    description: "An all-in-one AI harness for coding, chat, and email.",
     url: "/",
     siteName: brandName,
   },
   twitter: {
     card: "summary_large_image",
-    title: `${brandName.toUpperCase()} | Command Center`,
-    description: "AI Agent Command Center - Get into your groove",
+    title: `${brandName} | Coding, chat, and email`,
+    description: "An all-in-one AI harness for coding, chat, and email.",
   },
   icons: {
-    icon: "/Sloth_no_bg2.png",
-    apple: "/Sloth_no_bg2.png",
+    icon: "/icon-192.png",
+    apple: "/icon-192.png",
   },
   appleWebApp: {
     capable: true,
@@ -80,17 +86,23 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${outfit.variable} ${orbitron.variable} ${jetbrainsMono.variable}`}>
       <body className="antialiased">
-        <div className="noise-overlay" />
-        {children}
-        <DesktopChatNotificationBridge />
-        <DesktopUiUpdateBanner />
-        {/* Datagran Web Pixel - Analytics */}
-        <Script
-          src="https://www.datagran.io/pixel.js"
-          data-site-id="55236bf6-9cdb-476f-9c47-df1dea438972"
-          data-write-key="wpx_live_c57ec40067736af63d7f5a9fb6ca94d462279e0bf7b7d1a2"
-          strategy="afterInteractive"
-        />
+        <GlobalVoiceAssistant>
+          <div className="noise-overlay" />
+          {children}
+          <ServiceWorkerBridge />
+          <EmailSendBridge />
+          <EmailBackgroundSyncBridge />
+          <ChatNotificationBridge />
+          <EmailFocusNotificationBridge />
+          <DesktopUiUpdateBanner />
+          {/* Datagran Web Pixel - Analytics */}
+          <Script
+            src="https://www.datagran.io/pixel.js"
+            data-site-id="55236bf6-9cdb-476f-9c47-df1dea438972"
+            data-write-key="wpx_live_c57ec40067736af63d7f5a9fb6ca94d462279e0bf7b7d1a2"
+            strategy="afterInteractive"
+          />
+        </GlobalVoiceAssistant>
       </body>
     </html>
   );

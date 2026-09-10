@@ -86,20 +86,18 @@ export function CliAuthSection({
         <h3 className="text-sm font-medium text-white">Choose your coding harness</h3>
         <p className="mt-1 text-xs leading-relaxed text-zinc-400">
           Worker agents run through Claude Code or Codex CLI on the machine running the connector.
-          Install the harnesses you plan to assign to agents. Codex can be your coding harness, but
-          Claude Code is still required for Groovy&apos;s local computer-browser tasks.
+          Install the harnesses you plan to assign to agents. The same choice is available for
+          Groovy&apos;s local computer-browser tasks in Connector settings.
         </p>
       </div>
 
       <div className="flex gap-3 rounded-xl border border-orange-500/25 bg-orange-500/10 p-4">
         <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-orange-300" />
         <div>
-          <p className="text-xs font-medium text-orange-100">Claude Code is required for browser automation</p>
+          <p className="text-xs font-medium text-orange-100">Install at least one browser engine</p>
           <p className="mt-1 text-[11px] leading-relaxed text-orange-100/70">
-            Groovy&apos;s computer-browser tasks use Claude Code with Playwright on this connector
-            machine. If Claude Code is not installed and authenticated, login-required browser work
-            such as navigating Schwab will not run—even when the Orchestrator or your coding agents
-            use an OpenAI model.
+            Computer-browser tasks use Playwright with either Claude Code or Codex on this connector
+            machine. Choose the engine, model, and reasoning effort in Settings → Connector.
           </p>
         </div>
       </div>
@@ -140,8 +138,7 @@ export function CliAuthSection({
             Code without an interactive browser login.
           </p>
           <p className="mt-3 rounded-lg border border-orange-500/20 bg-orange-500/[0.07] px-3 py-2 text-[11px] leading-relaxed text-orange-200/80">
-            Required for computer-browser tasks. Without Claude Code, Groovy cannot run the local
-            Playwright browser operator.
+            Use this engine for browser tasks when you prefer Anthropic models such as Sonnet.
           </p>
           <a
             href="https://code.claude.com/docs/en/overview"
@@ -171,6 +168,9 @@ export function CliAuthSection({
           <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
             Choose ChatGPT sign-in for subscription access, or an OpenAI API key for usage-based
             access. Codex caches the login on this machine, and Groovy reuses it for local runs.
+          </p>
+          <p className="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.07] px-3 py-2 text-[11px] leading-relaxed text-emerald-200/80">
+            Use this engine for browser tasks when you prefer OpenAI models such as GPT-5.6 Luna.
           </p>
           <a
             href="https://developers.openai.com/codex/cli"

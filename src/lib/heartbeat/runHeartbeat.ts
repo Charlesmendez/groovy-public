@@ -21,6 +21,13 @@ import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/bi
 import { type UsageChargeType } from "@/lib/billing/pricing";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
 import { createDatagranLinkToken, resolveDatagranLinkOrigin } from "@/lib/datagran/linkToken";
+import { gmailApiCall } from "@/lib/email/gmail";
+import { resolveEmailModel } from "@/lib/email/modelRouting";
+import {
+  filterUnorganizedEmails,
+  gmailTriageInboxQuery,
+} from "@/lib/email/triageFreshness";
+import { EMAIL_TRIAGE_POLICY_VERSION } from "@/lib/email/triagePolicy";
 import { resolveKeys } from "@/lib/keys/resolveKeyMode";
 import {
   formatPreferenceForPrompt,
@@ -1724,6 +1731,19 @@ async function datagranApiCall(
   body?: unknown,
   provider?: string,
 ): Promise<{ ok: boolean; data?: unknown; error?: string; needsReauth?: boolean }> {
+  const normalizedMethod = method.toUpperCase();
+  if (
+    endpoint.startsWith("/api/proxy/gmail/") &&
+    ["GET", "POST", "PUT", "DELETE"].includes(normalizedMethod)
+  ) {
+    return gmailApiCall({
+      datagranApiKey,
+      connectionId,
+      method: normalizedMethod as "GET" | "POST" | "PUT" | "DELETE",
+      endpoint,
+      body,
+    });
+  }
   try {
     const url = new URL(endpoint, "https://www.datagran.io");
 
@@ -1745,8 +1765,8 @@ async function datagranApiCall(
     const ac = new AbortController();
     const apiTimeout = setTimeout(() => ac.abort(), DATAGRAN_API_TIMEOUT_MS);
 
-    const opts: RequestInit = { method: method.toUpperCase(), headers, signal: ac.signal };
-    if (body && method.toUpperCase() !== "GET") {
+    const opts: RequestInit = { method: normalizedMethod, headers, signal: ac.signal };
+    if (body && normalizedMethod !== "GET") {
       opts.body = JSON.stringify(body);
     }
     let res: Response;
@@ -2059,6 +2079,7 @@ async function fetchRecentEmails(
 ): Promise<{
   text: string;
   needsReauth?: boolean;
+  mailboxAddress?: string;
   ids: string[];
   items: Array<{
     id: string;
@@ -2066,16 +2087,22 @@ async function fetchRecentEmails(
     from: string;
     to: string;
     cc: string;
+    deliveredTo?: string;
     subject: string;
     date: string;
     snippet: string;
     listUnsubscribe?: string;
+    authenticationResults?: string;
+    autoSubmitted?: string;
+    precedence?: string;
+    listId?: string;
+    labelIds?: string[];
     messageIdHeader?: string;
     line: string;
   }>;
 }> {
   const lookbackDays = 7;
-  const inboxQuery = `in:inbox -from:me -label:"Groovy/Processed" -label:"Groovy/Unsubscribed" -label:"Groovy/Spam" newer_than:${lookbackDays}d`;
+  const inboxQuery = gmailTriageInboxQuery(lookbackDays);
   // List inbox message IDs and activity counts from the last week.
   const listRes = await datagranApiCall(
     datagranApiKey,
@@ -2169,7 +2196,7 @@ async function fetchRecentEmails(
     const body = [activityLine, sentLines.length > 0 ? sentLines.join("\n") : "", "(no recent inbox emails)"]
       .filter(Boolean)
       .join("\n");
-    return { text: body, ids: [], items: [] };
+    return { text: body, mailboxAddress: "", ids: [], items: [] };
   }
 
   // Fetch metadata for each (parallel, capped)
@@ -2188,21 +2215,33 @@ async function fetchRecentEmails(
       datagranApiKey,
       connectionId,
       "GET",
-      `/api/proxy/gmail/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=Message-ID`,
+      `/api/proxy/gmail/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Delivered-To&metadataHeaders=X-Original-To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=Authentication-Results&metadataHeaders=Auto-Submitted&metadataHeaders=Precedence&metadataHeaders=List-ID&metadataHeaders=Message-ID`,
     );
     if (!r.ok || !r.data) return null;
-    const payload = r.data as { payload?: { headers?: Array<{ name: string; value: string }> }; snippet?: string };
+    const payload = r.data as {
+      payload?: { headers?: Array<{ name: string; value: string }> };
+      snippet?: string;
+      labelIds?: string[];
+    };
     const headers = payload?.payload?.headers || [];
     const get = (n: string) =>
       headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value || "";
     const from = get("From");
     const to = get("To");
     const cc = get("Cc");
+    const deliveredTo = get("Delivered-To") || get("X-Original-To");
     const subject = get("Subject");
     const date = get("Date");
     const listUnsubscribe = get("List-Unsubscribe");
+    const authenticationResults = get("Authentication-Results");
+    const autoSubmitted = get("Auto-Submitted");
+    const precedence = get("Precedence");
+    const listId = get("List-ID");
     const messageIdHeader = get("Message-ID");
     const snippet = typeof payload?.snippet === "string" ? payload.snippet.trim() : "";
+    const labelIds = Array.isArray(payload?.labelIds)
+      ? payload.labelIds.map((label) => String(label || "").trim()).filter(Boolean)
+      : [];
     const line = `${prefix}Email ${idx + 1}: From=${from} | Subject=${subject} | Date=${date}`;
     return {
       id,
@@ -2210,10 +2249,16 @@ async function fetchRecentEmails(
       from,
       to,
       cc,
+      deliveredTo,
       subject,
       date,
       snippet,
       listUnsubscribe,
+      authenticationResults,
+      autoSubmitted,
+      precedence,
+      listId,
+      labelIds,
       messageIdHeader,
       line,
     };
@@ -2225,13 +2270,28 @@ async function fetchRecentEmails(
     from: string;
     to: string;
     cc: string;
+    deliveredTo?: string;
     subject: string;
     date: string;
     snippet: string;
     listUnsubscribe?: string;
+    authenticationResults?: string;
+    autoSubmitted?: string;
+    precedence?: string;
+    listId?: string;
+    labelIds?: string[];
     messageIdHeader?: string;
     line: string;
   }>;
+  const mailboxAddress =
+    items
+      .flatMap((item) =>
+        (item.deliveredTo || "").match(
+          /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
+        ) || [],
+      )
+      .map((address) => address.toLowerCase())
+      .find(Boolean) || "";
   const lines = items.map((d) => d.line).filter(Boolean);
   const text =
     lines.length > 0
@@ -2241,7 +2301,7 @@ async function fetchRecentEmails(
       : [activityLine, sentLines.length > 0 ? sentLines.join("\n") : "", "(no inbox email details available)"]
           .filter(Boolean)
           .join("\n");
-  return { text, ids, items };
+  return { text, mailboxAddress, ids, items };
 }
 
 async function fetchUpcomingEvents(
@@ -3232,6 +3292,11 @@ Rules:
     date: string;
     snippet: string;
     listUnsubscribe?: string;
+    authenticationResults?: string;
+    autoSubmitted?: string;
+    precedence?: string;
+    listId?: string;
+    labelIds?: string[];
     messageIdHeader?: string;
     line: string;
   }> = [];
@@ -3257,6 +3322,14 @@ Rules:
     autoExecutedCount: number;
     criticalCount: number;
     notes: string[];
+    focusArrivals: Array<{
+      actionId: string;
+      senderName: string;
+      senderEmail: string;
+      subject: string;
+      mailboxLabel: string;
+    }>;
+    focusNotification: { attempted: number; delivered: number };
   } | null = null;
   let inboxActionsPromptContext: InboxActionPromptContext = {
     summary: "(no recent inbox actions)",
@@ -3516,6 +3589,7 @@ Rules:
     let keyRowsQuery = supabase
       .from("datagran_agent_configs")
       .select("agent_id, provider, connection_id, datagran_api_key_enc")
+      .eq("user_id", userId)
       .in("provider", providersToFetch);
     if (selectedAgentIds.length > 0) {
       keyRowsQuery = keyRowsQuery.in("agent_id", selectedAgentIds);
@@ -3554,6 +3628,7 @@ Rules:
     const noEmailResult = {
       text: "",
       needsReauth: false,
+      mailboxAddress: "",
       ids: [] as string[],
       items: [] as Array<{
         id: string;
@@ -3565,6 +3640,11 @@ Rules:
         date: string;
         snippet: string;
         listUnsubscribe?: string;
+        authenticationResults?: string;
+        autoSubmitted?: string;
+        precedence?: string;
+        listId?: string;
+        labelIds?: string[];
         messageIdHeader?: string;
         line: string;
       }>,
@@ -3617,7 +3697,15 @@ Rules:
       gmailMailboxContexts = emailResultsByMailbox.map((m) => ({
         connectionId: m.mailbox.connectionId,
         mailboxLabel: m.mailbox.mailboxLabel,
+        address: m.result.mailboxAddress || "",
         datagranApiKey: m.datagranApiKey,
+      }));
+      const heartbeatOwnedAddresses = gmailMailboxContexts
+        .map((mailbox) => mailbox.address || "")
+        .filter(Boolean);
+      gmailMailboxContexts = gmailMailboxContexts.map((mailbox) => ({
+        ...mailbox,
+        ownedAddresses: heartbeatOwnedAddresses,
       }));
 
       const summaryBlocks: string[] = [];
@@ -3648,6 +3736,11 @@ Rules:
             date: item.date,
             snippet: item.snippet,
             listUnsubscribe: item.listUnsubscribe,
+            authenticationResults: item.authenticationResults,
+            autoSubmitted: item.autoSubmitted,
+            precedence: item.precedence,
+            listId: item.listId,
+            labelIds: item.labelIds,
             messageIdHeader: item.messageIdHeader,
             line: item.line,
           });
@@ -3663,6 +3756,11 @@ Rules:
             date: item.date,
             snippet: item.snippet,
             listUnsubscribe: item.listUnsubscribe,
+            authenticationResults: item.authenticationResults,
+            autoSubmitted: item.autoSubmitted,
+            precedence: item.precedence,
+            listId: item.listId,
+            labelIds: item.labelIds,
             messageIdHeader: item.messageIdHeader,
           });
         }
@@ -3884,31 +3982,75 @@ Rules:
   // - auto-execute high-confidence low-risk actions
   if (shouldFetchGmail && triageEmailItems.length > 0 && gmailMailboxContexts.length > 0) {
     try {
-      inboxTriageResult = await runInboxTriageForHeartbeat({
-        supabase,
-        userId,
-        agentId: heartbeatAgentId,
-        sessionId:
-          typeof taskConfig.orchestrator_session_id === "string" && taskConfig.orchestrator_session_id.trim()
-            ? taskConfig.orchestrator_session_id.trim()
-            : null,
-        sourceJobId: jobId || null,
-        userEmail,
-        policyModel: {
-          provider: keyInfo.provider,
-          modelName: selectedModelName,
-          apiKey: keyInfo.apiKey,
-        },
-        memoryContext,
-        preferenceContext,
-        mailboxes: gmailMailboxContexts,
-        emails: triageEmailItems,
-      });
-      console.log("[heartbeat] inbox triage", {
-        pending: inboxTriageResult.pendingCount,
-        autoExecuted: inboxTriageResult.autoExecutedCount,
-        critical: inboxTriageResult.criticalCount,
-      });
+      // The heartbeat fetch is also used to summarize recent mail, so it can
+      // contain messages that were already classified by an earlier heartbeat
+      // or an interactive client. Only spend model tokens on genuinely new or
+      // explicitly retryable classifications.
+      const triageMessageIds = Array.from(
+        new Set(triageEmailItems.map((item) => item.id).filter(Boolean)),
+      );
+      const existingTriageActions =
+        triageMessageIds.length > 0
+          ? await supabase
+              .from("inbox_actions")
+              .select(
+                "connection_id,gmail_message_id,recommended_action,status,reason,metadata",
+              )
+              .eq("user_id", userId)
+              .eq("provider", "gmail")
+              .in("gmail_message_id", triageMessageIds)
+          : { data: [], error: null };
+      if (existingTriageActions.error) {
+        throw new Error(existingTriageActions.error.message);
+      }
+      const unorganizedTriageItems = filterUnorganizedEmails(
+        triageEmailItems,
+        existingTriageActions.data || [],
+        { currentPolicyVersion: EMAIL_TRIAGE_POLICY_VERSION },
+      );
+      if (unorganizedTriageItems.length === 0) {
+        console.log("[heartbeat] inbox triage skipped", {
+          reason: "all_recent_messages_already_classified",
+          checked: triageEmailItems.length,
+        });
+      } else {
+        const emailModel = await resolveEmailModel({
+          supabase,
+          userId,
+          tier: "quality",
+        });
+        inboxTriageResult = await runInboxTriageForHeartbeat({
+          supabase,
+          userId,
+          agentId: heartbeatAgentId,
+          sessionId:
+            typeof taskConfig.orchestrator_session_id === "string" && taskConfig.orchestrator_session_id.trim()
+              ? taskConfig.orchestrator_session_id.trim()
+              : null,
+          sourceJobId: jobId || null,
+          userEmail,
+          policyModel: {
+            provider: emailModel.provider,
+            modelName: emailModel.modelName,
+            apiKey: emailModel.apiKey,
+            reasoningEffort: emailModel.reasoningEffort,
+          },
+          memoryContext,
+          preferenceContext,
+          mailboxes: gmailMailboxContexts,
+          emails: unorganizedTriageItems,
+        });
+        console.log("[heartbeat] inbox triage", {
+          checked: triageEmailItems.length,
+          classified: unorganizedTriageItems.length,
+          pending: inboxTriageResult.pendingCount,
+          autoExecuted: inboxTriageResult.autoExecutedCount,
+          critical: inboxTriageResult.criticalCount,
+          focusArrivals: inboxTriageResult.focusArrivals.length,
+          focusNotificationsDelivered:
+            inboxTriageResult.focusNotification.delivered,
+        });
+      }
     } catch (e) {
       console.warn("[heartbeat] inbox triage failed:", e);
     }

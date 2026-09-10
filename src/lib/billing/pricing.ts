@@ -10,7 +10,7 @@ export const GROOVY_MAC_MIN_SEATS = 10;
 export const GROOVY_MAC_SEAT_PRICE_USD = 15;
 export const KAPSO_ALLOWLIST_PRICE_USD = 2;
 
-type PricingUsdPerMillion = {
+export type PricingUsdPerMillion = {
   input: number;
   output: number;
   /** Price per million tokens read from prompt cache (Anthropic: 10% of input) */
@@ -20,17 +20,26 @@ type PricingUsdPerMillion = {
 };
 
 const PRICING_ALIASES: Array<{ match: RegExp; pricing: PricingUsdPerMillion; key: string }> = [
+  { match: /^claude-fable-5(?:$|[-.])/i, pricing: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 }, key: "claude-fable-5" },
+  { match: /^claude-opus-5(?:$|[-.])/i, pricing: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }, key: "claude-opus-5" },
+  { match: /^claude-opus-4[.-]8/i, pricing: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }, key: "claude-opus-4-8" },
   { match: /^claude-opus-4[.-]7/i, pricing: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }, key: "claude-opus-4-7" },
   { match: /^claude-opus-4[.-]6/i, pricing: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }, key: "claude-opus-4-6" },
   { match: /^claude-sonnet-4[.-]6/i, pricing: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, key: "claude-sonnet-4-6" },
   { match: /^claude-sonnet-4[.-]5/i, pricing: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, key: "claude-sonnet-4-5" },
   { match: /^claude-haiku-4[.-]5/i, pricing: { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 }, key: "claude-haiku-4-5" },
+  { match: /^gpt-5\.6-sol(?:$|[-.])/i, pricing: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 }, key: "gpt-5.6-sol" },
+  { match: /^gpt-5\.6-terra(?:$|[-.])/i, pricing: { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 }, key: "gpt-5.6-terra" },
+  { match: /^gpt-5\.6-luna(?:$|[-.])/i, pricing: { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 }, key: "gpt-5.6-luna" },
+  { match: /^gpt-5\.6(?:$|[-.])/i, pricing: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 }, key: "gpt-5.6-sol" },
   { match: /^gpt-5\.5-pro/i, pricing: { input: 30, output: 180 }, key: "gpt-5.5-pro" },
-  { match: /^gpt-5\.5/i, pricing: { input: 5, output: 30, cacheRead: 0.5 }, key: "gpt-5.5" },
+  { match: /^gpt-5\.5/i, pricing: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 }, key: "gpt-5.5" },
   { match: /^gpt-5\.4-codex-mini/i, pricing: { input: 0.75, output: 6, cacheRead: 0.075 }, key: "gpt-5.4-codex-mini" },
   { match: /^gpt-5\.4-mini/i, pricing: { input: 0.75, output: 4.5, cacheRead: 0.075 }, key: "gpt-5.4-mini" },
   { match: /^gpt-5\.4/i, pricing: { input: 2.5, output: 15, cacheRead: 0.25 }, key: "gpt-5.4" },
   { match: /^gpt-5-mini/i, pricing: { input: 0.3, output: 1.2 }, key: "gpt-5-mini" },
+  { match: /^gpt-4o-mini(?:$|[-.])/i, pricing: { input: 0.15, output: 0.6, cacheRead: 0.075 }, key: "gpt-4o-mini" },
+  { match: /^gpt-4o(?:$|[-.])/i, pricing: { input: 2.5, output: 10, cacheRead: 1.25 }, key: "gpt-4o" },
 ];
 
 function roundUsd(n: number): number {
@@ -55,6 +64,13 @@ function normalizeModelName(model?: string | null): { key: string; pricing: Pric
   // Billing policy is explicitly pegged to Opus pricing.
   const fallback = PRICING_ALIASES[0];
   return fallback ? { key: fallback.key, pricing: fallback.pricing } : null;
+}
+
+/** Shared pricing resolver for billing and usage analytics. */
+export function getModelPricingUsdPerMillion(
+  model?: string | null,
+): { key: string; pricing: PricingUsdPerMillion } | null {
+  return normalizeModelName(model);
 }
 
 export function normalizeUsageChargeType(value?: string | null): UsageChargeType {

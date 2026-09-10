@@ -5,7 +5,9 @@ import { completeAgentTaskFromConnector } from "@/lib/orchestrator/agentTasks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// Worker completion responds immediately, then an asynchronous orchestrator
+// assignment may use this invocation's after() budget to resume its controller.
+export const maxDuration = 800;
 
 const AGENT_TASK_COMPLETE_SCOPE = "agent_task_complete";
 

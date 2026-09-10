@@ -7,6 +7,9 @@ import { killProcessTree } from "../process/index.mjs";
 import { prepareSpawnEnv } from "../shell/index.mjs";
 
 const DEFAULT_CODE_AGENT_TIMEOUT_MS = 20 * 60 * 1000;
+const VERCEL_READ_PERMISSION_PROFILE = "groovy-vercel-read";
+const VERCEL_READ_NETWORK_DOMAINS =
+  '{ "**.vercel.com" = "allow", "**.vercel.app" = "allow" }';
 
 function quoteWindowsArg(arg) {
   const s = String(arg ?? "");
@@ -69,7 +72,29 @@ export function resolveCodexBin() {
 }
 
 function addCodexExecutionMode(args, options = {}) {
-  if (options.planMode === true) {
+  if (options.readOnly === true || options.planMode === true) {
+    if (options.externalAccess === "vercel_read") {
+      // Keep the repository read-only while enabling a narrowly scoped
+      // outbound path for Vercel diagnostics. Do not combine default_permissions
+      // with sandbox_mode; Codex permission profiles own both boundaries.
+      args.push(
+        "-c",
+        `default_permissions="${VERCEL_READ_PERMISSION_PROFILE}"`,
+        "-c",
+        `permissions.${VERCEL_READ_PERMISSION_PROFILE}.extends=":read-only"`,
+        "-c",
+        `permissions.${VERCEL_READ_PERMISSION_PROFILE}.network.enabled=true`,
+        "-c",
+        `permissions.${VERCEL_READ_PERMISSION_PROFILE}.network.mode="limited"`,
+        "-c",
+        `permissions.${VERCEL_READ_PERMISSION_PROFILE}.network.domains=${VERCEL_READ_NETWORK_DOMAINS}`,
+        "-c",
+        "features.network_proxy.enabled=true",
+        "-c",
+        `features.network_proxy.domains=${VERCEL_READ_NETWORK_DOMAINS}`,
+      );
+      return;
+    }
     // Real OS-level read-only sandbox. Use the -c form because
     // `codex exec resume` doesn't expose -s/--sandbox; -c is accepted by
     // both `codex exec` and `codex exec resume`.
@@ -89,6 +114,24 @@ function addCodexReasoningEffort(args, options = {}) {
     throw new Error("invalid_reasoning_effort");
   }
   args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
+}
+
+function addCodexConfigOverrides(args, options = {}) {
+  const overrides = Array.isArray(options.configOverrides) ? options.configOverrides : [];
+  if (overrides.length > 32) throw new Error("too_many_codex_config_overrides");
+  for (const raw of overrides) {
+    const value = String(raw || "").trim();
+    if (!value || value.length > 1000 || /[\r\n\0]/.test(value)) {
+      throw new Error("invalid_codex_config_override");
+    }
+    args.push("-c", value);
+  }
+}
+
+function addCodexEphemeralMode(args, options = {}) {
+  if (options.ephemeral !== true) return;
+  if (options.sessionId) throw new Error("ephemeral_codex_run_cannot_resume");
+  args.push("--ephemeral");
 }
 
 // Track the previous turn's plan-mode state per Codex session so we can cue
@@ -116,7 +159,7 @@ function recordCodexPlanMode(threadId, planMode) {
   }
 }
 
-function buildCodexArgs(options) {
+export function buildCodexArgs(options) {
   if (options.sessionId) {
     // Resume existing session: codex exec resume SESSION_ID "prompt".
     // NOTE: `exec resume` does not accept `--cd`; the child's cwd is set via
@@ -125,6 +168,7 @@ function buildCodexArgs(options) {
     const args = ["exec", "resume", String(options.sessionId)];
     if (options.model) args.push("-m", String(options.model));
     addCodexReasoningEffort(args, options);
+    addCodexConfigOverrides(args, options);
     addCodexExecutionMode(args, options);
     args.push("--json");
     args.push("--skip-git-repo-check");
@@ -135,8 +179,10 @@ function buildCodexArgs(options) {
   const args = ["exec"];
   if (options.model) args.push("-m", String(options.model));
   addCodexReasoningEffort(args, options);
+  addCodexConfigOverrides(args, options);
   if (options.cwd) args.push("--cd", String(options.cwd));
   addCodexExecutionMode(args, options);
+  addCodexEphemeralMode(args, options);
   args.push("--json");
   args.push("--skip-git-repo-check");
   if (options.prompt) args.push(String(options.prompt));
@@ -562,6 +608,22 @@ function mapCodexToolName(event) {
 function synthesizeClaudeStreamEvent(codexEvent) {
   const toolName = mapCodexToolName(codexEvent);
   if (!toolName) return null;
+  let mcpInput = {};
+  if (codexEvent.item?.type === "mcp_tool_call") {
+    const rawArguments = codexEvent.item.arguments;
+    if (rawArguments && typeof rawArguments === "object" && !Array.isArray(rawArguments)) {
+      mcpInput = rawArguments;
+    } else if (typeof rawArguments === "string" && rawArguments.trim()) {
+      try {
+        const parsed = JSON.parse(rawArguments);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          mcpInput = parsed;
+        }
+      } catch {
+        // Keep progress reporting generic when the MCP arguments are not JSON.
+      }
+    }
+  }
   return {
     type: "assistant",
     message: {
@@ -571,6 +633,7 @@ function synthesizeClaudeStreamEvent(codexEvent) {
           name: toolName,
           input: {
             // Provide enough for the connector's summarizeLiveToolUse
+            ...mcpInput,
             ...(codexEvent.item?.type === "command_execution"
               ? { command: codexEvent.item.command || "" }
               : {}),
@@ -1036,8 +1099,9 @@ export async function runHeadlessCodex(options = {}) {
     }
   };
 
+  let args = [];
   try {
-    const args =
+    args =
       slashExecution?.kind === "codex-json"
         ? slashExecution.args
         : buildCodexArgs({ ...options, prompt, cwd });
@@ -1058,11 +1122,13 @@ export async function runHeadlessCodex(options = {}) {
     result.codexThreadId =
       extractThreadId(result.streamEvents || []) || normalizeCodexThreadId(options.sessionId);
     recordCodexPlanMode(result.codexThreadId, options.planMode);
-    const recoveredUsage = recoverCodexUsageFromSessionFile({
-      threadId: result.codexThreadId,
-      startedAtMs: runStartedAtMs,
-      finishedAtMs: runFinishedAtMs,
-    });
+    const recoveredUsage = options.ephemeral === true
+      ? null
+      : recoverCodexUsageFromSessionFile({
+          threadId: result.codexThreadId,
+          startedAtMs: runStartedAtMs,
+          finishedAtMs: runFinishedAtMs,
+        });
     if (recoveredUsage) {
       result.codexUsage = recoveredUsage;
       result.streamEvents = [
@@ -1106,11 +1172,13 @@ export async function runHeadlessCodex(options = {}) {
     result.codexThreadId =
       extractThreadId(result.streamEvents || []) || normalizeCodexThreadId(options.sessionId);
     recordCodexPlanMode(result.codexThreadId, options.planMode);
-    const recoveredUsage = recoverCodexUsageFromSessionFile({
-      threadId: result.codexThreadId,
-      startedAtMs: runStartedAtMs,
-      finishedAtMs: runFinishedAtMs,
-    });
+    const recoveredUsage = options.ephemeral === true
+      ? null
+      : recoverCodexUsageFromSessionFile({
+          threadId: result.codexThreadId,
+          startedAtMs: runStartedAtMs,
+          finishedAtMs: runFinishedAtMs,
+        });
     if (recoveredUsage) {
       result.codexUsage = recoveredUsage;
       result.streamEvents = [
@@ -1145,9 +1213,11 @@ export function extractCodexResult(streamEvents) {
 
     const tokenInfo = codexTokenInfoFromEvent(e);
     const tokenUsage =
-      tokenInfo && typeof tokenInfo === "object"
-        ? tokenInfo.last_token_usage || tokenInfo.total_token_usage || null
-        : null;
+      e.type === "turn.completed" && e.usage && typeof e.usage === "object"
+        ? e.usage
+        : tokenInfo && typeof tokenInfo === "object"
+          ? tokenInfo.last_token_usage || tokenInfo.total_token_usage || null
+          : null;
     const normalizedUsage = codexUsageFromTokenUsage(tokenUsage);
     if (normalizedUsage) {
       usage = normalizedUsage;

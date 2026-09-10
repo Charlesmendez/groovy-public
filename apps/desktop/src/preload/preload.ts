@@ -28,8 +28,52 @@ type HostedUiUpdateStatus = {
 
 type NativeNotificationStatus = {
   supported: boolean;
-  permission: "default" | "denied" | "granted" | "unsupported";
+  permission:
+    | "default"
+    | "denied"
+    | "granted"
+    | "unknown"
+    | "unsupported";
 };
+
+type NativeComposerShortcut = "mod-enter" | "mod-j";
+
+type NativeAppAreaShortcut = "command-center" | "chat" | "email";
+
+const NATIVE_APP_AREA_SHORTCUTS = new Set<NativeAppAreaShortcut>([
+  "command-center",
+  "chat",
+  "email",
+]);
+
+type NativeEmailShortcut =
+  | "escape"
+  | "open-shortcuts"
+  | "search"
+  | "compose"
+  | "next"
+  | "previous"
+  | "open-reply-all"
+  | "forward"
+  | "mark-done"
+  | "archive"
+  | "toggle-star"
+  | "mark-unread";
+
+const NATIVE_EMAIL_SHORTCUTS = new Set<NativeEmailShortcut>([
+  "escape",
+  "open-shortcuts",
+  "search",
+  "compose",
+  "next",
+  "previous",
+  "open-reply-all",
+  "forward",
+  "mark-done",
+  "archive",
+  "toggle-star",
+  "mark-unread",
+]);
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const listener = (_event: IpcRendererEvent, payload: T) => cb(payload);
@@ -69,16 +113,49 @@ const api = {
   reloadUi: (): Promise<void> => ipcRenderer.invoke("groovy:reload-ui"),
   getNativeNotificationStatus: (): Promise<NativeNotificationStatus> =>
     ipcRenderer.invoke("groovy:get-native-notification-status"),
+  testNativeNotification: (): Promise<{
+    requested: boolean;
+    reason?: string;
+  }> => ipcRenderer.invoke("groovy:test-native-notification"),
+  openNativeNotificationSettings: (): Promise<{
+    opened: boolean;
+    reason?: string;
+  }> => ipcRenderer.invoke("groovy:open-native-notification-settings"),
   showChatNotification: (payload: {
     messageId: string;
     channelId: string;
     title: string;
     body: string;
     url: string;
+    silent?: boolean;
   }): Promise<{ shown: boolean; reason?: string }> =>
     ipcRenderer.invoke("groovy:show-chat-notification", payload),
+  setChatBadgeCount: (count: number): Promise<{ updated: boolean }> =>
+    ipcRenderer.invoke("groovy:set-chat-badge-count", count),
   onSystemResume: (cb: () => void) =>
     subscribe<Record<string, never>>("groovy:system-resumed", () => cb()),
+  onNativeComposerShortcut: (cb: (shortcut: NativeComposerShortcut) => void) =>
+    subscribe<unknown>("groovy:native-composer-shortcut", (payload) => {
+      if (payload === "mod-enter" || payload === "mod-j") cb(payload);
+    }),
+  onNativeAppAreaShortcut: (cb: (shortcut: NativeAppAreaShortcut) => void) =>
+    subscribe<unknown>("groovy:native-app-area-shortcut", (payload) => {
+      if (
+        typeof payload === "string" &&
+        NATIVE_APP_AREA_SHORTCUTS.has(payload as NativeAppAreaShortcut)
+      ) {
+        cb(payload as NativeAppAreaShortcut);
+      }
+    }),
+  onNativeEmailShortcut: (cb: (shortcut: NativeEmailShortcut) => void) =>
+    subscribe<unknown>("groovy:native-email-shortcut", (payload) => {
+      if (
+        typeof payload === "string" &&
+        NATIVE_EMAIL_SHORTCUTS.has(payload as NativeEmailShortcut)
+      ) {
+        cb(payload as NativeEmailShortcut);
+      }
+    }),
   getSettings: (): Promise<{ keepRunningInBackground: boolean; appUrl?: string }> =>
     ipcRenderer.invoke("groovy:get-settings"),
   setSetting: (key: string, value: unknown): Promise<void> =>

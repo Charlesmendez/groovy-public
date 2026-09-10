@@ -116,6 +116,8 @@ async function loadCapabilities(id: string) {
     integrationsResult,
     profileIntegrationResult,
     preferencesResult,
+    secretDefinitionsResult,
+    profileSecretResult,
   ] = await Promise.all([
     admin
       .from("workspace_skill_artifacts")
@@ -156,6 +158,8 @@ async function loadCapabilities(id: string) {
       .select("onboarding_data")
       .eq("user_id", integrationOwnerId)
       .maybeSingle(),
+    admin.from("workspace_secret_definitions").select("id,name,key,description").eq("workspace_id", workspaceId).order("name"),
+    admin.from("workspace_secret_profile_grants").select("secret_id").eq("workspace_id", workspaceId).eq("profile_id", id),
   ]);
   for (const result of [
     artifactsResult,
@@ -164,6 +168,8 @@ async function loadCapabilities(id: string) {
     integrationsResult,
     profileIntegrationResult,
     preferencesResult,
+    secretDefinitionsResult,
+    profileSecretResult,
   ]) {
     if (result.error) throw result.error;
   }
@@ -179,6 +185,7 @@ async function loadCapabilities(id: string) {
       String(row.integration_agent_id),
     ),
   );
+  const profileSecretIds = new Set((profileSecretResult.data || []).map((row) => String(row.secret_id)));
   const onboardingData =
     preferencesResult.data?.onboarding_data &&
     typeof preferencesResult.data.onboarding_data === "object" &&
@@ -234,6 +241,7 @@ async function loadCapabilities(id: string) {
           inherited: inheritedIntegrationIds.has(String(row.agent_id)),
         };
       }),
+      secrets: (secretDefinitionsResult.data || []).map((row) => ({ id: String(row.id), name: row.name, key: row.key, description: row.description, granted: profileSecretIds.has(String(row.id)) })),
     },
   };
 }
@@ -273,12 +281,13 @@ export async function PUT(req: Request, { params }: Params) {
     const isExternal = context.profile.surface === "external";
     const requestedSkillIds = stringIds(body.skillArtifactIds);
     const requestedIntegrationIds = stringIds(body.integrationIds);
+    const requestedSecretIds = stringIds(body.secretIds);
     const inheritWorkspaceSkills =
       !isExternal && body.inheritWorkspaceSkills !== false;
     const inheritWorkspaceIntegrations =
       !isExternal && body.inheritWorkspaceIntegrations !== false;
 
-    const [{ data: artifacts, error: artifactError }, { data: integrations, error: integrationError }] =
+    const [{ data: artifacts, error: artifactError }, { data: integrations, error: integrationError }, { data: secrets, error: secretError }] =
       await Promise.all([
         requestedSkillIds.length
           ? admin
@@ -294,9 +303,11 @@ export async function PUT(req: Request, { params }: Params) {
               .eq("user_id", integrationOwnerId)
               .in("agent_id", requestedIntegrationIds)
           : Promise.resolve({ data: [], error: null }),
+        requestedSecretIds.length ? admin.from("workspace_secret_definitions").select("id").eq("workspace_id", workspaceId).in("id", requestedSecretIds) : Promise.resolve({ data: [], error: null }),
       ]);
     if (artifactError) throw artifactError;
     if (integrationError) throw integrationError;
+    if (secretError) throw secretError;
 
     const validSkillIds = new Set(
       (artifacts || [])
@@ -312,9 +323,10 @@ export async function PUT(req: Request, { params }: Params) {
         )
         .map((integration) => String(integration.agent_id)),
     );
+    const validSecretIds = new Set((secrets || []).map((row) => String(row.id)));
     if (
       validSkillIds.size !== requestedSkillIds.length ||
-      validIntegrationIds.size !== requestedIntegrationIds.length
+      validIntegrationIds.size !== requestedIntegrationIds.length || validSecretIds.size !== requestedSecretIds.length
     ) {
       return NextResponse.json(
         { error: "One or more capabilities are invalid or disconnected" },
@@ -325,6 +337,7 @@ export async function PUT(req: Request, { params }: Params) {
     const [
       { data: currentSkills, error: currentSkillsError },
       { data: currentIntegrations, error: currentIntegrationsError },
+      { data: currentSecrets, error: currentSecretsError },
     ] = await Promise.all([
       admin
         .from("workspace_skill_assignments")
@@ -335,9 +348,11 @@ export async function PUT(req: Request, { params }: Params) {
         .from("orchestrator_profile_integrations")
         .select("integration_agent_id")
         .eq("profile_id", id),
+      admin.from("workspace_secret_profile_grants").select("secret_id").eq("workspace_id", workspaceId).eq("profile_id", id),
     ]);
     if (currentSkillsError) throw currentSkillsError;
     if (currentIntegrationsError) throw currentIntegrationsError;
+    if (currentSecretsError) throw currentSecretsError;
 
     const currentSkillIds = new Set(
       (currentSkills || []).map((row) => String(row.artifact_id)),
@@ -347,6 +362,7 @@ export async function PUT(req: Request, { params }: Params) {
         String(row.integration_agent_id),
       ),
     );
+    const currentSecretIds = new Set((currentSecrets || []).map((row) => String(row.secret_id)));
 
     const skillAdds = requestedSkillIds.filter(
       (artifactId) => !currentSkillIds.has(artifactId),
@@ -360,6 +376,8 @@ export async function PUT(req: Request, { params }: Params) {
     const integrationRemovals = Array.from(currentIntegrationIds).filter(
       (integrationId) => !validIntegrationIds.has(integrationId),
     );
+    const secretAdds = requestedSecretIds.filter((secretId) => !currentSecretIds.has(secretId));
+    const secretRemovals = Array.from(currentSecretIds).filter((secretId) => !validSecretIds.has(secretId));
 
     if (skillAdds.length) {
       const { error } = await admin.from("workspace_skill_assignments").insert(
@@ -389,6 +407,7 @@ export async function PUT(req: Request, { params }: Params) {
         );
       if (error) throw error;
     }
+    if (secretAdds.length) { const { error } = await admin.from("workspace_secret_profile_grants").insert(secretAdds.map((secret_id) => ({ workspace_id: workspaceId, secret_id, profile_id: id, created_by: user.id }))); if (error) throw error; }
     if (skillRemovals.length) {
       const { error } = await admin
         .from("workspace_skill_assignments")
@@ -409,6 +428,7 @@ export async function PUT(req: Request, { params }: Params) {
         .in("integration_agent_id", integrationRemovals);
       if (error) throw error;
     }
+    if (secretRemovals.length) { const { error } = await admin.from("workspace_secret_profile_grants").delete().eq("workspace_id", workspaceId).eq("profile_id", id).in("secret_id", secretRemovals); if (error) throw error; }
 
     const { error: profileUpdateError } = await admin
       .from("orchestrator_profiles")

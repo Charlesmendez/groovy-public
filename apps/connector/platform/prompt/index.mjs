@@ -289,3 +289,56 @@ export async function promptForCredentials(options = {}) {
     suggestion: `Set credentials manually on ${os.homedir()} via connector config`,
   };
 }
+
+export async function promptForSecret(options = {}) {
+  const name = String(options.name || "Workspace secret").trim();
+  const reason = String(options.reason || "Configure this secret for Groovy skills.").trim();
+  const note = "Stored encrypted on this device. The value is never sent to Groovy servers, chat, or logs.";
+
+  if (isDarwin) {
+    const esc = (value) => String(value).replace(/\\/g, "\\\\").replace(/\"/g, '\\"');
+    const script = [
+      `display dialog "${esc(name)}\\n\\n${esc(reason)}\\n\\n${esc(note)}" with title "Configure Groovy Secret" default answer "" with hidden answer buttons {"Cancel","Save"} default button "Save"`,
+      "return text returned of result",
+    ].join("\n");
+    try {
+      const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 180_000 });
+      const value = String(stdout || "");
+      if (!value.trim()) return { ok: false, error: "empty_secret" };
+      return { ok: true, value };
+    } catch {
+      return { ok: false, error: "user_cancelled" };
+    }
+  }
+
+  if (isWindows) {
+    const n = singleQuotePowerShell(name);
+    const r = singleQuotePowerShell(reason);
+    const security = singleQuotePowerShell(note);
+    const script = [
+      "Add-Type -AssemblyName System.Windows.Forms",
+      "$form = New-Object System.Windows.Forms.Form",
+      "$form.Text = 'Configure Groovy Secret'",
+      "$form.Width = 520; $form.Height = 245; $form.StartPosition = 'CenterScreen'; $form.TopMost = $true",
+      `$label = New-Object System.Windows.Forms.Label; $label.Text = '${n}'; $label.Left = 16; $label.Top = 14; $label.Width = 470; $form.Controls.Add($label)`,
+      `$reason = New-Object System.Windows.Forms.Label; $reason.Text = '${r}'; $reason.Left = 16; $reason.Top = 38; $reason.Width = 470; $form.Controls.Add($reason)`,
+      `$note = New-Object System.Windows.Forms.Label; $note.Text = '${security}'; $note.Left = 16; $note.Top = 62; $note.Width = 470; $note.Height = 38; $form.Controls.Add($note)`,
+      "$value = New-Object System.Windows.Forms.TextBox; $value.Left = 16; $value.Top = 108; $value.Width = 470; $value.UseSystemPasswordChar = $true; $form.Controls.Add($value)",
+      "$ok = New-Object System.Windows.Forms.Button; $ok.Text = 'Save'; $ok.Left = 328; $ok.Top = 150; $ok.Width = 75; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK; $form.Controls.Add($ok)",
+      "$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.Left = 411; $cancel.Top = 150; $cancel.Width = 75; $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel; $form.Controls.Add($cancel)",
+      "$form.AcceptButton = $ok; $form.CancelButton = $cancel",
+      "$result = $form.ShowDialog()",
+      "if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $value.Text) { Write-Output $value.Text }",
+    ].join("; ");
+    try {
+      const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-Command", script], { windowsHide: true, timeout: 180_000, maxBuffer: 1024 * 1024 });
+      const value = String(stdout || "").trimEnd();
+      if (!value) return { ok: false, error: "user_cancelled" };
+      return { ok: true, value };
+    } catch {
+      return { ok: false, error: "user_cancelled" };
+    }
+  }
+
+  return { ok: false, error: "secret_prompt_not_supported_on_this_os" };
+}

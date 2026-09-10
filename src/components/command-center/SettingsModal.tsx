@@ -47,8 +47,15 @@ import {
 import { detectConnectorPlatformFromNavigator, type ConnectorClientPlatform } from "@/lib/connector/platform";
 
 import type { Provider, LlmKeyMode, KeyModes } from "@/lib/keys/resolveKeyMode";
-import { isServerKeyEligibleProvider } from "@/lib/keys/providerKeyPolicy";
+import {
+  buildInitialProviderModes,
+  PROVIDER_INFO,
+  PROVIDER_ORDER,
+  providerManagedModeLabel,
+  providerUserModeLabel,
+} from "@/lib/keys/providerSettings";
 import { useEdition } from "@/hooks/useEdition";
+import { useDesktopUpdater } from "@/hooks/useDesktopUpdater";
 
 // Kept for backwards-compat with existing imports; not used by this modal anymore.
 export type FilesAgentInfo = { id: string; name: string; createdAt?: string };
@@ -139,6 +146,9 @@ type AiyraAudioDeviceListResult = {
   resolvedDeviceName?: string;
 };
 
+type BrowserTaskProvider = "claude" | "codex";
+type BrowserTaskPlaywrightDriver = "cli" | "mcp";
+
 const DEFAULT_OPENWAKEWORD_THRESHOLD = 0.27;
 const AIYRA_RECENT_UI_ACTIVITY_EVENTS = [
   "wake_detected",
@@ -176,7 +186,14 @@ type SettingsModalProps = {
   connectorVersion?: string | null;
   minConnectorVersion?: string;
   connectorSupportsInPlaceUpdate?: boolean;
+  connectorManagedByDesktop?: boolean;
   connectorDownloadUrl?: string;
+  connectorConfig?: Record<string, unknown>;
+  connectorCapabilities?: {
+    claudeCliInstalled?: boolean | null;
+    codexCliInstalled?: boolean | null;
+  };
+  onSaveConnectorConfig?: (patch: Record<string, unknown>) => Promise<void>;
   aiyraConfig?: AiyraConfigSnapshot;
   onLoadAiyraConfig?: (input: {
     apiKey: string;
@@ -338,109 +355,6 @@ const SECTION_NAV: { id: SettingsSection; label: string; icon: typeof Settings }
   { id: "advanced", label: "Advanced", icon: Wrench },
 ];
 
-const PROVIDER_INFO: Record<Provider, { name: string; placeholder: string; helpUrl: string; description?: string }> = {
-  anthropic: {
-    name: "Anthropic (Claude)",
-    placeholder: "sk-ant-...",
-    helpUrl: "https://console.anthropic.com/settings/keys",
-  },
-  openai: {
-    name: "OpenAI",
-    placeholder: "sk-...",
-    helpUrl: "https://platform.openai.com/api-keys",
-  },
-  google: {
-    name: "Google (Gemini)",
-    placeholder: "AIza...",
-    helpUrl: "https://aistudio.google.com/app/apikey",
-  },
-  xai: {
-    name: "xAI (Grok)",
-    placeholder: "xai-...",
-    helpUrl: "https://console.x.ai/",
-  },
-  claude_cli: {
-    name: "Claude Headless CLI",
-    placeholder: "sk-ant-oat01-...",
-    helpUrl: "https://docs.claude.com/en/docs/claude-code/headless",
-    description: "OAuth token from `claude setup-token`. Uses your Claude.ai plan for headless CLI runs.",
-  },
-  codex_cli: {
-    name: "Codex Headless CLI",
-    placeholder: "sk-...",
-    helpUrl: "https://platform.openai.com/api-keys",
-    description: "Optional OpenAI API key for headless Codex CLI runs. Leave unset to use the connector machine's `codex login` session.",
-  },
-  azure_openai: {
-    name: "Azure OpenAI",
-    placeholder: "Azure OpenAI key",
-    helpUrl: "https://learn.microsoft.com/azure/ai-services/openai/",
-  },
-  aws_bedrock: {
-    name: "AWS Bedrock",
-    placeholder: "AWS access secret",
-    helpUrl: "https://docs.aws.amazon.com/bedrock/",
-  },
-  groq: {
-    name: "Groq",
-    placeholder: "gsk_...",
-    helpUrl: "https://console.groq.com/keys",
-  },
-  mistral: {
-    name: "Mistral",
-    placeholder: "Mistral API key",
-    helpUrl: "https://console.mistral.ai/api-keys/",
-  },
-  other: {
-    name: "Other provider",
-    placeholder: "Provider API key",
-    helpUrl: "/docs/reference-infrastructure",
-  },
-};
-
-const PROVIDER_ORDER: Provider[] = [
-  "anthropic",
-  "openai",
-  "google",
-  "xai",
-  "azure_openai",
-  "aws_bedrock",
-  "groq",
-  "mistral",
-  "other",
-  "claude_cli",
-  "codex_cli",
-];
-
-function providerManagedModeLabel(provider: Provider): string {
-  if (provider === "codex_cli" || provider === "claude_cli") return "Local login";
-  return "Server env";
-}
-
-function providerUserModeLabel(provider: Provider): string {
-  return provider === "codex_cli" ? "API key" : "Own key";
-}
-
-function buildInitialProviderModes(
-  globalMode: LlmKeyMode,
-  keyModes?: KeyModes,
-  allowServerProviderKeys = true
-): KeyModes {
-  const out: KeyModes = {};
-  for (const p of PROVIDER_ORDER) {
-    const m = keyModes?.[p];
-    out[p] =
-      !allowServerProviderKeys && isServerKeyEligibleProvider(p)
-        ? "user"
-        : m === "groovy" || m === "user"
-          ? m
-          : p === "claude_cli" || p === "codex_cli"
-            ? "groovy"
-            : globalMode;
-  }
-  return out;
-}
-
 function resolveInitialSettingsSection({
   focusSection,
   currentKeyMode,
@@ -540,7 +454,11 @@ export function SettingsModal({
   connectorVersion,
   minConnectorVersion,
   connectorSupportsInPlaceUpdate = false,
+  connectorManagedByDesktop = false,
   connectorDownloadUrl,
+  connectorConfig,
+  connectorCapabilities,
+  onSaveConnectorConfig,
   aiyraConfig,
   onLoadAiyraConfig,
   onSaveAiyraConfig,
@@ -553,6 +471,9 @@ export function SettingsModal({
 }: SettingsModalProps) {
   const edition = useEdition();
   const connectorGuide = useConnectorInstallGuide();
+  const desktopUpdater = useDesktopUpdater({
+    requiredVersion: minConnectorVersion,
+  });
   const resolvedConnectorOpenWakewordThreshold = Number.isFinite(
     Number(connectorAiyraVoiceHealth?.openwakeword_threshold)
   )
@@ -569,7 +490,12 @@ export function SettingsModal({
   const prevFocusSectionRef = useRef(focusSection);
   const wasOpenRef = useRef(false);
   useEffect(() => {
-    if (focusSection && focusSection !== prevFocusSectionRef.current && isOpen) {
+    const justOpened = isOpen && !wasOpenRef.current;
+    if (
+      focusSection &&
+      isOpen &&
+      (justOpened || focusSection !== prevFocusSectionRef.current)
+    ) {
       setActiveSection(
         resolveInitialSettingsSection({
           focusSection,
@@ -623,6 +549,61 @@ export function SettingsModal({
   const [connectorMode, setConnectorMode] = useState<"local" | "groovy" | null>(null);
   const [connectorModeSaving, setConnectorModeSaving] = useState(false);
   const [connectorModeError, setConnectorModeError] = useState<string | null>(null);
+  const [browserTaskProvider, setBrowserTaskProvider] = useState<BrowserTaskProvider>(
+    connectorConfig?.browser_task_provider === "claude" ? "claude" : "codex"
+  );
+  const [browserTaskPlaywrightDriver, setBrowserTaskPlaywrightDriver] =
+    useState<BrowserTaskPlaywrightDriver>(
+      connectorConfig?.browser_task_provider === "claude" ||
+        connectorConfig?.browser_task_playwright_driver === "mcp"
+        ? "mcp"
+        : "cli"
+    );
+  const [browserTaskModel, setBrowserTaskModel] = useState(
+    typeof connectorConfig?.browser_task_model === "string" && connectorConfig.browser_task_model.trim()
+      ? connectorConfig.browser_task_model.trim()
+      : connectorConfig?.browser_task_provider === "claude"
+        ? "claude-sonnet-4-6"
+        : "gpt-5.6-luna"
+  );
+  const [browserTaskReasoningEffort, setBrowserTaskReasoningEffort] = useState(
+    typeof connectorConfig?.browser_task_reasoning_effort === "string" &&
+      connectorConfig.browser_task_reasoning_effort.trim()
+      ? connectorConfig.browser_task_reasoning_effort.trim()
+      : "medium"
+  );
+  const [browserTaskSaving, setBrowserTaskSaving] = useState(false);
+  const [browserTaskMessage, setBrowserTaskMessage] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isOpen) return;
+    const provider: BrowserTaskProvider =
+      connectorConfig?.browser_task_provider === "claude" ? "claude" : "codex";
+    const fallbackModel = provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.6-luna";
+    const configuredModel =
+      typeof connectorConfig?.browser_task_model === "string"
+        ? connectorConfig.browser_task_model.trim()
+        : "";
+    const modelMatchesProvider =
+      provider === "claude"
+        ? configuredModel.startsWith("claude-")
+        : /^(gpt-|o[13](?:-|$))/i.test(configuredModel);
+    const configuredEffort =
+      typeof connectorConfig?.browser_task_reasoning_effort === "string"
+        ? connectorConfig.browser_task_reasoning_effort.trim().toLowerCase()
+        : "";
+    const effort = ["low", "medium", "high", "xhigh", "max"].includes(configuredEffort)
+      ? configuredEffort
+      : "medium";
+    setBrowserTaskProvider(provider);
+    setBrowserTaskPlaywrightDriver(
+      provider === "claude" || connectorConfig?.browser_task_playwright_driver === "mcp"
+        ? "mcp"
+        : "cli"
+    );
+    setBrowserTaskModel(modelMatchesProvider ? configuredModel : fallbackModel);
+    setBrowserTaskReasoningEffort(effort);
+    setBrowserTaskMessage(null);
+  }, [connectorConfig, isOpen]);
   const [aiyraApiKey, setAiyraApiKey] = useState("");
   const [aiyraClearApiKey, setAiyraClearApiKey] = useState(false);
   const [aiyraEnabled, setAiyraEnabled] = useState(aiyraConfig?.enabled === true);
@@ -2086,7 +2067,30 @@ export function SettingsModal({
     canSelfUpdateActiveConnector;
   const canSelfUpdateLocalConnector =
     connectorMode !== "groovy" &&
+    !connectorManagedByDesktop &&
     canSelfUpdateActiveConnector;
+  const isDesktopManagedLocalConnector =
+    connectorMode !== "groovy" &&
+    (connectorManagedByDesktop || desktopUpdater.desktop);
+  const browserTaskModelOptions =
+    browserTaskProvider === "codex"
+      ? [
+          { value: "gpt-5.6-luna", label: "GPT-5.6 Luna", description: "Lowest-cost default" },
+          { value: "gpt-5.6-terra", label: "GPT-5.6 Terra", description: "Balanced" },
+          { value: "gpt-5.6-sol", label: "GPT-5.6 Sol", description: "Highest capability" },
+        ]
+      : [
+          { value: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", description: "Balanced" },
+          { value: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", description: "Lower cost" },
+          { value: "claude-opus-4-6", label: "Claude Opus 4.6", description: "Highest capability" },
+        ];
+  const browserTaskReasoningOptions = [
+    { value: "low", label: "Low" },
+    { value: "medium", label: "Medium" },
+    { value: "high", label: "High" },
+    ...(browserTaskProvider === "codex" ? [{ value: "xhigh", label: "Extra high" }] : []),
+    { value: "max", label: "Max" },
+  ];
 
   if (!isOpen) return null;
 
@@ -2117,6 +2121,27 @@ export function SettingsModal({
       // ignore
     } finally {
       setAgentRuntimeSaving(false);
+    }
+  };
+
+  const handleSaveBrowserTaskRuntime = async () => {
+    if (!onSaveConnectorConfig) return;
+    setBrowserTaskSaving(true);
+    setBrowserTaskMessage(null);
+    try {
+      await onSaveConnectorConfig({
+        browser_task_provider: browserTaskProvider,
+        browser_task_model: browserTaskModel,
+        browser_task_reasoning_effort: browserTaskReasoningEffort,
+        browser_task_playwright_driver: browserTaskPlaywrightDriver,
+      });
+      setBrowserTaskMessage("Saved. The connector is restarting with this browser runtime.");
+    } catch (saveError) {
+      setBrowserTaskMessage(
+        saveError instanceof Error ? saveError.message : "Failed to save browser runtime"
+      );
+    } finally {
+      setBrowserTaskSaving(false);
     }
   };
 
@@ -2250,6 +2275,131 @@ export function SettingsModal({
               </details>
             </div>
           )}
+
+          <div className="p-4 rounded-xl bg-black/30 border border-white/10 space-y-4">
+            <div>
+              <div className="text-sm font-medium text-zinc-200">Computer browser</div>
+              <div className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                Playwright controls the browser. Choose its interface and whether Claude Code or Codex decides the browser steps.
+              </div>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-4">
+              <div className="space-y-1.5">
+                <div className="text-[11px] text-zinc-500">Interface</div>
+                <CustomSelect
+                  value={browserTaskPlaywrightDriver}
+                  onChange={(value) => {
+                    setBrowserTaskPlaywrightDriver(value === "mcp" ? "mcp" : "cli");
+                    setBrowserTaskMessage(null);
+                  }}
+                  options={[
+                    {
+                      value: "cli",
+                      label: "Playwright CLI",
+                      description: "Lowest-cost measured default for Codex",
+                      disabled: browserTaskProvider === "claude",
+                    },
+                    {
+                      value: "mcp",
+                      label: "Playwright MCP",
+                      description: "Faster alternative; required for Claude",
+                    },
+                  ]}
+                  ariaLabel="Playwright browser interface"
+                  size="sm"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="text-[11px] text-zinc-500">Engine</div>
+                <CustomSelect
+                  value={browserTaskProvider}
+                  onChange={(value) => {
+                    const provider = value === "claude" ? "claude" : "codex";
+                    setBrowserTaskProvider(provider);
+                    setBrowserTaskModel(
+                      provider === "claude" ? "claude-sonnet-4-6" : "gpt-5.6-luna"
+                    );
+                    setBrowserTaskPlaywrightDriver(provider === "claude" ? "mcp" : "cli");
+                    if (provider === "claude" && browserTaskReasoningEffort === "xhigh") {
+                      setBrowserTaskReasoningEffort("medium");
+                    }
+                    setBrowserTaskMessage(null);
+                  }}
+                  options={[
+                    {
+                      value: "codex",
+                      label: "Codex",
+                      description: "OpenAI models through your local Codex login",
+                      disabled: connectorCapabilities?.codexCliInstalled === false,
+                    },
+                    {
+                      value: "claude",
+                      label: "Claude Code",
+                      description: "Anthropic models through Claude Code",
+                      disabled: connectorCapabilities?.claudeCliInstalled === false,
+                    },
+                  ]}
+                  ariaLabel="Computer browser engine"
+                  size="sm"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="text-[11px] text-zinc-500">Model</div>
+                <CustomSelect
+                  value={browserTaskModel}
+                  onChange={(value) => {
+                    setBrowserTaskModel(value);
+                    setBrowserTaskMessage(null);
+                  }}
+                  options={browserTaskModelOptions}
+                  ariaLabel="Computer browser model"
+                  size="sm"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <div className="text-[11px] text-zinc-500">Reasoning</div>
+                <CustomSelect
+                  value={browserTaskReasoningEffort}
+                  onChange={(value) => {
+                    setBrowserTaskReasoningEffort(value);
+                    setBrowserTaskMessage(null);
+                  }}
+                  options={browserTaskReasoningOptions}
+                  ariaLabel="Computer browser reasoning effort"
+                  size="sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="text-[11px] text-zinc-500">
+                Default: Playwright CLI + official skill · Codex · GPT-5.6 Luna · medium reasoning. MCP remains selectable and is used for Claude.
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleSaveBrowserTaskRuntime()}
+                disabled={browserTaskSaving || !onSaveConnectorConfig}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-cyan-500/15 border border-cyan-500/20 text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50 transition-colors text-xs"
+              >
+                {browserTaskSaving ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Save className="w-3.5 h-3.5" />
+                )}
+                {browserTaskSaving ? "Saving…" : "Save browser runtime"}
+              </button>
+            </div>
+            {browserTaskMessage && (
+              <div
+                className={`text-xs ${
+                  browserTaskMessage.startsWith("Saved") ? "text-emerald-300" : "text-red-300"
+                }`}
+              >
+                {browserTaskMessage}
+              </div>
+            )}
+          </div>
 
           {/* Mode selection */}
           <div className="p-4 rounded-xl bg-black/30 border border-white/10">
@@ -2420,7 +2570,22 @@ export function SettingsModal({
                             ? canSelfUpdateActiveHostedConnector
                               ? `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Self-update hosted Mac to install the latest connector.`
                               : `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Request update and we will handle it.`
-                            : canSelfUpdateLocalConnector
+                            : isDesktopManagedLocalConnector
+                              ? desktopUpdater.desktop
+                                ? desktopUpdater.status?.state === "ready"
+                                  ? `Groovy Desktop ${desktopUpdater.status.version || ""} is ready. Restart to install it and Connector v${minConnectorVersion}.`
+                                  : desktopUpdater.status?.state === "downloading" ||
+                                      desktopUpdater.status?.state === "available"
+                                    ? `Groovy Desktop ${desktopUpdater.status.version || ""} is downloading. It includes Connector v${minConnectorVersion}.`
+                                    : desktopUpdater.status?.state === "checking"
+                                      ? "Checking the licensed Groovy Desktop update feed now…"
+                                      : desktopUpdater.status?.state === "error"
+                                        ? `The Desktop update check failed: ${desktopUpdater.status.error || "Unknown error"}`
+                                        : desktopUpdater.checkFeedback
+                                          ? desktopUpdater.checkFeedback
+                                          : `This connector is bundled with Groovy Desktop. Update Groovy Desktop to install Connector v${minConnectorVersion}.`
+                                : `This connector is managed by Groovy Desktop on your computer. Open Groovy Desktop to update it, or download the latest licensed Desktop release.`
+                              : canSelfUpdateLocalConnector
                               ? `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Use Update now to install the latest connector, then it will restart itself.`
                               : `You're on v${connectorVersion}. Latest is v${minConnectorVersion}. Download and install it once; future versions can update in place.`}
                         </div>
@@ -2451,6 +2616,52 @@ export function SettingsModal({
                             </button>
                           )
                         ) : null
+                      ) : isDesktopManagedLocalConnector &&
+                        desktopUpdater.desktop ? (
+                        <button
+                          type="button"
+                          disabled={
+                            desktopUpdater.status?.state === "checking" ||
+                            desktopUpdater.status?.state === "available" ||
+                            desktopUpdater.status?.state === "downloading"
+                          }
+                          onClick={() =>
+                            void (desktopUpdater.status?.state === "ready"
+                              ? desktopUpdater.installUpdate()
+                              : desktopUpdater.checkForUpdates())
+                          }
+                          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 text-zinc-200 hover:bg-white/10 text-xs transition-all disabled:opacity-50"
+                          title="Update Groovy Desktop and its bundled connector"
+                        >
+                          {desktopUpdater.status?.state === "checking" ||
+                          desktopUpdater.status?.state === "available" ||
+                          desktopUpdater.status?.state === "downloading" ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <RotateCw className="w-3.5 h-3.5" />
+                          )}
+                          {desktopUpdater.status?.state === "ready"
+                            ? "Restart and install"
+                            : desktopUpdater.status?.state === "checking"
+                              ? "Checking…"
+                              : desktopUpdater.status?.state === "available" ||
+                                  desktopUpdater.status?.state === "downloading"
+                                ? "Downloading…"
+                                : desktopUpdater.status?.state === "error"
+                                  ? "Retry Desktop update"
+                                  : desktopUpdater.checkFeedback
+                                    ? "Check again"
+                                    : "Update Groovy Desktop"}
+                        </button>
+                      ) : isDesktopManagedLocalConnector ? (
+                        <a
+                          href="/account/downloads?recommended=desktop"
+                          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/5 text-zinc-200 hover:bg-white/10 text-xs transition-all"
+                          title="Download the latest licensed Groovy Desktop release"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          Download Groovy Desktop
+                        </a>
                       ) : canSelfUpdateLocalConnector ? (
                         <button
                           type="button"
@@ -2489,7 +2700,11 @@ export function SettingsModal({
                       ) : (
                         <div className="mt-2 text-xs text-zinc-500 space-y-1 pl-3 border-l border-zinc-700">
                           <p>
-                            {canSelfUpdateLocalConnector
+                            {isDesktopManagedLocalConnector
+                              ? desktopUpdater.desktop
+                                ? "Groovy Desktop owns this connector. Its licensed updater replaces the signed Desktop app and bundled connector together."
+                                : "This connector is owned by Groovy Desktop. Update it from the Desktop app or the licensed Downloads page."
+                              : canSelfUpdateLocalConnector
                               ? "Local mode can update in place while the connector is online. Use manual download only if needed."
                               : "This installed connector is too old to self-update. Install the latest connector manually once; future updates can run in place."}
                           </p>
@@ -4360,7 +4575,7 @@ export function SettingsModal({
             <label className="flex items-center justify-between">
               <div>
                 <span className="text-sm text-zinc-300">Max turns per branch</span>
-                <p className="text-[11px] text-zinc-500 mt-0.5">Execution budget for each hidden worker branch when the orchestrator fans work out in parallel (1-64).</p>
+                <p className="text-[11px] text-zinc-500 mt-0.5">Execution budget for each hidden worker branch and for asynchronous agent re-handoffs (1-64).</p>
               </div>
               <input
                 type="number"
@@ -4509,7 +4724,7 @@ export function SettingsModal({
             </div>
             <div className="min-w-0">
               <h1 className="truncate text-sm font-semibold text-white sm:text-base">
-                Command Center settings
+                Groovy settings
               </h1>
               <p className="truncate text-[10px] text-zinc-500 md:hidden">
                 {activeSectionMeta.label}
@@ -4517,17 +4732,10 @@ export function SettingsModal({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <a
-              href="/settings"
-              className="hidden items-center gap-1.5 rounded-lg border border-white/10 px-3 py-2 text-xs text-zinc-400 transition hover:border-white/20 hover:text-white sm:flex"
-            >
-              Workspace settings
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
             <button
               onClick={onClose}
               className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-500 transition-all hover:bg-white/10 hover:text-white"
-              aria-label="Close Command Center settings"
+              aria-label="Close Groovy settings"
             >
               <X className="w-5 h-5" />
             </button>
@@ -4546,14 +4754,14 @@ export function SettingsModal({
                 label: section.label,
               }))}
               size="sm"
-              ariaLabel="Command Center settings section"
+              ariaLabel="Groovy settings section"
               triggerClassName="bg-white/[0.025]"
             />
             <a
               href="/settings"
               className="mt-2 flex w-full items-center justify-between rounded-lg border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-xs text-zinc-500"
             >
-              Open shared workspace settings
+              Workspace settings
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
           </div>
@@ -4563,11 +4771,11 @@ export function SettingsModal({
               href="/settings"
               className="mb-4 flex items-center justify-between rounded-xl border border-cyan-400/15 bg-cyan-400/[0.035] px-3 py-2.5 text-xs text-zinc-300 transition hover:border-cyan-400/25 hover:text-white"
             >
-              Shared workspace settings
+              Workspace settings
               <ExternalLink className="h-3.5 w-3.5 text-cyan-300" />
             </a>
             <div className="px-3 pb-2 text-[9px] font-medium uppercase tracking-[0.18em] text-zinc-600">
-              Command Center
+              Groovy
             </div>
             <div className="flex min-w-0 flex-col gap-1">
               {visibleSectionNav.map((section) => {

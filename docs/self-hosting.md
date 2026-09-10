@@ -54,6 +54,13 @@ Set `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY`, and a
 `WEB_PUSH_CONTACT` value such as `mailto:notifications@example.com`. Push
 requires a secure HTTPS origin outside localhost.
 
+Channel huddles work peer-to-peer with public STUN by default. For reliable
+audio, camera, and screen sharing across restrictive corporate or mobile
+networks, configure `CHAT_TURN_URLS` with comma-separated `turn:`/`turns:`
+endpoints and `CHAT_TURN_SHARED_SECRET` for coturn REST credentials. Providers
+without REST credentials can use `CHAT_TURN_USERNAME` and
+`CHAT_TURN_CREDENTIAL`; keep all four values server-side.
+
 Do not configure Stripe for self-hosting. Compose sets
 `GROOVY_EDITION=self-hosted`, which switches off hosted checkout, metering,
 and online license-row checks. This is a deployment-mode switch, not a grant

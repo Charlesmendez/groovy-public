@@ -1,7 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Check, Copy } from "lucide-react";
+import {
+  renderChatMathToHtml,
+  tokenizeChatMessageInline,
+} from "@/lib/chat/mathFormatting";
 
 type TextSegment = {
   type: "text";
@@ -125,6 +129,248 @@ function CodeBlock({ info, code }: { info: string; code: string }) {
   );
 }
 
+function MathMessage({
+  expression,
+  raw,
+  display,
+}: {
+  expression: string;
+  raw: string;
+  display: boolean;
+}) {
+  const html = useMemo(
+    () => renderChatMathToHtml(expression, display),
+    [display, expression],
+  );
+  if (!html) return raw;
+
+  return (
+    <span
+      className={
+        display
+          ? "block max-w-full overflow-x-auto overflow-y-hidden"
+          : "inline max-w-full"
+      }
+      // KaTeX escapes TeX input and HTML-capable commands remain disabled
+      // through trust:false in renderChatMathToHtml.
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
+
+function InlineMessageText({ text }: { text: string }) {
+  const tokens = useMemo(() => tokenizeChatMessageInline(text), [text]);
+
+  return tokens.map((token, index) => {
+    const key = `${token.type}-${index}`;
+    if (token.type === "math") {
+      return (
+        <MathMessage
+          key={key}
+          expression={token.value}
+          raw={token.raw}
+          display={token.display}
+        />
+      );
+    }
+    if (token.type === "strong") {
+      return (
+        <strong key={key} className="font-semibold text-zinc-100">
+          {token.value}
+        </strong>
+      );
+    }
+    if (token.type === "code") {
+      return (
+        <code
+          key={key}
+          className="rounded bg-white/[0.07] px-1 py-0.5 font-mono text-[0.88em] text-cyan-100"
+        >
+          {token.value}
+        </code>
+      );
+    }
+    if (token.type === "italic") {
+      return <em key={key}>{token.value}</em>;
+    }
+    if (token.type === "underline") {
+      return (
+        <span key={key} className="underline decoration-white/40 underline-offset-2">
+          {token.value}
+        </span>
+      );
+    }
+    if (token.type === "strike") {
+      return (
+        <s key={key} className="decoration-white/45">
+          {token.value}
+        </s>
+      );
+    }
+    if (token.type === "link") {
+      return (
+        <a
+          key={key}
+          href={token.href}
+          target="_blank"
+          rel="noreferrer"
+          className="text-cyan-300 underline decoration-cyan-300/35 underline-offset-2 transition hover:text-cyan-200"
+        >
+          {token.label}
+        </a>
+      );
+    }
+    return token.value;
+  });
+}
+
+function TextMessageBlocks({
+  text,
+  textClassName,
+}: {
+  text: string;
+  textClassName: string;
+}) {
+  const lines = text.trimEnd().split("\n");
+  const blocks: ReactNode[] = [];
+  let index = 0;
+  const specialLine =
+    /^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+\.\s+|>\s?)/;
+
+  while (index < lines.length) {
+    const line = lines[index] || "";
+    if (!line.trim()) {
+      blocks.push(<div key={`space-${index}`} className="h-2" aria-hidden />);
+      index += 1;
+      continue;
+    }
+
+    const checklist = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.*)$/);
+    if (checklist) {
+      const items: Array<{ checked: boolean; content: string }> = [];
+      while (index < lines.length) {
+        const item = (lines[index] || "").match(
+          /^\s*[-*]\s+\[([ xX])\]\s+(.*)$/,
+        );
+        if (!item) break;
+        items.push({
+          checked: item[1].toLowerCase() === "x",
+          content: item[2],
+        });
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`checklist-${index}`} className="space-y-1">
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex} className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                checked={item.checked}
+                readOnly
+                tabIndex={-1}
+                className="mt-1 h-3.5 w-3.5 accent-cyan-300"
+                aria-label={item.checked ? "Completed item" : "Open item"}
+              />
+              <span className={item.checked ? "text-zinc-500 line-through" : ""}>
+                <InlineMessageText text={item.content} />
+              </span>
+            </li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-*]\s+(.*)$/);
+    if (unordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = (lines[index] || "").match(/^\s*[-*]\s+(.*)$/);
+        if (!item || /^\[[ xX]\]\s+/.test(item[1])) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(
+        <ul
+          key={`unordered-${index}`}
+          className="list-disc space-y-1 pl-5 marker:text-zinc-500"
+        >
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>
+              <InlineMessageText text={item} />
+            </li>
+          ))}
+        </ul>,
+      );
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ordered) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const item = (lines[index] || "").match(/^\s*\d+\.\s+(.*)$/);
+        if (!item) break;
+        items.push(item[1]);
+        index += 1;
+      }
+      blocks.push(
+        <ol
+          key={`ordered-${index}`}
+          className="list-decimal space-y-1 pl-5 marker:text-zinc-500"
+        >
+          {items.map((item, itemIndex) => (
+            <li key={itemIndex}>
+              <InlineMessageText text={item} />
+            </li>
+          ))}
+        </ol>,
+      );
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quoted: string[] = [];
+      while (index < lines.length) {
+        const item = (lines[index] || "").match(/^\s*>\s?(.*)$/);
+        if (!item) break;
+        quoted.push(item[1]);
+        index += 1;
+      }
+      blocks.push(
+        <blockquote
+          key={`quote-${index}`}
+          className="border-l-2 border-white/15 pl-3 text-zinc-400"
+        >
+          {quoted.map((item, itemIndex) => (
+            <div key={itemIndex}>
+              <InlineMessageText text={item} />
+            </div>
+          ))}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      index < lines.length &&
+      (lines[index] || "").trim() &&
+      !specialLine.test(lines[index] || "")
+    ) {
+      paragraph.push(lines[index] || "");
+      index += 1;
+    }
+    blocks.push(
+      <div key={`text-${index}`} className={textClassName}>
+        <InlineMessageText text={paragraph.join("\n")} />
+      </div>,
+    );
+  }
+
+  return blocks;
+}
+
 export function FormattedMessageContent({
   content,
   className = "",
@@ -147,9 +393,11 @@ export function FormattedMessageContent({
         if (!text) return null;
 
         return (
-          <div key={segment.key} className={textClassName}>
-            {text}
-          </div>
+          <TextMessageBlocks
+            key={segment.key}
+            text={text}
+            textClassName={textClassName}
+          />
         );
       })}
     </div>

@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   canManageChannelSchedules,
+  canManageCurrentChannelSchedules,
+  channelScheduleCreateDenialReason,
+  channelScheduleManualRunDeviceCandidates,
   channelScheduleSummary,
   formatChannelSchedule,
   parseChannelScheduleAction,
   parseTeamChatChannelId,
   publicChannelSchedule,
+  resolveScheduledTaskRunDevice,
+  resolveScheduledWorkerRef,
+  resolveTeamChatScheduleChannelId,
 } from "./channelSchedules";
 
 test("Team Chat schedule scope accepts only an explicit channel UUID", () => {
@@ -25,6 +31,85 @@ test("Team Chat schedule scope accepts only an explicit channel UUID", () => {
   );
 });
 
+test("scheduled channel scope uses the stored channel and safely falls back to its external thread", () => {
+  const channelA = "12345678-1234-4234-8234-123456789012";
+  const channelB = "87654321-4321-4321-8321-210987654321";
+  assert.deepEqual(
+    resolveTeamChatScheduleChannelId({
+      storedChannelId: channelA,
+      externalThreadKey: channelA,
+    }),
+    { channelId: channelA, conflict: false },
+  );
+  assert.deepEqual(
+    resolveTeamChatScheduleChannelId({
+      storedChannelId: null,
+      externalThreadKey: channelA,
+    }),
+    { channelId: channelA, conflict: false },
+  );
+  assert.deepEqual(
+    resolveTeamChatScheduleChannelId({
+      storedChannelId: channelA,
+      externalThreadKey: channelB,
+    }),
+    { channelId: channelA, conflict: true },
+  );
+  assert.deepEqual(
+    resolveTeamChatScheduleChannelId({
+      storedChannelId: "../../scheduled_jobs",
+      externalThreadKey: "not-a-channel",
+    }),
+    { channelId: null, conflict: false },
+  );
+});
+
+test("Team Chat Mind mentions are not silently converted into worker schedules", () => {
+  const channelId = "12345678-1234-4234-8234-123456789012";
+  assert.equal(
+    resolveScheduledWorkerRef({
+      requestedAgent: "@groovy",
+      teamChatChannelId: channelId,
+      currentMindName: "Groovy default",
+      currentMindSlug: "groovy-default",
+    }),
+    null,
+  );
+  assert.equal(
+    resolveScheduledWorkerRef({
+      requestedAgent: "Groovy default",
+      teamChatChannelId: channelId,
+      currentMindName: "Groovy default",
+    }),
+    null,
+  );
+  assert.equal(
+    resolveScheduledWorkerRef({
+      requestedAgent: "Scout",
+      teamChatChannelId: channelId,
+      currentMindName: "Groovy default",
+    }),
+    "Scout",
+  );
+  assert.equal(
+    resolveScheduledWorkerRef({
+      requestedAgent: "Groovy",
+      teamChatChannelId: channelId,
+      currentMindName: "Groovy default",
+      explicitWorker: true,
+    }),
+    "Groovy",
+  );
+  assert.equal(
+    resolveScheduledWorkerRef({
+      requestedAgent: "Groovy",
+      teamChatChannelId: null,
+      currentMindName: "Groovy default",
+    }),
+    "Groovy",
+  );
+});
+
 test("channel schedule actions are closed to the supported controls", () => {
   assert.equal(parseChannelScheduleAction("pause"), "pause");
   assert.equal(parseChannelScheduleAction("resume"), "resume");
@@ -32,7 +117,7 @@ test("channel schedule actions are closed to the supported controls", () => {
   assert.equal(parseChannelScheduleAction("delete"), null);
 });
 
-test("workspace members manage channel schedules while guests stay view-only", () => {
+test("workspace members manage channel schedules while guests and stale creators stay view-only", () => {
   assert.equal(
     canManageChannelSchedules({
       workspaceRole: "member",
@@ -55,7 +140,67 @@ test("workspace members manage channel schedules while guests stay view-only", (
       channelCreatedBy: "channel-creator",
       userId: "channel-creator",
     }),
+    false,
+  );
+});
+
+test("Team Chat cannot create direct shell schedules on the owner's connector", () => {
+  assert.match(
+    channelScheduleCreateDenialReason({
+      channelId: "5d959469-a9d8-4f0f-a93f-31df3baf8f8a",
+      kind: "shell",
+    }) || "",
+    /direct shell schedules are not allowed/i,
+  );
+  assert.equal(
+    channelScheduleCreateDenialReason({
+      channelId: "5d959469-a9d8-4f0f-a93f-31df3baf8f8a",
+      kind: "orchestrator",
+    }),
+    null,
+  );
+  assert.equal(
+    channelScheduleCreateDenialReason({ channelId: null, kind: "shell" }),
+    null,
+  );
+});
+
+test("private-channel scheduling authority is revoked with channel access", () => {
+  assert.equal(
+    canManageCurrentChannelSchedules({
+      workspaceRole: "member",
+      visibility: "private",
+      isChannelMember: false,
+      isArchived: false,
+    }),
+    false,
+  );
+  assert.equal(
+    canManageCurrentChannelSchedules({
+      workspaceRole: "member",
+      visibility: "private",
+      isChannelMember: true,
+      isArchived: false,
+    }),
     true,
+  );
+  assert.equal(
+    canManageCurrentChannelSchedules({
+      workspaceRole: "guest",
+      visibility: "private",
+      isChannelMember: true,
+      isArchived: false,
+    }),
+    false,
+  );
+  assert.equal(
+    canManageCurrentChannelSchedules({
+      workspaceRole: "admin",
+      visibility: "private",
+      isChannelMember: false,
+      isArchived: true,
+    }),
+    false,
   );
 });
 
@@ -128,5 +273,68 @@ test("channel cadence labels cover the scheduler's supported shapes", () => {
   assert.equal(
     formatChannelSchedule({ type: "interval_minutes", minutes: 15 }),
     "Every 15 minutes",
+  );
+});
+
+test("manual runs prefer the assigned connector when it is online", () => {
+  assert.equal(
+    resolveScheduledTaskRunDevice({
+      assignedDeviceId: "assigned",
+      activeDeviceId: "active",
+      onlineDeviceIds: ["active", "assigned"],
+    }),
+    "assigned",
+  );
+});
+
+test("manual runs fall back to the active online connector", () => {
+  assert.equal(
+    resolveScheduledTaskRunDevice({
+      assignedDeviceId: "stale",
+      activeDeviceId: "active",
+      onlineDeviceIds: ["active"],
+    }),
+    "active",
+  );
+  assert.equal(
+    resolveScheduledTaskRunDevice({
+      assignedDeviceId: "stale",
+      activeDeviceId: "offline",
+      onlineDeviceIds: ["only-online"],
+    }),
+    "only-online",
+  );
+});
+
+test("manual runs require at least one online connector", () => {
+  assert.equal(
+    resolveScheduledTaskRunDevice({
+      assignedDeviceId: "stale",
+      activeDeviceId: null,
+      onlineDeviceIds: [],
+    }),
+    null,
+  );
+});
+
+test("server manual runs try the assigned device before other owned connectors", () => {
+  assert.deepEqual(
+    channelScheduleManualRunDeviceCandidates({
+      assignedDeviceId: "assigned",
+      ownedDeviceIds: ["newest", "assigned", "older"],
+      canMoveToAnotherDevice: true,
+    }),
+    ["assigned", "newest", "older"],
+  );
+});
+
+test("machine-local manual runs stay pinned to their assigned connector", () => {
+  assert.deepEqual(
+    channelScheduleManualRunDeviceCandidates({
+      assignedDeviceId: "assigned",
+      ownedDeviceIds: ["newest"],
+      canMoveToAnotherDevice: false,
+    }),
+    ["assigned"],
   );
 });

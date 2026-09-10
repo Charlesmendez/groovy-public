@@ -183,7 +183,8 @@ export async function POST(req: Request) {
   const { data: memberRows } = await supabase
     .from("workspace_members")
     .select("user_id")
-    .eq("workspace_id", workspaceId);
+    .eq("workspace_id", workspaceId)
+    .in("role", ["admin", "member"]);
   const ownerUserId = asTrimmed((agent as { user_id?: unknown }).user_id);
   if (Array.isArray(memberRows) && memberRows.length > 0) {
     const { error: memberAclErr } = await supabase.from("orchestrator_agent_members").upsert(

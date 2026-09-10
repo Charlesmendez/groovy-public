@@ -10,9 +10,12 @@ import {
   Braces,
   ChevronRight,
   Hash,
+  KeyRound,
   LayoutGrid,
   Settings2,
   Users,
+  ShieldCheck,
+  Webhook,
 } from "lucide-react";
 import { AppNav } from "@/components/AppNav";
 import { CustomSelect } from "@/components/ui/CustomSelect";
@@ -39,10 +42,28 @@ const items = [
     icon: Bell,
   },
   {
+    href: "/settings/webhooks",
+    label: "Webhooks",
+    description: "Send service updates to Chat",
+    icon: Webhook,
+  },
+  {
     href: "/settings/minds",
     label: "Minds",
     description: "Identity, models, and policy",
     icon: Bot,
+  },
+  {
+    href: "/settings/providers",
+    label: "Model Providers",
+    description: "Provider API keys and local logins",
+    icon: KeyRound,
+  },
+  {
+    href: "/settings/secrets",
+    label: "Secrets",
+    description: "Local keys for Minds and skills",
+    icon: ShieldCheck,
   },
   {
     href: "/settings/skills",
@@ -100,9 +121,14 @@ export function SettingsShell({ children }: { children: React.ReactNode }) {
       />
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#08090b]/95 backdrop-blur-xl">
         <div className="mx-auto flex min-h-16 max-w-[1440px] items-center gap-3 px-4 py-3 sm:px-6">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400">
+          <Link
+            href="/dashboard?panel=settings"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white"
+            aria-label="Open Groovy settings"
+            title="Groovy settings"
+          >
             <Settings2 className="h-4 w-4" />
-          </span>
+          </Link>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">
               Workspace settings

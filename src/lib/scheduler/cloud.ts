@@ -30,15 +30,63 @@ const WEEKDAY_INDEX: Record<string, number> = {
   Sat: 6,
 };
 
-function validTimezone(value: unknown): string {
+export function normalizeScheduleTimezone(value: unknown): string | null {
   const timezone = typeof value === "string" ? value.trim() : "";
-  if (!timezone) return "UTC";
+  if (!timezone) return null;
   try {
-    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
-    return timezone;
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+    }).resolvedOptions().timeZone;
   } catch {
-    return "UTC";
+    return null;
   }
+}
+
+export function withScheduleTimezone(
+  value: unknown,
+  timezoneValue: unknown,
+): { schedule: Record<string, unknown> | null; changed: boolean } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { schedule: null, changed: false };
+  }
+  const schedule = value as Record<string, unknown>;
+  if (schedule.type !== "daily" && schedule.type !== "weekly") {
+    return { schedule, changed: false };
+  }
+  if (normalizeScheduleTimezone(schedule.timezone)) {
+    return { schedule, changed: false };
+  }
+  const timezone = normalizeScheduleTimezone(timezoneValue);
+  if (!timezone) return { schedule, changed: false };
+  return {
+    schedule: { ...schedule, timezone },
+    changed: true,
+  };
+}
+
+/**
+ * Interval schedules start counting when they are created. Without an anchor,
+ * both the local connector and cloud fallback treat a new interval job as
+ * immediately due, which can fire a replacement schedule seconds after the
+ * user edited it.
+ */
+export function initialIntervalScheduleAnchor(
+  schedule: unknown,
+  now = new Date(),
+): string | null {
+  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) {
+    return null;
+  }
+  const record = schedule as Record<string, unknown>;
+  const minutes = Number(record.minutes);
+  if (
+    record.type !== "interval_minutes" ||
+    !Number.isFinite(minutes) ||
+    minutes <= 0
+  ) {
+    return null;
+  }
+  return now.toISOString();
 }
 
 function zonedParts(date: Date, timeZone: string): ZonedParts {
@@ -69,12 +117,15 @@ function calendarKey(parts: ZonedParts): string {
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
-function scheduleTimezone(job: CloudScheduledJob): string {
+function scheduleTimezone(job: CloudScheduledJob): string | null {
   const options =
     job.task?.options && typeof job.task.options === "object"
       ? (job.task.options as Record<string, unknown>)
       : null;
-  return validTimezone(job.schedule?.timezone || options?.timezone);
+  return (
+    normalizeScheduleTimezone(job.schedule?.timezone) ||
+    normalizeScheduleTimezone(options?.timezone)
+  );
 }
 
 export function isCloudScheduleDue(
@@ -86,9 +137,14 @@ export function isCloudScheduleDue(
   if (!schedule || typeof schedule !== "object") {
     return { due: false, timezone: "UTC", reason: "missing_schedule" };
   }
-  const timezone = scheduleTimezone(job);
   const type = typeof schedule.type === "string" ? schedule.type : "";
-  const lastRun = job.last_run_at ? new Date(job.last_run_at) : null;
+  const configuredTimezone = scheduleTimezone(job);
+  const timezone = configuredTimezone || "UTC";
+  const parsedLastRun = job.last_run_at ? new Date(job.last_run_at) : null;
+  const lastRun =
+    parsedLastRun && Number.isFinite(parsedLastRun.getTime())
+      ? parsedLastRun
+      : null;
 
   if (type === "once") {
     const runAt = new Date(String(schedule.run_at || ""));
@@ -114,6 +170,29 @@ export function isCloudScheduleDue(
     };
   }
 
+  // Daily and weekly schedules are defined as connector-local wall-clock
+  // times. Running a legacy row with no recorded timezone as UTC can reserve
+  // the occurrence hours too early and prevent the connector from running it
+  // at the time shown to the user. Leave it to the connector until its IANA
+  // timezone has been recorded.
+  if (!configuredTimezone) {
+    const hasTimezoneValue = Boolean(
+      (typeof schedule.timezone === "string" && schedule.timezone.trim()) ||
+        (typeof job.task?.options === "object" &&
+          job.task.options &&
+          typeof (job.task.options as Record<string, unknown>).timezone ===
+            "string" &&
+          String(
+            (job.task.options as Record<string, unknown>).timezone,
+          ).trim()),
+    );
+    return {
+      due: false,
+      timezone,
+      reason: hasTimezoneValue ? "invalid_timezone" : "timezone_required",
+    };
+  }
+
   const current = zonedParts(now, timezone);
   const hour = Number(schedule.hour);
   const minute = Number(schedule.minute);
@@ -136,8 +215,15 @@ export function isCloudScheduleDue(
   if (type !== "daily" && type !== "weekly") {
     return { due: false, timezone, reason: "unsupported_schedule" };
   }
-  if (lastRun && calendarKey(zonedParts(lastRun, timezone)) === calendarKey(current)) {
-    return { due: false, timezone, reason: "already_ran" };
+  if (lastRun) {
+    const lastRunLocal = zonedParts(lastRun, timezone);
+    const ranThisOccurrence =
+      calendarKey(lastRunLocal) === calendarKey(current) &&
+      (lastRunLocal.hour > hour ||
+        (lastRunLocal.hour === hour && lastRunLocal.minute >= minute));
+    if (ranThisOccurrence) {
+      return { due: false, timezone, reason: "already_ran" };
+    }
   }
   return { due: true, timezone };
 }
@@ -189,4 +275,23 @@ export function cloudScheduledJobEligibility(
     return { eligible: false, reason: "message_requests_connector_capability" };
   }
   return { eligible: true };
+}
+
+const SAFE_CLOUD_RETRY_ERRORS = new Set([
+  "Unauthorized",
+  "scheduler_dispatch_http_401",
+  "scheduled_channel_busy",
+  "scheduled_channel_resolution_failed",
+]);
+
+/**
+ * These failures happen before the scheduled model/tool run starts, so a
+ * later cloud tick can safely retry the same occurrence without duplicating
+ * side effects.
+ */
+export function isSafeCloudScheduleRetry(error: unknown): boolean {
+  return (
+    typeof error === "string" &&
+    SAFE_CLOUD_RETRY_ERRORS.has(error.trim())
+  );
 }

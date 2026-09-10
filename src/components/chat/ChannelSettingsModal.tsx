@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import {
   Bell,
   Bot,
@@ -13,6 +14,7 @@ import {
   ShieldCheck,
   Sparkles,
   Users,
+  Webhook,
   X,
 } from "lucide-react";
 import type { ChannelSkillOption } from "@/components/chat/ChannelCreateModal";
@@ -26,6 +28,7 @@ import {
 
 type Channel = {
   id: string;
+  kind: "channel" | "dm";
   name: string;
   topic: string | null;
   visibility: "workspace" | "private";
@@ -204,6 +207,7 @@ function SelectionRow({
 
 export function ChannelSettingsModal({
   channel,
+  displayName,
   profiles,
   people,
   agents,
@@ -217,6 +221,7 @@ export function ChannelSettingsModal({
   onChanged,
 }: {
   channel: Channel;
+  displayName?: string;
   profiles: Profile[];
   people: Person[];
   agents: Agent[];
@@ -229,8 +234,17 @@ export function ChannelSettingsModal({
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
+  const isDirectMessage = channel.kind === "dm";
+  const settingsSections = isDirectMessage
+    ? SECTIONS.filter(
+        (item) =>
+          item.id === "orchestrator" || item.id === "notifications",
+      )
+    : SECTIONS;
   const incomingDraftKey = JSON.stringify(draftFromChannel(channel));
-  const [section, setSection] = useState<SettingsSection>("general");
+  const [section, setSection] = useState<SettingsSection>(
+    isDirectMessage ? "orchestrator" : "general",
+  );
   const [baseline, setBaseline] = useState<ChannelDraft>(() =>
     draftFromChannel(channel),
   );
@@ -249,6 +263,10 @@ export function ChannelSettingsModal({
     setError(null);
     setSaved(false);
   }, [channel.id, incomingDraftKey]);
+
+  useEffect(() => {
+    setSection(isDirectMessage ? "orchestrator" : "general");
+  }, [channel.id, isDirectMessage]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -278,6 +296,7 @@ export function ChannelSettingsModal({
   const selectedProfileIsGuestSafe = isGuestSafeMind(selectedProfile);
   const guestMindRequired =
     hasGuests && draft.orchestratorMode !== "off";
+  const guestMindSelectionRestricted = hasGuests && isDirectMessage;
   const selectedSkillCount = skillAssignments.length;
   const selectedParticipantCount = members.filter(
     (member) =>
@@ -386,9 +405,9 @@ export function ChannelSettingsModal({
       person.role === "guest" &&
       skillAssignments.length > 0 &&
       !window.confirm(
-        `Add this channel guest? ${skillAssignments.length} internal ${
+        `Add this channel guest? ${skillAssignments.length} assigned ${
           skillAssignments.length === 1 ? "capability" : "capabilities"
-        } will be paused while any guest participates.`,
+        } will remain available to the Mind in replies this guest can see. Only continue if the assigned content is approved for guest-facing use.`,
       )
     ) {
       return;
@@ -452,7 +471,9 @@ export function ChannelSettingsModal({
     );
   };
 
-  const sectionMeta = SECTIONS.find((item) => item.id === section)!;
+  const sectionMeta =
+    settingsSections.find((item) => item.id === section) ||
+    settingsSections[0]!;
 
   return (
     <div
@@ -468,7 +489,9 @@ export function ChannelSettingsModal({
       >
         <header className="flex shrink-0 items-start gap-3 border-b border-white/10 px-4 py-4 sm:px-5">
           <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-zinc-400">
-            {channel.visibility === "private" ? (
+            {isDirectMessage ? (
+              <MessageSquareText className="h-4 w-4" />
+            ) : channel.visibility === "private" ? (
               <Lock className="h-4 w-4" />
             ) : (
               <Hash className="h-4 w-4" />
@@ -479,10 +502,11 @@ export function ChannelSettingsModal({
               id="channel-settings-title"
               className="truncate text-base font-semibold text-white"
             >
-              {channel.name}
+              {displayName || channel.name}
             </h2>
             <p className="mt-0.5 truncate text-xs text-zinc-500">
-              Channel settings · {sectionMeta.description}
+              {isDirectMessage ? "Conversation" : "Channel"} settings ·{" "}
+              {sectionMeta.description}
             </p>
           </div>
           {!canManage ? (
@@ -494,14 +518,20 @@ export function ChannelSettingsModal({
             type="button"
             onClick={requestClose}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-500 hover:bg-white/5 hover:text-white"
-            aria-label="Close channel settings"
+            aria-label={`Close ${
+              isDirectMessage ? "conversation" : "channel"
+            } settings`}
           >
             <X className="h-4 w-4" />
           </button>
         </header>
 
-        <div className="grid shrink-0 grid-cols-5 gap-1 border-b border-white/10 bg-black/15 p-2 md:hidden">
-          {SECTIONS.map((item) => {
+        <div
+          className={`grid shrink-0 gap-1 border-b border-white/10 bg-black/15 p-2 md:hidden ${
+            isDirectMessage ? "grid-cols-2" : "grid-cols-5"
+          }`}
+        >
+          {settingsSections.map((item) => {
             const Icon = item.icon;
             const active = item.id === section;
             return (
@@ -525,8 +555,13 @@ export function ChannelSettingsModal({
 
         <div className="flex min-h-0 flex-1">
           <aside className="hidden w-56 shrink-0 border-r border-white/10 bg-black/10 p-3 md:flex md:flex-col">
-            <nav className="space-y-1" aria-label="Channel settings sections">
-              {SECTIONS.map((item) => {
+            <nav
+              className="space-y-1"
+              aria-label={`${
+                isDirectMessage ? "Conversation" : "Channel"
+              } settings sections`}
+            >
+              {settingsSections.map((item) => {
                 const Icon = item.icon;
                 const active = item.id === section;
                 const count =
@@ -566,7 +601,7 @@ export function ChannelSettingsModal({
             <div className="mt-auto rounded-xl border border-white/[0.07] bg-white/[0.025] p-3">
               <div className="flex items-center gap-2 text-[10px] font-medium text-zinc-400">
                 <ShieldCheck className="h-3.5 w-3.5 text-cyan-300" />
-                Channel boundary
+                {isDirectMessage ? "Conversation" : "Channel"} boundary
               </div>
               <p className="mt-1.5 text-[9px] leading-relaxed text-zinc-600">
                 Mind settings add context but never expand profile permissions
@@ -691,6 +726,21 @@ export function ChannelSettingsModal({
                       );
                     })}
                   </div>
+                  {canManage && channel.kind === "channel" ? (
+                    <Link
+                      href={`/settings/webhooks?channel=${channel.id}`}
+                      className="mt-5 flex items-center gap-3 rounded-xl border border-white/10 bg-white/[0.025] p-4 text-sm transition hover:border-cyan-300/30"
+                    >
+                      <Webhook className="h-5 w-5 shrink-0 text-cyan-300" />
+                      <span className="flex-1">
+                        <span className="block text-zinc-200">Incoming webhooks</span>
+                        <span className="mt-1 block text-xs text-zinc-500">
+                          Let a service post updates to this channel.
+                        </span>
+                      </span>
+                      <span className="text-zinc-500">→</span>
+                    </Link>
+                  ) : null}
                   {baseline.visibility === "workspace" &&
                   draft.visibility === "private" ? (
                     <div className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.07] px-3 py-2.5 text-xs leading-relaxed text-amber-100">
@@ -706,39 +756,59 @@ export function ChannelSettingsModal({
                   <div className="mb-6">
                     <h3 className="text-lg font-semibold">Mind & behavior</h3>
                     <p className="mt-1 text-sm leading-relaxed text-zinc-500">
-                      Choose the channel Mind, when it should answer, and the
-                      operating brief it follows here.
+                      {isDirectMessage
+                        ? "Keep this conversation human-only, or add a Mind when you want AI participation."
+                        : "Choose the channel Mind, when it should answer, and the operating brief it follows here."}
                     </p>
                   </div>
                   <label className="mb-1.5 block text-[11px] font-medium uppercase tracking-widest text-zinc-500">
-                    Channel Mind
+                    {isDirectMessage ? "Conversation Mind" : "Channel Mind"}
                   </label>
                   <CustomSelect
                     value={draft.profileId}
                     onChange={(profileId) =>
-                      setDraft((current) => ({ ...current, profileId }))
+                      setDraft((current) => ({
+                        ...current,
+                        profileId,
+                        ...(isDirectMessage
+                          ? {
+                              orchestratorMode: profileId
+                                ? current.orchestratorMode === "off"
+                                  ? "mention"
+                                  : current.orchestratorMode
+                                : "off",
+                            }
+                          : {}),
+                      }))
                     }
                     options={[
                       {
                         value: "",
-                        label: "Groovy default",
-                        description: guestMindRequired
-                          ? "Unavailable while guests can talk to the Mind"
-                          : "Use the workspace’s default Mind.",
-                        disabled: guestMindRequired,
+                        label: isDirectMessage
+                          ? "No Mind · humans only"
+                          : "Groovy default",
+                        description: isDirectMessage
+                          ? "A private conversation between people."
+                          : guestMindRequired
+                            ? "Unavailable while guests can talk to the Mind"
+                            : "Use the workspace’s default Mind.",
+                        disabled: !isDirectMessage && guestMindRequired,
                       },
                       ...profiles.map((profile) => ({
                         value: profile.id,
                         label: profile.name,
                         description: isGuestSafeMind(profile)
                           ? "Guest-ready · External · Restricted"
-                          : guestMindRequired
+                          : guestMindRequired ||
+                              guestMindSelectionRestricted
                             ? "Internal Mind · configure before using with guests"
                             : profile.is_default
                               ? "Workspace default"
                               : "Workspace Mind",
                         disabled:
-                          guestMindRequired && !isGuestSafeMind(profile),
+                          (guestMindRequired ||
+                            guestMindSelectionRestricted) &&
+                          !isGuestSafeMind(profile),
                       })),
                     ]}
                     disabled={!canManage}
@@ -749,7 +819,9 @@ export function ChannelSettingsModal({
                     <p className="text-xs text-zinc-600">
                       {selectedProfile
                         ? `${selectedProfile.name} supplies the identity, model, memory, and tool policy.`
-                        : "The workspace default supplies the identity, model, memory, and tool policy."}
+                        : isDirectMessage
+                          ? "No Mind can read or reply in this conversation."
+                          : "The workspace default supplies the identity, model, memory, and tool policy."}
                     </p>
                     <button
                       type="button"
@@ -849,7 +921,12 @@ export function ChannelSettingsModal({
                         <button
                           key={option.id}
                           type="button"
-                          disabled={!canManage}
+                          disabled={
+                            !canManage ||
+                            (isDirectMessage &&
+                              option.id !== "off" &&
+                              !draft.profileId)
+                          }
                           onClick={() =>
                             setDraft((current) => ({
                               ...current,
@@ -878,7 +955,9 @@ export function ChannelSettingsModal({
                       htmlFor="channel-orchestrator-instructions"
                       className="block text-[11px] font-medium uppercase tracking-widest text-zinc-500"
                     >
-                      Channel instructions
+                      {isDirectMessage
+                        ? "Conversation instructions"
+                        : "Channel instructions"}
                     </label>
                     <span className="text-[10px] tabular-nums text-zinc-600">
                       {draft.orchestratorInstructions.length.toLocaleString()} /
@@ -892,7 +971,11 @@ export function ChannelSettingsModal({
                     rows={10}
                     maxLength={MAX_CHANNEL_ORCHESTRATOR_INSTRUCTIONS}
                     disabled={!canManage}
-                    placeholder={`Example: Keep this channel focused on customer launches. Start with a concise status summary, call out blockers, and ask before changing production.`}
+                    placeholder={
+                      isDirectMessage
+                        ? "Example: Help only when mentioned. Keep replies concise and do not act without asking."
+                        : "Example: Keep this channel focused on customer launches. Start with a concise status summary, call out blockers, and ask before changing production."
+                    }
                     onChange={(event) =>
                       setDraft((current) => ({
                         ...current,
@@ -904,16 +987,18 @@ export function ChannelSettingsModal({
                   <div className="mt-3 flex gap-2.5 rounded-xl border border-cyan-400/15 bg-cyan-400/[0.04] p-3">
                     <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
                     <p className="text-[11px] leading-relaxed text-zinc-400">
-                      This brief shapes behavior in this channel. It cannot
-                      grant tools, override the Mind’s authorization boundary,
-                      expose other channels, or widen memory access. Do not put
-                      secrets here.
+                      This brief shapes behavior in this{" "}
+                      {isDirectMessage ? "conversation" : "channel"}. It
+                      cannot grant tools, override the Mind’s authorization
+                      boundary, expose other channels, or widen memory access.
+                      Do not put secrets here.
                     </p>
                   </div>
                   {hasGuests ? (
                     <div className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.07] p-3 text-xs leading-relaxed text-amber-100">
-                      Guest channels still require a guest-ready Mind. Channel
-                      instructions cannot loosen that audience boundary.
+                      {isDirectMessage
+                        ? "This conversation can stay human-only without a Mind. If you enable AI, only a guest-ready Mind can participate, and conversation instructions cannot loosen that boundary."
+                        : "Guest channels still require a guest-ready Mind. Channel instructions cannot loosen that audience boundary."}
                     </div>
                   ) : null}
                 </div>
@@ -923,8 +1008,8 @@ export function ChannelSettingsModal({
                 <RoomNotificationPanel
                   room={{
                     id: channel.id,
-                    kind: "channel",
-                    name: channel.name,
+                    kind: channel.kind,
+                    name: displayName || channel.name,
                   }}
                 />
               ) : null}
@@ -1049,8 +1134,9 @@ export function ChannelSettingsModal({
                   </div>
                   {hasGuests ? (
                     <div className="mb-4 rounded-xl border border-amber-400/20 bg-amber-400/[0.07] p-3 text-xs leading-relaxed text-amber-100">
-                      Internal channel capabilities are paused while a guest
-                      participates. Remove all guests before assigning more.
+                      This channel includes guests. Assigned skills and docs
+                      are available to the Mind when it responds here, so only
+                      add capabilities approved for guest-facing use.
                     </div>
                   ) : null}
                   <div className="space-y-2">
@@ -1066,8 +1152,7 @@ export function ChannelSettingsModal({
                           disabled={
                             !canManage ||
                             busy === `skill:${skill.id}` ||
-                            busy !== null ||
-                            (hasGuests && !included)
+                            busy !== null
                           }
                           icon={
                             skill.artifact_type === "skill" ? (
@@ -1126,7 +1211,8 @@ export function ChannelSettingsModal({
             <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#111319] p-5 shadow-2xl">
               <h3 className="text-base font-semibold">Discard your changes?</h3>
               <p className="mt-2 text-sm leading-relaxed text-zinc-500">
-                The channel settings you changed have not been saved.
+                The {isDirectMessage ? "conversation" : "channel"} settings you
+                changed have not been saved.
               </p>
               <div className="mt-5 flex justify-end gap-2">
                 <button

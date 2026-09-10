@@ -1535,7 +1535,24 @@ export async function POST(req: Request) {
         }
       } catch (error) {
         console.error("[datagran-chat] Anthropic API error:", error);
-        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        const errorRecord =
+          error && typeof error === "object"
+            ? (error as Record<string, unknown>)
+            : null;
+        const errorStatus =
+          typeof errorRecord?.status === "number"
+            ? errorRecord.status
+            : typeof errorRecord?.statusCode === "number"
+              ? errorRecord.statusCode
+              : null;
+        const rawErrorMessage =
+          error instanceof Error ? error.message : "Unknown error";
+        const anthropicCredentialRejected =
+          errorStatus === 401 ||
+          /authentication_error|api key is invalid/i.test(rawErrorMessage);
+        const errorMessage = anthropicCredentialRejected
+          ? "Anthropic model API credential is invalid. Replace it in Settings → Model Providers. The data source request was not executed."
+          : rawErrorMessage;
         sendSSE(controller, encoder, { type: "error", error: errorMessage });
         if (!streamClosed) {
           controller.close();

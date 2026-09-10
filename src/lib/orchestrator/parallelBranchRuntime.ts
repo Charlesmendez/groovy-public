@@ -10,6 +10,10 @@ import {
   spawnWorkerBranches,
 } from "./runtimeGraph";
 import type { ConnectorExecute, FilesAgentSession, GeneratedFileRef } from "./runOrchestratorRound";
+import {
+  parallelConnectorCallKey,
+  reconcileParallelConnectorResults,
+} from "./parallelBranchResults";
 
 type ToolResultInput = {
   toolCallId: string;
@@ -23,6 +27,7 @@ export type ParallelBranchConnectorToolResultInput = ToolResultInput & {
 
 export type ParallelBranchRuntimeContext = {
   orchestratorAgentId: string;
+  usageActorUserId?: string;
   orchestratorSessionId?: string | null;
   epochId: string;
   appBaseUrl?: string;
@@ -178,23 +183,6 @@ function buildToolResultsHistoryMessage(toolResults: ToolResultInput[]): ModelMe
   };
 }
 
-function normalizeIncomingToolResults(
-  toolResults: ParallelBranchConnectorToolResultInput[] | undefined
-): Map<string, ToolResultInput[]> {
-  const grouped = new Map<string, ToolResultInput[]>();
-  for (const raw of toolResults || []) {
-    const branchId = asTrimmed(raw.branchId);
-    const toolCallId = asTrimmed(raw.toolCallId);
-    const toolName = asTrimmed(raw.toolName);
-    const result = typeof raw.result === "string" ? raw.result : "";
-    if (!branchId || !toolCallId || !toolName || !result) continue;
-    const current = grouped.get(branchId) || [];
-    current.push({ toolCallId, toolName, result });
-    grouped.set(branchId, current);
-  }
-  return grouped;
-}
-
 function finalizeBatchResult(
   state: ParallelBranchRuntimeState
 ): Extract<ParallelBranchBatchEnvelope, { kind: "final" }> {
@@ -269,27 +257,60 @@ async function completeWorker(
 
 async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeArgs): Promise<ParallelBranchBatchEnvelope> {
   const { supabase, userId, state } = args;
-  const incomingResultsByBranch = normalizeIncomingToolResults(args.toolResults);
   const existingPendingConnectorExecutes = Array.isArray(state.pendingConnectorExecutes)
     ? state.pendingConnectorExecutes
     : [];
-  if (incomingResultsByBranch.size > 0) {
-    state.pendingConnectorExecutes = existingPendingConnectorExecutes.filter(
-      (execute) => !incomingResultsByBranch.has(execute.branchId)
-    );
-  }
+  const reconciledConnectorResults = reconcileParallelConnectorResults({
+    pending: existingPendingConnectorExecutes,
+    incoming: args.toolResults,
+  });
+  const incomingResultsByBranch = reconciledConnectorResults.acceptedByBranch;
+  state.pendingConnectorExecutes = reconciledConnectorResults.remaining;
+  const workersWithLostConnectorState: ParallelBranchWorkerState[] = [];
 
   for (const worker of state.workers) {
     if (worker.result) continue;
     const incoming = incomingResultsByBranch.get(worker.branchId) || [];
-    if (incoming.length === 0) continue;
-    const historyMessage = buildToolResultsHistoryMessage(incoming);
-    if (historyMessage) {
-      worker.history = [...cloneMessages(worker.history), historyMessage];
+    if (incoming.length > 0) {
+      const historyMessage = buildToolResultsHistoryMessage(incoming);
+      if (historyMessage) {
+        worker.history = [...cloneMessages(worker.history), historyMessage];
+      }
+      worker.pendingToolResults = incoming;
     }
-    worker.pendingToolResults = incoming;
-    worker.waitingForConnector = false;
+    const hasPendingForWorker = state.pendingConnectorExecutes.some(
+      (execute) => execute.branchId === worker.branchId,
+    );
+    if (worker.waitingForConnector) {
+      if (hasPendingForWorker) {
+        worker.waitingForConnector = true;
+      } else if (incoming.length > 0) {
+        worker.waitingForConnector = false;
+      } else {
+        workersWithLostConnectorState.push(worker);
+      }
+    }
   }
+
+  await Promise.all(
+    workersWithLostConnectorState.map((worker) =>
+      completeWorker(
+        supabase,
+        userId,
+        worker,
+        {
+          branchId: worker.branchId,
+          title: worker.title,
+          goal: worker.goal,
+          status: "failed",
+          summary:
+            "Worker branch could not resume because its pending connector state was missing.",
+          toolCallsExecuted: [],
+        },
+        "missing_connector_state",
+      ),
+    ),
+  );
 
   const connectorExecutes: ParallelBranchBatchConnectorExecute[] = [];
   const activeBranchCount = await getActiveBranchCount({
@@ -318,6 +339,7 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
           const round = await runOrchestratorRound({
             supabase,
             userId,
+            usageActorUserId: state.context.usageActorUserId,
             appBaseUrl: state.context.appBaseUrl,
             deviceId: state.context.deviceId,
             connectorPlatform: state.context.connectorPlatform,
@@ -339,6 +361,7 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
             orchestratorSessionId: state.context.orchestratorSessionId || null,
             branchControllerSettings: state.branchController,
             maxSteps: Math.max(1, worker.budgetRemaining),
+            allowSynthesisAfterTool: false,
             runtimeScopeOverride: {
               agentId: state.context.orchestratorAgentId,
               epochId: state.context.epochId,
@@ -354,7 +377,11 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
           });
           const spentBudget = Math.max(
             1,
-            Array.isArray(round.toolCallsExecuted) ? round.toolCallsExecuted.length : 0
+            Number.isFinite(Number(round.stepsUsed))
+              ? Math.floor(Number(round.stepsUsed))
+              : Array.isArray(round.toolCallsExecuted)
+                ? round.toolCallsExecuted.length
+                : 0,
           );
           worker.budgetRemaining = Math.max(0, worker.budgetRemaining - spentBudget);
 
@@ -372,6 +399,24 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
           }
 
           if (round.kind === "needs_connector") {
+            if (round.connectorExecutes.length === 0) {
+              await completeWorker(
+                supabase,
+                userId,
+                worker,
+                {
+                  branchId: worker.branchId,
+                  title: worker.title,
+                  goal: worker.goal,
+                  status: "failed",
+                  summary:
+                    "Worker branch requested connector work without providing an executable connector call.",
+                  toolCallsExecuted: round.toolCallsExecuted,
+                },
+                "empty_connector_request",
+              );
+              return;
+            }
             worker.waitingForConnector = true;
             worker.pendingToolResults = undefined;
             for (const execute of round.connectorExecutes) {
@@ -428,10 +473,27 @@ async function advanceParallelBranchRuntime(args: ContinueParallelBranchRuntimeA
   }
 
   if (connectorExecutes.length > 0) {
-    const combinedPendingConnectorExecutes = [
-      ...(Array.isArray(state.pendingConnectorExecutes) ? state.pendingConnectorExecutes : []),
-      ...connectorExecutes,
-    ];
+    const combinedPendingConnectorExecutes = Array.from(
+      new Map(
+        [
+          ...(Array.isArray(state.pendingConnectorExecutes)
+            ? state.pendingConnectorExecutes
+            : []),
+          ...connectorExecutes,
+        ].map((execute) => [
+          parallelConnectorCallKey(execute),
+          execute,
+        ]),
+      ).values(),
+    );
+    const workerOrder = new Map(
+      state.workers.map((worker, index) => [worker.branchId, index]),
+    );
+    combinedPendingConnectorExecutes.sort(
+      (left, right) =>
+        (workerOrder.get(left.branchId) ?? Number.MAX_SAFE_INTEGER) -
+        (workerOrder.get(right.branchId) ?? Number.MAX_SAFE_INTEGER),
+    );
     state.pendingConnectorExecutes = combinedPendingConnectorExecutes;
     return {
       version: 1,

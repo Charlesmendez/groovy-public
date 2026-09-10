@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   getWhatsAppRecycleCheckIntervalMs,
+  getWhatsAppRecycleCircuitDecision,
   getWhatsAppRecycleDecision,
   getWhatsAppRecycleRetryCooldownMs,
+  getRssGrowthRateMbPerMin,
   shouldCheckWhatsAppRecycle,
 } from "./platform/whatsapp/recycle.mjs";
 
@@ -78,6 +80,58 @@ test("memory pressure never interrupts an active bridge operation", () => {
   assert.equal(result.reason, "active_operation");
 });
 
+test("resource guards remain active when time-based recycling is disabled", () => {
+  const memory = decision({
+    recycleIntervalMs: 0,
+    memoryRssBytes: 6 * 1024 ** 3,
+  });
+  assert.equal(memory.due, true);
+  assert.equal(memory.reason, "memory_limit");
+
+  const cpu = decision({
+    recycleIntervalMs: 0,
+    cpuPercent: 180,
+    cpuLimitPercent: 125,
+    consecutiveHighCpuChecks: 3,
+    requiredHighCpuChecks: 3,
+  });
+  assert.equal(cpu.due, true);
+  assert.equal(cpu.reason, "cpu_limit");
+});
+
+test("sustained CPU pressure triggers a recycle but a transient spike does not", () => {
+  const transient = decision({
+    cpuPercent: 180,
+    cpuLimitPercent: 125,
+    consecutiveHighCpuChecks: 2,
+    requiredHighCpuChecks: 3,
+    lastRecycleAtMs: 9.9 * HOUR,
+  });
+  assert.equal(transient.due, false);
+  assert.equal(transient.reason, "interval_not_elapsed");
+
+  const sustained = decision({
+    cpuPercent: 180,
+    cpuLimitPercent: 125,
+    consecutiveHighCpuChecks: 3,
+    requiredHighCpuChecks: 3,
+    lastRecycleAtMs: 9.9 * HOUR,
+  });
+  assert.equal(sustained.due, true);
+  assert.equal(sustained.reason, "cpu_limit");
+  assert.equal(sustained.forced, true);
+});
+
+test("memory pressure takes priority when both memory and CPU limits are reached", () => {
+  const result = decision({
+    memoryRssBytes: 6 * 1024 ** 3,
+    cpuPercent: 180,
+    cpuLimitPercent: 125,
+    consecutiveHighCpuChecks: 4,
+  });
+  assert.equal(result.reason, "memory_limit");
+});
+
 test("checks lifecycle policy frequently without changing the recycle cadence", () => {
   assert.equal(getWhatsAppRecycleCheckIntervalMs(6 * HOUR), 60_000);
   assert.equal(getWhatsAppRecycleCheckIntervalMs(45_000), 45_000);
@@ -86,8 +140,52 @@ test("checks lifecycle policy frequently without changing the recycle cadence", 
 
 test("memory pressure retries sooner than time-based recycle failures", () => {
   assert.equal(getWhatsAppRecycleRetryCooldownMs("memory_limit", 6 * HOUR), 2 * 60_000);
+  assert.equal(getWhatsAppRecycleRetryCooldownMs("cpu_limit", 6 * HOUR), 2 * 60_000);
   assert.equal(getWhatsAppRecycleRetryCooldownMs("recovery_retry", 6 * HOUR), 5 * 60_000);
   assert.equal(getWhatsAppRecycleRetryCooldownMs("idle_interval", 6 * HOUR), 15 * 60_000);
+});
+
+test("opens the resource circuit before a third pressure recycle in an hour", () => {
+  const now = 10 * HOUR;
+  const result = getWhatsAppRecycleCircuitDecision({
+    nowMs: now,
+    pressureRecycleTimestampsMs: [now - 30 * 60_000, now - 10 * 60_000],
+    reason: "cpu_limit",
+    maxPressureRecycles: 2,
+    windowMs: HOUR,
+  });
+  assert.equal(result.open, true);
+  assert.equal(result.reason, "resource_restart_loop");
+  assert.equal(result.recordAttempt, false);
+});
+
+test("resource circuit ignores time-based recycles and prunes old pressure attempts", () => {
+  const now = 10 * HOUR;
+  const ignored = getWhatsAppRecycleCircuitDecision({
+    nowMs: now,
+    pressureRecycleTimestampsMs: [now - 20 * 60_000],
+    reason: "idle_interval",
+    windowMs: HOUR,
+  });
+  assert.equal(ignored.recordAttempt, false);
+
+  const pruned = getWhatsAppRecycleCircuitDecision({
+    nowMs: now,
+    pressureRecycleTimestampsMs: [now - 2 * HOUR],
+    reason: "memory_limit",
+    windowMs: HOUR,
+  });
+  assert.deepEqual(pruned.recentTimestampsMs, [now]);
+});
+
+test("computes RSS growth in megabytes per minute", () => {
+  assert.equal(
+    getRssGrowthRateMbPerMin(
+      { atMs: 0, rssBytes: 100 * 1024 ** 2 },
+      { atMs: 2 * 60_000, rssBytes: 140 * 1024 ** 2 }
+    ),
+    20
+  );
 });
 
 test("retries a failed recycle when the bridge never becomes ready", () => {
@@ -95,6 +193,28 @@ test("retries a failed recycle when the bridge never becomes ready", () => {
   assert.equal(result.due, true);
   assert.equal(result.reason, "recovery_retry");
   assert.equal(result.forced, true);
+});
+
+test("retries a failed recycle after a transient browser auth event", () => {
+  const result = decision({
+    ready: false,
+    recoveryPending: true,
+    authFailure:
+      "Protocol error (Page.addScriptToEvaluateOnNewDocument): Target closed",
+  });
+  assert.equal(result.due, true);
+  assert.equal(result.reason, "recovery_retry");
+  assert.equal(result.forced, true);
+});
+
+test("retries a failed recycle after a transient browser disconnect", () => {
+  const result = decision({
+    ready: false,
+    recoveryPending: true,
+    disconnected: "Execution context was destroyed after navigation",
+  });
+  assert.equal(result.due, true);
+  assert.equal(result.reason, "recovery_retry");
 });
 
 test("does not recycle a bridge that is merely still starting", () => {
@@ -117,6 +237,17 @@ test("does not recovery-recycle when user intervention is required", () => {
     assert.equal(result.due, false);
     assert.equal(result.reason, "bridge_not_ready");
   }
+});
+
+test("QR state blocks recovery even when the browser failure was transient", () => {
+  const result = decision({
+    ready: false,
+    recoveryPending: true,
+    qrPending: true,
+    authFailure: "Protocol error: Target closed",
+  });
+  assert.equal(result.due, false);
+  assert.equal(result.reason, "bridge_not_ready");
 });
 
 test("rechecks immediately after a background operation releases the bridge", () => {

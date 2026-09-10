@@ -7,6 +7,17 @@ import {
   type WorkspaceInfo,
 } from "@/lib/workspaces";
 import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
+import { canManageChannelSkills } from "@/lib/chat/channelSkills";
+import {
+  resolveAssignedSkillReference,
+  type AssignedSkillCatalogItem,
+} from "@/lib/skills-manager/assignedSkills";
+import {
+  buildChannelSkillArtifact,
+  normalizeChannelSkillActionsManifest,
+  resolveChannelSkillRepository,
+} from "@/lib/skills-manager/channelSkillAuthoring";
+import { skillActionsManifestRelativePath } from "@/lib/skills-manager/actionManifestAuthoring";
 
 type AuthedContext = {
   userId: string;
@@ -155,12 +166,35 @@ async function getContext(requireAdmin = false): Promise<AuthedContext> {
 
 async function getWorkspaceForUserId(
   admin: ReturnType<typeof createSupabaseAdminClient>,
-  userId: string
+  userId: string,
+  workspaceId?: string | null,
 ): Promise<WorkspaceInfo> {
-  const membership = await getWorkspaceMembershipForUser({
-    userId,
-    admin,
-  });
+  const membership = workspaceId
+    ? await admin
+        .from("workspace_members")
+        .select("workspace_id,role,created_at")
+        .eq("workspace_id", workspaceId)
+        .eq("user_id", userId)
+        .maybeSingle()
+        .then(({ data, error }) => {
+          if (error) throw new Error(error.message);
+          if (!data) return null;
+          return {
+            workspace_id: String(data.workspace_id),
+            role:
+              data.role === "admin"
+                ? ("admin" as const)
+                : data.role === "guest"
+                  ? ("guest" as const)
+                  : ("member" as const),
+            created_at:
+              typeof data.created_at === "string" ? data.created_at : null,
+          };
+        })
+    : await getWorkspaceMembershipForUser({
+        userId,
+        admin,
+      });
   if (!membership?.workspace_id) throw new Error("Workspace not found");
 
   const { data: workspace, error: wsErr } = await admin
@@ -197,9 +231,13 @@ async function getWorkspaceForUserId(
   };
 }
 
-async function getContextForUser(userId: string, requireAdmin = false): Promise<AuthedContext> {
+async function getContextForUser(
+  userId: string,
+  requireAdmin = false,
+  workspaceId?: string | null,
+): Promise<AuthedContext> {
   const admin = createSupabaseAdminClient();
-  const workspace = await getWorkspaceForUserId(admin, userId);
+  const workspace = await getWorkspaceForUserId(admin, userId, workspaceId);
   if (!isWorkspaceOperatorRole(workspace.role)) {
     throw new Error("Workspace member access required");
   }
@@ -213,6 +251,7 @@ async function audit(
   ctx: AuthedContext,
   eventType: string,
   fields: {
+    actorUserId?: string | null;
     repositoryId?: string | null;
     artifactId?: string | null;
     assignmentId?: string | null;
@@ -221,7 +260,7 @@ async function audit(
 ) {
   await ctx.admin.from("workspace_skill_audit_events").insert({
     workspace_id: ctx.workspace.id,
-    actor_user_id: ctx.userId,
+    actor_user_id: fields.actorUserId || ctx.userId,
     event_type: eventType,
     repository_id: fields.repositoryId || null,
     artifact_id: fields.artifactId || null,
@@ -435,7 +474,7 @@ export async function listSkillsManagerState() {
       .order("updated_at", { ascending: false }),
     ctx.admin
       .from("workspace_skill_artifacts")
-      .select("id,workspace_id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,lifecycle,metadata,risk_flags,created_at,updated_at")
+      .select("id,workspace_id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,lifecycle,metadata,risk_flags,content_snapshot,content_snapshot_truncated,content_snapshot_updated_at,created_at,updated_at")
       .eq("workspace_id", ctx.workspace.id)
       .order("updated_at", { ascending: false }),
     ctx.admin
@@ -569,7 +608,18 @@ export async function listSkillsManagerState() {
     currentUserId: ctx.userId,
     workspace: ctx.workspace,
     repositories: reposRes.data || [],
-    artifacts: artifactsRes.data || [],
+    artifacts: (artifactsRes.data || []).map((artifact) => {
+      if (ctx.workspace.role === "admin") return artifact;
+      return Object.fromEntries(
+        Object.entries(artifact).filter(
+          ([key]) => ![
+            "content_snapshot",
+            "content_snapshot_truncated",
+            "content_snapshot_updated_at",
+          ].includes(key),
+        ),
+      );
+    }),
     assignments: assignmentsRes.data || [],
     syncs: syncsRes.data || [],
     auditEvents: auditsRes.data || [],
@@ -623,8 +673,10 @@ export async function connectSkillsRepository(input: {
   return { repository: repo, syncResult };
 }
 
-export async function syncSkillsRepository(input: { repositoryId: string; deviceId: string }) {
-  const ctx = await getContext(false);
+async function syncSkillsRepositoryWithContext(
+  ctx: AuthedContext,
+  input: { repositoryId: string; deviceId: string },
+) {
   const repositoryId = asString(input.repositoryId);
   const deviceId = asString(input.deviceId);
   if (!repositoryId || !deviceId) throw new Error("repositoryId and deviceId are required");
@@ -678,6 +730,11 @@ export async function syncSkillsRepository(input: { repositoryId: string; device
     });
   }
   return { ...result, upsertedArtifacts };
+}
+
+export async function syncSkillsRepository(input: { repositoryId: string; deviceId: string }) {
+  const ctx = await getContext(false);
+  return syncSkillsRepositoryWithContext(ctx, input);
 }
 
 export async function pushSkillsRepositoryChanges(input: { repositoryId: string; deviceId: string }) {
@@ -738,7 +795,7 @@ export async function pushSkillsRepositoryChanges(input: { repositoryId: string;
   return { ...result, upsertedArtifacts };
 }
 
-export async function createSkillsArtifact(input: {
+type CreateSkillsArtifactInput = {
   repositoryId: string;
   deviceId: string;
   artifactType: "skill" | "instruction_doc";
@@ -748,23 +805,60 @@ export async function createSkillsArtifact(input: {
   description?: string;
   targets?: string[];
   overwrite?: boolean;
+  expectedCommitSha?: string;
   commitMessage?: string;
-}) {
-  const ctx = await getContext(true);
+  companionFiles?: Array<{ relativePath: string; content: string }>;
+  preservePrimary?: boolean;
+  actionsManifest?: string;
+};
+
+async function createSkillsArtifactWithContext(
+  ctx: AuthedContext,
+  input: CreateSkillsArtifactInput,
+  auditActorUserId?: string,
+) {
   const repositoryId = asString(input.repositoryId);
   const deviceId = asString(input.deviceId);
   if (!repositoryId || !deviceId) throw new Error("repositoryId and deviceId are required");
   if (input.artifactType !== "skill" && input.artifactType !== "instruction_doc") {
     throw new Error("artifactType must be skill or instruction_doc");
   }
-  if (!asString(input.relativePath).endsWith(".md")) {
+  const relativePath = asString(input.relativePath);
+  if (!relativePath.endsWith(".md")) {
     throw new Error("Markdown artifact path must end in .md");
+  }
+  const companionFiles = [...(input.companionFiles || [])];
+  if (input.actionsManifest !== undefined) {
+    if (input.artifactType !== "skill") {
+      throw new Error("Only skills can include groovy-actions.json.");
+    }
+    const actionsContent = normalizeChannelSkillActionsManifest(
+      input.actionsManifest,
+    );
+    if (!actionsContent) {
+      throw new Error("A complete groovy-actions.json is required.");
+    }
+    const actionsRelativePath = skillActionsManifestRelativePath(relativePath);
+    const existingIndex = companionFiles.findIndex(
+      (file) => asString(file.relativePath) === actionsRelativePath,
+    );
+    const companion = {
+      relativePath: actionsRelativePath,
+      content: actionsContent,
+    };
+    if (existingIndex >= 0) companionFiles[existingIndex] = companion;
+    else companionFiles.push(companion);
   }
   const repo = await getRepository(ctx, repositoryId);
   const result = await callSkillsConnectorRpc({
     ctx,
     deviceId,
-    rpcType: "skills_artifact_create",
+    rpcType:
+      companionFiles.length > 0
+        ? input.preservePrimary
+          ? "skills_artifact_companion_upsert"
+          : "skills_artifact_bundle_create"
+        : "skills_artifact_create",
     timeoutMs: 3 * 60 * 1000,
     payload: {
       repository_id: repositoryId,
@@ -772,13 +866,19 @@ export async function createSkillsArtifact(input: {
       repo_url: asString(repo.repo_url),
       ref: asString(repo.default_ref) || "main",
       artifact_type: input.artifactType,
-      relative_path: asString(input.relativePath),
+      relative_path: relativePath,
       content: String(input.content || ""),
       name: asString(input.name),
       description: asString(input.description),
       targets: normalizeTargets(input.targets),
       overwrite: input.overwrite === true,
+      expected_commit_sha: asString(input.expectedCommitSha),
       commit_message: asString(input.commitMessage),
+      companion_files: companionFiles.map((file) => ({
+        relative_path: asString(file.relativePath),
+        content: String(file.content || ""),
+      })),
+      preserve_primary: input.preservePrimary === true,
     },
   });
   await recordSyncResult({
@@ -800,8 +900,9 @@ export async function createSkillsArtifact(input: {
     });
     return result;
   }
-  const syncResult = await syncSkillsRepository({ repositoryId, deviceId });
+  const syncResult = await syncSkillsRepositoryWithContext(ctx, { repositoryId, deviceId });
   await audit(ctx, "skills_artifact_created", {
+    actorUserId: auditActorUserId,
     repositoryId,
     metadata: {
       artifactType: input.artifactType,
@@ -809,6 +910,11 @@ export async function createSkillsArtifact(input: {
     },
   });
   return { ...result, syncResult };
+}
+
+export async function createSkillsArtifact(input: CreateSkillsArtifactInput) {
+  const ctx = await getContext(true);
+  return createSkillsArtifactWithContext(ctx, input);
 }
 
 function renderRuntimeSkillMarkdown(args: {
@@ -916,6 +1022,7 @@ async function setSkillAssignmentWithContext(
   input: {
   artifactId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target?: "all" | "flow" | "claude" | "codex";
   enabled?: boolean;
   }
@@ -924,6 +1031,8 @@ async function setSkillAssignmentWithContext(
   if (!artifactId) throw new Error("artifactId is required");
   const target = input.target === "flow" || input.target === "claude" || input.target === "codex" ? input.target : "all";
   const agentId = asString(input.agentId || "") || null;
+  const profileId = asString(input.profileId || "") || null;
+  if (agentId && profileId) throw new Error("Choose either a Mind or a worker assignment");
   const { data: artifact } = await ctx.admin
     .from("workspace_skill_artifacts")
     .select("id,workspace_id,targets")
@@ -938,12 +1047,14 @@ async function setSkillAssignmentWithContext(
       .delete()
       .eq("workspace_id", ctx.workspace.id)
       .eq("artifact_id", artifactId)
-      .eq("target", target)
-      .is("profile_id", null);
+      .eq("target", target);
+    deleteQuery = profileId
+      ? deleteQuery.eq("profile_id", profileId)
+      : deleteQuery.is("profile_id", null);
     deleteQuery = agentId ? deleteQuery.eq("agent_id", agentId) : deleteQuery.is("agent_id", null);
     const { error } = await deleteQuery;
     if (error) throw new Error(error.message);
-    await audit(ctx, "skills_assignment_removed", { artifactId, metadata: { agentId, target } });
+    await audit(ctx, "skills_assignment_removed", { artifactId, metadata: { agentId, profileId, target } });
     return { ok: true, removed: true };
   }
 
@@ -966,14 +1077,26 @@ async function setSkillAssignmentWithContext(
     if (agentErr) throw new Error(agentErr.message);
     if (!agent?.id) throw new Error("Agent not found in this workspace");
   }
+  if (profileId) {
+    const { data: profile, error: profileError } = await ctx.admin
+      .from("orchestrator_profiles")
+      .select("id")
+      .eq("workspace_id", ctx.workspace.id)
+      .eq("id", profileId)
+      .maybeSingle();
+    if (profileError) throw new Error(profileError.message);
+    if (!profile?.id) throw new Error("Mind not found in this workspace");
+  }
 
   let existingQuery = ctx.admin
     .from("workspace_skill_assignments")
     .select("id")
     .eq("workspace_id", ctx.workspace.id)
     .eq("artifact_id", artifactId)
-    .eq("target", target)
-    .is("profile_id", null);
+    .eq("target", target);
+  existingQuery = profileId
+    ? existingQuery.eq("profile_id", profileId)
+    : existingQuery.is("profile_id", null);
   existingQuery = agentId ? existingQuery.eq("agent_id", agentId) : existingQuery.is("agent_id", null);
   const { data: existing, error: existingErr } = await existingQuery.maybeSingle();
   if (existingErr) throw new Error(existingErr.message);
@@ -982,9 +1105,9 @@ async function setSkillAssignmentWithContext(
     workspace_id: ctx.workspace.id,
     artifact_id: artifactId,
     agent_id: agentId,
-    profile_id: null,
+    profile_id: profileId,
     target,
-    scope: agentId ? "agent" : "workspace",
+    scope: agentId ? "agent" : profileId ? "profile" : "workspace",
     enabled: true,
     created_by_user_id: ctx.userId,
     updated_at: new Date().toISOString(),
@@ -1005,7 +1128,7 @@ async function setSkillAssignmentWithContext(
   await audit(ctx, "skills_assignment_set", {
     artifactId,
     assignmentId: String(data.id),
-    metadata: { agentId, target },
+    metadata: { agentId, profileId, target },
   });
   return { ok: true, assignment: data };
 }
@@ -1013,6 +1136,7 @@ async function setSkillAssignmentWithContext(
 export async function setSkillAssignment(input: {
   artifactId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target?: "all" | "flow" | "claude" | "codex";
   enabled?: boolean;
 }) {
@@ -1022,20 +1146,100 @@ export async function setSkillAssignment(input: {
 
 export async function setSkillAssignmentForUser(input: {
   userId: string;
+  workspaceId?: string | null;
   artifactId: string;
   agentId?: string | null;
+  profileId?: string | null;
   target?: "all" | "flow" | "claude" | "codex";
   enabled?: boolean;
 }) {
-  const ctx = await getContextForUser(input.userId, true);
+  const ctx = await getContextForUser(input.userId, true, input.workspaceId);
   return setSkillAssignmentWithContext(ctx, input);
+}
+
+export async function listWorkspaceSecretAssignmentsForUser(input: {
+  userId: string;
+  workspaceId: string;
+  query?: string;
+}) {
+  const ctx = await getContextForUser(input.userId, true, input.workspaceId);
+  const query = asString(input.query).toLowerCase();
+  const [secrets, profiles, workers, skills, profileGrants, workerGrants, skillGrants, readiness] = await Promise.all([
+    ctx.admin.from("workspace_secret_definitions").select("id,name,key,description").eq("workspace_id", ctx.workspace.id).order("name"),
+    ctx.admin.from("orchestrator_profiles").select("id,name,surface").eq("workspace_id", ctx.workspace.id).order("name"),
+    ctx.admin.from("workspace_orchestrator_agents").select("agent_id,agents!workspace_orchestrator_agents_agent_id_fkey(name)").eq("workspace_id", ctx.workspace.id),
+    ctx.admin.from("workspace_skill_artifacts").select("id,name,slug,relative_path").eq("workspace_id", ctx.workspace.id).eq("artifact_type", "skill").neq("lifecycle", "archived").order("name"),
+    ctx.admin.from("workspace_secret_profile_grants").select("secret_id,profile_id").eq("workspace_id", ctx.workspace.id),
+    ctx.admin.from("workspace_secret_agent_grants").select("secret_id,agent_id").eq("workspace_id", ctx.workspace.id),
+    ctx.admin.from("workspace_secret_artifact_grants").select("secret_id,artifact_id").eq("workspace_id", ctx.workspace.id),
+    ctx.admin.from("workspace_secret_device_readiness").select("secret_id,device_id,configured").eq("workspace_id", ctx.workspace.id),
+  ]);
+  for (const result of [secrets, profiles, workers, skills, profileGrants, workerGrants, skillGrants, readiness]) {
+    if (result.error) throw new Error(result.error.message);
+  }
+  const matches = (item: Record<string, unknown>) => !query || Object.values(item).some((value) => asString(value).toLowerCase().includes(query));
+  return {
+    workspaceId: ctx.workspace.id,
+    secrets: ((secrets.data || []) as Array<Record<string, unknown>>).filter(matches),
+    minds: profiles.data || [],
+    workers: (workers.data || []).map((row) => {
+      const relation = Array.isArray(row.agents) ? row.agents[0] : row.agents;
+      return { id: asString(row.agent_id), name: asString(relation?.name) || "Worker" };
+    }),
+    skills: skills.data || [],
+    grants: {
+      minds: profileGrants.data || [],
+      workers: workerGrants.data || [],
+      skills: skillGrants.data || [],
+    },
+    readiness: readiness.data || [],
+    note: "Secret values are never returned. Readiness only reports whether a device has a configured value.",
+  };
+}
+
+export async function setWorkspaceSecretAssignmentForUser(input: {
+  userId: string;
+  workspaceId: string;
+  secretId: string;
+  destination: "mind" | "worker" | "skill";
+  destinationId: string;
+  enabled: boolean;
+}) {
+  const ctx = await getContextForUser(input.userId, true, input.workspaceId);
+  const secretId = asString(input.secretId);
+  const destinationId = asString(input.destinationId);
+  if (!secretId || !destinationId) throw new Error("Secret and assignment destination are required");
+  const { data: secret, error: secretError } = await ctx.admin.from("workspace_secret_definitions").select("id,name,key").eq("workspace_id", ctx.workspace.id).eq("id", secretId).maybeSingle();
+  if (secretError) throw new Error(secretError.message);
+  if (!secret) throw new Error("Secret declaration not found");
+  const target = input.destination === "mind"
+    ? { table: "workspace_secret_profile_grants", column: "profile_id", validation: ctx.admin.from("orchestrator_profiles").select("id,name").eq("workspace_id", ctx.workspace.id).eq("id", destinationId).maybeSingle() }
+    : input.destination === "worker"
+      ? { table: "workspace_secret_agent_grants", column: "agent_id", validation: ctx.admin.from("workspace_orchestrator_agents").select("agent_id").eq("workspace_id", ctx.workspace.id).eq("agent_id", destinationId).maybeSingle() }
+      : { table: "workspace_secret_artifact_grants", column: "artifact_id", validation: ctx.admin.from("workspace_skill_artifacts").select("id,name").eq("workspace_id", ctx.workspace.id).eq("artifact_type", "skill").eq("id", destinationId).maybeSingle() };
+  const validation = await target.validation;
+  if (validation.error) throw new Error(validation.error.message);
+  if (!validation.data) throw new Error("Assignment destination not found in this workspace");
+  if (input.enabled) {
+    const { error } = await ctx.admin.from(target.table).upsert({ workspace_id: ctx.workspace.id, secret_id: secretId, [target.column]: destinationId, created_by: ctx.userId }, { onConflict: `secret_id,${target.column}` });
+    if (error) throw new Error(error.message);
+  } else {
+    const { error } = await ctx.admin.from(target.table).delete().eq("workspace_id", ctx.workspace.id).eq("secret_id", secretId).eq(target.column, destinationId);
+    if (error) throw new Error(error.message);
+  }
+  await audit(ctx, input.enabled ? "workspace_secret_assignment_set" : "workspace_secret_assignment_removed", {
+    artifactId: input.destination === "skill" ? destinationId : undefined,
+    metadata: { secretId, secretKey: secret.key, destination: input.destination, destinationId },
+  });
+  return { ok: true, secret: { id: secret.id, name: secret.name, key: secret.key }, destination: input.destination, destinationId, enabled: input.enabled };
 }
 
 export async function listSkillsAndDocsForUser(input: {
   userId: string;
+  workspaceId?: string | null;
   query?: string;
 }) {
-  const ctx = await getContextForUser(input.userId, false);
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
   const query = asString(input.query).toLowerCase();
   const [{ data: artifacts, error: artifactError }, { data: assignments, error: assignmentError }] =
     await Promise.all([
@@ -1058,7 +1262,7 @@ export async function listSkillsAndDocsForUser(input: {
   if (assignmentError) throw new Error(assignmentError.message);
   const filtered = ((artifacts || []) as Array<Record<string, unknown>>).filter((artifact) => {
     if (!query) return true;
-    return [artifact.name, artifact.slug, artifact.description, artifact.relative_path]
+    return [artifact.id, artifact.name, artifact.slug, artifact.description, artifact.relative_path]
       .map((value) => asString(value).toLowerCase())
       .some((value) => value.includes(query));
   });
@@ -1067,6 +1271,432 @@ export async function listSkillsAndDocsForUser(input: {
     role: ctx.workspace.role,
     artifacts: filtered,
     assignments: assignments || [],
+  };
+}
+
+async function assertChannelSkillManager(
+  ctx: AuthedContext,
+  input: { channelId: string; actorUserId: string },
+) {
+  const channelId = asString(input.channelId);
+  const actorUserId = asString(input.actorUserId);
+  if (!channelId || !actorUserId) {
+    throw new Error("Channel skill management context is incomplete.");
+  }
+  const [{ data: channel, error: channelError }, { data: membership, error: membershipError }] =
+    await Promise.all([
+      ctx.admin
+        .from("chat_channels")
+        .select("id,workspace_id,kind,is_archived,created_by")
+        .eq("id", channelId)
+        .eq("workspace_id", ctx.workspace.id)
+        .maybeSingle(),
+      ctx.admin
+        .from("workspace_members")
+        .select("role")
+        .eq("workspace_id", ctx.workspace.id)
+        .eq("user_id", actorUserId)
+        .maybeSingle(),
+    ]);
+  if (channelError) throw new Error(channelError.message);
+  if (membershipError) throw new Error(membershipError.message);
+  if (!channel || channel.kind !== "channel" || channel.is_archived === true) {
+    throw new Error("Channel skills are unavailable for this conversation.");
+  }
+  const workspaceRole =
+    membership?.role === "admin"
+      ? "admin"
+      : membership?.role === "member"
+        ? "member"
+        : membership?.role === "guest"
+          ? "guest"
+          : null;
+  if (
+    !canManageChannelSkills({
+      actorUserId,
+      channelCreatedBy: asString(channel.created_by),
+      workspaceRole,
+    })
+  ) {
+    throw new Error(
+      "Only a workspace admin or this channel's full-member creator can manage channel skills.",
+    );
+  }
+  return { channel, workspaceRole };
+}
+
+export async function listChannelSkillsForUser(input: {
+  userId: string;
+  workspaceId: string;
+  channelId: string;
+  actorUserId: string;
+  query?: string;
+}) {
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
+  const access = await assertChannelSkillManager(ctx, input);
+  const query = asString(input.query).toLowerCase();
+  const [{ data: artifacts, error: artifactError }, { data: assignments, error: assignmentError }] =
+    await Promise.all([
+      ctx.admin
+        .from("workspace_skill_artifacts")
+        .select("id,artifact_type,slug,name,description,relative_path,targets,lifecycle")
+        .eq("workspace_id", ctx.workspace.id)
+        .eq("lifecycle", "active")
+        .order("name", { ascending: true }),
+      ctx.admin
+        .from("chat_channel_skill_assignments")
+        .select("id,artifact_id,created_at")
+        .eq("channel_id", input.channelId),
+    ]);
+  if (artifactError) throw new Error(artifactError.message);
+  if (assignmentError) throw new Error(assignmentError.message);
+  const assignedIds = new Set(
+    (assignments || []).map((assignment) => asString(assignment.artifact_id)),
+  );
+  const items = ((artifacts || []) as Array<Record<string, unknown>>)
+    .filter((artifact) => {
+      const targets = normalizeTargets(artifact.targets);
+      if (!targets.includes("all") && !targets.includes("flow")) return false;
+      if (!query) return true;
+      return [artifact.id, artifact.name, artifact.slug, artifact.description, artifact.relative_path]
+        .map((value) => asString(value).toLowerCase())
+        .some((value) => value.includes(query));
+    })
+    .map((artifact) => ({
+      ...assignedSkillCatalogItem(artifact),
+      assigned: assignedIds.has(asString(artifact.id)),
+    }));
+  const { data: repositories, error: repositoriesError } =
+    access.workspaceRole === "admin"
+      ? await ctx.admin
+          .from("workspace_skill_repositories")
+          .select("id,label,status,updated_at")
+          .eq("workspace_id", ctx.workspace.id)
+          .eq("status", "active")
+          .order("updated_at", { ascending: false })
+      : { data: [], error: null };
+  if (repositoriesError) throw new Error(repositoriesError.message);
+  return {
+    items,
+    assignmentCount: assignedIds.size,
+    canCreateSkills: access.workspaceRole === "admin",
+    creationRepositories: (repositories || []).map((repository) => ({
+      id: asString(repository.id),
+      label: asString(repository.label) || "Skills repository",
+    })),
+  };
+}
+
+export async function setChannelSkillAssignmentForUser(input: {
+  userId: string;
+  workspaceId: string;
+  channelId: string;
+  actorUserId: string;
+  artifactId: string;
+  enabled: boolean;
+}) {
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
+  await assertChannelSkillManager(ctx, input);
+  const artifactId = asString(input.artifactId);
+  const { data: artifact, error: artifactError } = await ctx.admin
+    .from("workspace_skill_artifacts")
+    .select("id,artifact_type,slug,name,description,relative_path,targets,lifecycle")
+    .eq("id", artifactId)
+    .eq("workspace_id", ctx.workspace.id)
+    .eq("lifecycle", "active")
+    .maybeSingle();
+  if (artifactError) throw new Error(artifactError.message);
+  if (!artifact) throw new Error("Skill or instruction doc not found.");
+  const targets = normalizeTargets(artifact.targets);
+  if (!targets.includes("all") && !targets.includes("flow")) {
+    throw new Error("This capability is not available to Team Chat.");
+  }
+
+  if (!input.enabled) {
+    const { error } = await ctx.admin
+      .from("chat_channel_skill_assignments")
+      .delete()
+      .eq("channel_id", input.channelId)
+      .eq("workspace_id", ctx.workspace.id)
+      .eq("artifact_id", artifactId);
+    if (error) throw new Error(error.message);
+  } else {
+    const { error } = await ctx.admin
+      .from("chat_channel_skill_assignments")
+      .upsert(
+        {
+          channel_id: input.channelId,
+          workspace_id: ctx.workspace.id,
+          artifact_id: artifactId,
+          added_by: input.actorUserId,
+        },
+        { onConflict: "channel_id,artifact_id", ignoreDuplicates: true },
+      );
+    if (error) throw new Error(error.message);
+  }
+
+  await ctx.admin.from("workspace_skill_audit_events").insert({
+    workspace_id: ctx.workspace.id,
+    actor_user_id: input.actorUserId,
+    event_type: input.enabled
+      ? "channel_skill_assignment_set"
+      : "channel_skill_assignment_removed",
+    artifact_id: artifactId,
+    metadata: { channelId: input.channelId },
+  });
+  return {
+    item: assignedSkillCatalogItem(artifact as Record<string, unknown>),
+    enabled: input.enabled,
+  };
+}
+
+export async function createChannelSkillForUser(input: {
+  userId: string;
+  workspaceId: string;
+  channelId: string;
+  actorUserId: string;
+  deviceId: string;
+  name: string;
+  description: string;
+  instructions: string;
+  actionsManifest?: string | null;
+  repository?: string | null;
+}) {
+  // The runtime owner supplies the connector, but the human actor remains the
+  // authorization and audit subject for this workspace-wide Git write.
+  const ctx = await getContextForUser(input.userId, true, input.workspaceId);
+  const access = await assertChannelSkillManager(ctx, input);
+  if (access.workspaceRole !== "admin") {
+    throw new Error(
+      "Only a workspace admin can author a new shared skill. Channel creators can assign existing skills.",
+    );
+  }
+  const deviceId = asString(input.deviceId);
+  if (!deviceId) {
+    throw new Error(
+      "The Groovy Connector must be online to create and push a Git-backed skill.",
+    );
+  }
+  const skill = buildChannelSkillArtifact(input);
+  const { data: repositoryRows, error: repositoriesError } = await ctx.admin
+    .from("workspace_skill_repositories")
+    .select("id,label,repo_url,status,updated_at")
+    .eq("workspace_id", ctx.workspace.id)
+    .eq("status", "active")
+    .order("updated_at", { ascending: false });
+  if (repositoriesError) throw new Error(repositoriesError.message);
+  const repository = resolveChannelSkillRepository(
+    ((repositoryRows || []) as Array<Record<string, unknown>>).map((row) => ({
+      id: asString(row.id),
+      label: asString(row.label) || defaultLabelForRepo(asString(row.repo_url)),
+      repoUrl: asString(row.repo_url),
+    })),
+    input.repository,
+  );
+
+  const createResult = await createSkillsArtifactWithContext(
+    ctx,
+    {
+      repositoryId: repository.id,
+      deviceId,
+      artifactType: "skill",
+      relativePath: skill.relativePath,
+      content: skill.content,
+      name: skill.name,
+      description: skill.description,
+      targets: ["flow"],
+      overwrite: false,
+      commitMessage: `Add channel skill ${skill.name}`,
+      companionFiles:
+        skill.actionsRelativePath && skill.actionsContent
+          ? [
+              {
+                relativePath: skill.actionsRelativePath,
+                content: skill.actionsContent,
+              },
+            ]
+          : [],
+    },
+    input.actorUserId,
+  );
+  if (createResult.ok !== true) {
+    const code = asString(createResult.error || createResult.error_code);
+    if (code.includes("unsupported_skills_rpc")) {
+      throw new Error(
+        "Update Groovy Desktop and its Connector to v0.24.33 or newer before creating an executable skill.",
+      );
+    }
+    if (code === "artifact_already_exists") {
+      throw new Error(
+        `A skill already exists at ${skill.relativePath}. Choose a distinct skill name or assign the existing skill.`,
+      );
+    }
+    throw new Error(code || "The connector could not create and push the skill.");
+  }
+  const syncResult = asRecord(createResult.syncResult);
+  if (syncResult.ok !== true) {
+    throw new Error(
+      `The skill was written to the Git checkout, but Skills & Docs could not sync it: ${
+        asString(syncResult.error) || "repository sync failed"
+      }`,
+    );
+  }
+
+  const { data: artifact, error: artifactError } = await ctx.admin
+    .from("workspace_skill_artifacts")
+    .select("id,artifact_type,slug,name,description,relative_path,targets,lifecycle")
+    .eq("workspace_id", ctx.workspace.id)
+    .eq("repository_id", repository.id)
+    .eq("relative_path", skill.relativePath)
+    .eq("lifecycle", "active")
+    .maybeSingle();
+  if (artifactError) throw new Error(artifactError.message);
+  if (!artifact?.id) {
+    throw new Error(
+      "The skill was pushed, but its synced Skills & Docs artifact could not be resolved.",
+    );
+  }
+
+  const assignment = await setChannelSkillAssignmentForUser({
+    userId: input.userId,
+    workspaceId: input.workspaceId,
+    channelId: input.channelId,
+    actorUserId: input.actorUserId,
+    artifactId: String(artifact.id),
+    enabled: true,
+  });
+  return {
+    ...assignment,
+    repository: { id: repository.id, label: repository.label },
+    relativePath: skill.relativePath,
+    actionsRelativePath: skill.actionsRelativePath,
+    commitSha: asString(createResult.commitSha || syncResult.commitSha) || null,
+  };
+}
+
+export async function updateChannelSkillActionsForUser(input: {
+  userId: string;
+  workspaceId: string;
+  channelId: string;
+  actorUserId: string;
+  deviceId: string;
+  artifact: string;
+  actionsManifest: string;
+}) {
+  const ctx = await getContextForUser(input.userId, true, input.workspaceId);
+  const access = await assertChannelSkillManager(ctx, input);
+  if (access.workspaceRole !== "admin") {
+    throw new Error(
+      "Only a workspace admin can update executable actions for a shared skill.",
+    );
+  }
+  const deviceId = asString(input.deviceId);
+  if (!deviceId) {
+    throw new Error(
+      "The Groovy Connector must be online to update a Git-backed skill.",
+    );
+  }
+  const actionsContent = normalizeChannelSkillActionsManifest(
+    input.actionsManifest,
+  );
+  if (!actionsContent) throw new Error("A complete groovy-actions.json is required.");
+
+  const [artifactsResult, assignmentsResult] = await Promise.all([
+    ctx.admin
+      .from("workspace_skill_artifacts")
+      .select(
+        "id,repository_id,artifact_type,slug,name,description,relative_path,targets,lifecycle,content_snapshot",
+      )
+      .eq("workspace_id", ctx.workspace.id)
+      .eq("artifact_type", "skill")
+      .eq("lifecycle", "active"),
+    ctx.admin
+      .from("chat_channel_skill_assignments")
+      .select("artifact_id")
+      .eq("workspace_id", ctx.workspace.id)
+      .eq("channel_id", input.channelId),
+  ]);
+  const { data: rows, error } = artifactsResult;
+  if (error) throw new Error(error.message);
+  if (assignmentsResult.error) throw new Error(assignmentsResult.error.message);
+  const assignedIds = new Set(
+    (assignmentsResult.data || []).map((row) => asString(row.artifact_id)),
+  );
+  const assignedRows = ((rows || []) as Array<Record<string, unknown>>).filter(
+    (row) => assignedIds.has(asString(row.id)),
+  );
+  const items = assignedRows.map(
+    assignedSkillCatalogItem,
+  );
+  const resolved = resolveAssignedSkillReference(items, input.artifact);
+  if (!resolved.ok) throw new Error(resolved.error.replace("assigned capabilities", "skills"));
+  const artifact = assignedRows.find(
+    (row) => asString(row.id) === resolved.item.id,
+  );
+  if (!artifact) throw new Error("Skill not found.");
+  const relativePath = asString(artifact.relative_path);
+  const content = asString(artifact.content_snapshot);
+  const repositoryId = asString(artifact.repository_id);
+  if (!relativePath || !content || !repositoryId) {
+    throw new Error(
+      "This skill has no synchronized Git source. Sync its repository before adding actions.",
+    );
+  }
+  const actionsRelativePath = `${relativePath.slice(0, -"SKILL.md".length)}groovy-actions.json`;
+  const updateResult = await createSkillsArtifactWithContext(
+    ctx,
+    {
+      repositoryId,
+      deviceId,
+      artifactType: "skill",
+      relativePath,
+      content,
+      name: asString(artifact.name),
+      description: asString(artifact.description),
+      targets: normalizeTargets(artifact.targets),
+      overwrite: true,
+      preservePrimary: true,
+      commitMessage: `Update actions for ${asString(artifact.name) || asString(artifact.slug) || "skill"}`,
+      companionFiles: [
+        { relativePath: actionsRelativePath, content: actionsContent },
+      ],
+    },
+    input.actorUserId,
+  );
+  if (updateResult.ok !== true) {
+    const code = asString(updateResult.error || updateResult.error_code);
+    if (code.includes("unsupported_skills_rpc")) {
+      throw new Error(
+        "Update Groovy Desktop and its Connector to v0.24.33 or newer before adding executable skill actions.",
+      );
+    }
+    throw new Error(
+      code ||
+        "The Connector could not update the skill action manifest.",
+    );
+  }
+  const syncResult = asRecord(updateResult.syncResult);
+  if (syncResult.ok !== true) {
+    throw new Error(
+      `The manifest was written, but Skills & Docs could not sync it: ${
+        asString(syncResult.error) || "repository sync failed"
+      }`,
+    );
+  }
+  const { data: refreshed, error: refreshedError } = await ctx.admin
+    .from("workspace_skill_artifacts")
+    .select("id,artifact_type,slug,name,description,relative_path,targets,lifecycle,metadata")
+    .eq("id", resolved.item.id)
+    .eq("workspace_id", ctx.workspace.id)
+    .maybeSingle();
+  if (refreshedError) throw new Error(refreshedError.message);
+  if (!refreshed) throw new Error("The updated skill could not be resolved after sync.");
+  return {
+    item: assignedSkillCatalogItem(refreshed as Record<string, unknown>),
+    relativePath,
+    actionsRelativePath,
+    commitSha:
+      asString(updateResult.commitSha || syncResult.commitSha) || null,
   };
 }
 
@@ -1239,7 +1869,7 @@ async function loadAssignedArtifactsForTarget(
   }
   const { data: assignments, error: assignmentErr } = await ctx.admin
     .from("workspace_skill_assignments")
-    .select("id,artifact_id,agent_id,profile_id,target,scope,workspace_skill_artifacts!inner(id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,metadata,risk_flags,content_snapshot,content_snapshot_truncated,content_snapshot_updated_at)")
+    .select("id,artifact_id,agent_id,profile_id,target,scope,workspace_skill_artifacts!inner(id,repository_id,artifact_type,slug,name,description,relative_path,exact_filename,targets,checksum,commit_sha,lifecycle,metadata,risk_flags,content_snapshot,content_snapshot_truncated,content_snapshot_updated_at)")
     .eq("workspace_id", ctx.workspace.id)
     .eq("enabled", true)
     .in("target", ["all", target]);
@@ -1254,7 +1884,13 @@ async function loadAssignedArtifactsForTarget(
   });
   const assignedArtifacts = selected
     .map((row) => row.workspace_skill_artifacts)
-    .filter((row): row is Record<string, unknown> => !!row && typeof row === "object" && !Array.isArray(row))
+    .filter(
+      (row): row is Record<string, unknown> =>
+        !!row &&
+        typeof row === "object" &&
+        !Array.isArray(row) &&
+        (row as Record<string, unknown>).lifecycle === "active",
+    );
   const additionalArtifactIds = Array.from(
     new Set(
       (input.additionalArtifactIds || []).map(asString).filter(Boolean),
@@ -1285,6 +1921,131 @@ async function loadAssignedArtifactsForTarget(
       ) === index,
   );
   return { target, agentId, artifacts };
+}
+
+function assignedSkillCatalogItem(
+  artifact: Record<string, unknown>,
+): AssignedSkillCatalogItem {
+  const metadata = asRecord(artifact.metadata);
+  const actionsManifest = asRecord(metadata.groovyActions);
+  const actions = asArray(actionsManifest.actions)
+    .map(asRecord)
+    .map((action) => ({
+      name: asString(action.name),
+      description: asString(action.description),
+      secrets: asArray(action.secrets).map(asString).filter(Boolean),
+    }))
+    .filter((action) => action.name);
+  return {
+    id: asString(artifact.id),
+    artifactType:
+      asString(artifact.artifact_type) === "instruction_doc"
+        ? "instruction_doc"
+        : "skill",
+    slug: asString(artifact.slug),
+    name:
+      asString(artifact.name) ||
+      asString(artifact.slug) ||
+      asString(artifact.relative_path),
+    description: asString(artifact.description),
+    relativePath: asString(artifact.relative_path),
+    ...(actions.length ? { actions } : {}),
+  };
+}
+
+export async function resolveAssignedSkillActionForUser(input: {
+  userId: string;
+  workspaceId?: string | null;
+  agentId?: string | null;
+  profileId?: string | null;
+  additionalArtifactIds?: string[];
+  target: "flow" | "claude" | "codex";
+  artifact: string;
+  action: string;
+  args: Record<string, unknown>;
+  deviceId: string;
+}) {
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
+  const { artifacts } = await loadAssignedArtifactsForTarget(ctx, input);
+  const reference = input.artifact.trim().toLowerCase();
+  const matches = artifacts.filter((artifact) =>
+    [artifact.id, artifact.name, artifact.slug, artifact.relative_path]
+      .map(asString).some((value) => value.toLowerCase() === reference),
+  );
+  if (matches.length !== 1) throw new Error(matches.length ? "Skill reference is ambiguous" : "Skill is not assigned to this Mind or channel");
+  const artifact = matches[0];
+  const manifest = asRecord(asRecord(artifact.metadata).groovyActions);
+  const action = asArray(manifest.actions).map(asRecord).find((item) => asString(item.name) === input.action);
+  if (!action) throw new Error("This action is not declared by the assigned skill");
+  const requiredKeys = Array.from(new Set(asArray(action.secrets).map(asString).filter(Boolean)));
+  const artifactId = asString(artifact.id);
+  const profileId = asString(input.profileId || "");
+  const agentId = asString(input.agentId || "");
+  if (!profileId && !agentId) throw new Error("Secret-backed actions require an explicitly selected Mind or worker");
+
+  const { data: artifactGrants, error: artifactGrantError } = await ctx.admin
+    .from("workspace_secret_artifact_grants")
+    .select("secret_id,workspace_secret_definitions!inner(id,key,name)")
+    .eq("workspace_id", ctx.workspace.id)
+    .eq("artifact_id", artifactId);
+  if (artifactGrantError) throw new Error(artifactGrantError.message);
+  const candidates = (artifactGrants || []).map((row) => {
+    const definition = Array.isArray(row.workspace_secret_definitions) ? row.workspace_secret_definitions[0] : row.workspace_secret_definitions;
+    return { id: asString(row.secret_id), key: asString(definition?.key), name: asString(definition?.name) };
+  }).filter((item) => requiredKeys.includes(item.key));
+  const candidateIds = candidates.map((item) => item.id);
+  const targetQuery = profileId
+    ? ctx.admin.from("workspace_secret_profile_grants").select("secret_id").eq("workspace_id", ctx.workspace.id).eq("profile_id", profileId).in("secret_id", candidateIds.length ? candidateIds : ["00000000-0000-0000-0000-000000000000"])
+    : ctx.admin.from("workspace_secret_agent_grants").select("secret_id").eq("workspace_id", ctx.workspace.id).eq("agent_id", agentId).in("secret_id", candidateIds.length ? candidateIds : ["00000000-0000-0000-0000-000000000000"]);
+  const { data: targetGrants, error: targetGrantError } = await targetQuery;
+  if (targetGrantError) throw new Error(targetGrantError.message);
+  const targetGranted = new Set((targetGrants || []).map((row) => asString(row.secret_id)));
+  const bindings = candidates.filter((item) => targetGranted.has(item.id));
+  const missing = requiredKeys.filter((key) => !bindings.some((item) => item.key === key));
+  if (missing.length) throw new Error(`Required secrets are not assigned to both this skill and ${profileId ? "Mind" : "worker"}: ${missing.join(", ")}`);
+  if (bindings.length) {
+    const { data: readiness, error: readinessError } = await ctx.admin.from("workspace_secret_device_readiness").select("secret_id,configured").eq("workspace_id", ctx.workspace.id).eq("device_id", input.deviceId).in("secret_id", bindings.map((item) => item.id));
+    if (readinessError) throw new Error(readinessError.message);
+    const ready = new Set((readiness || []).filter((row) => row.configured).map((row) => asString(row.secret_id)));
+    const unavailable = bindings.filter((item) => !ready.has(item.id));
+    if (unavailable.length) throw new Error(`Configure these secrets on the selected Connector: ${unavailable.map((item) => item.key).join(", ")}`);
+  }
+  const { data: repository, error: repoError } = await ctx.admin.from("workspace_skill_repositories").select("repo_url,default_ref").eq("workspace_id", ctx.workspace.id).eq("id", asString(artifact.repository_id)).single();
+  if (repoError) throw new Error(repoError.message);
+  return {
+    __connector_execute__: true as const,
+    type: "skill_action_execute",
+    params: { workspace_id: ctx.workspace.id, repo_url: repository.repo_url, ref: repository.default_ref, relative_path: asString(artifact.relative_path), action: input.action, args: input.args, secret_bindings: bindings },
+    toolName: "run_skill_action",
+    agent: "skills",
+    message: `Running ${input.action} locally…`,
+  };
+}
+
+async function listAssignedSkillsCatalogWithContext(
+  ctx: AuthedContext,
+  input: {
+    agentId?: string | null;
+    profileId?: string | null;
+    additionalArtifactIds?: string[];
+    target: "flow" | "claude" | "codex";
+  },
+): Promise<{ items: AssignedSkillCatalogItem[]; artifactCount: number }> {
+  const { artifacts } = await loadAssignedArtifactsForTarget(ctx, input);
+  const items = artifacts.map(assignedSkillCatalogItem);
+  return { items, artifactCount: items.length };
+}
+
+export async function listAssignedSkillsCatalogForUser(input: {
+  userId: string;
+  workspaceId?: string | null;
+  agentId?: string | null;
+  profileId?: string | null;
+  additionalArtifactIds?: string[];
+  target: "flow" | "claude" | "codex";
+}): Promise<{ items: AssignedSkillCatalogItem[]; artifactCount: number }> {
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
+  return listAssignedSkillsCatalogWithContext(ctx, input);
 }
 
 async function preflightAgentSkillsWithContext(
@@ -1373,6 +2134,7 @@ async function buildAssignedSkillsPromptContextWithContext(
     deviceId: string;
     agentId?: string | null;
     profileId?: string | null;
+    additionalArtifactIds?: string[];
     target: "flow" | "claude" | "codex";
   }
 ): Promise<{ text: string; artifactCount: number }> {
@@ -1382,10 +2144,10 @@ async function buildAssignedSkillsPromptContextWithContext(
 
   const repoIds = Array.from(new Set(artifacts.map((artifact) => asString(artifact.repository_id)).filter(Boolean)));
   const [reposRes, syncsRes] = await Promise.all([
-    repoIds.length && deviceId
+    repoIds.length
       ? ctx.admin
           .from("workspace_skill_repositories")
-          .select("id,label,repo_url,last_commit_sha")
+          .select("id,label,last_commit_sha")
           .eq("workspace_id", ctx.workspace.id)
           .in("id", repoIds)
       : Promise.resolve({ data: [], error: null }),
@@ -1425,34 +2187,10 @@ async function buildAssignedSkillsPromptContextWithContext(
     }
   }
 
-  const materializedPaths = Array.from(new Set(pathByRepoAndRel.values())).slice(0, 20);
-  const contentByPath = new Map<string, { content: string; truncated: boolean }>();
-  if (deviceId && materializedPaths.length > 0) {
-    const readResult = await callSkillsConnectorRpc({
-      ctx,
-      deviceId,
-      rpcType: "skills_assigned_context_read",
-      timeoutMs: 30_000,
-      payload: { paths: materializedPaths },
-    });
-    if (readResult.ok === true) {
-      for (const raw of asArray(readResult.items)) {
-        const item = asRecord(raw);
-        const itemPath = asString(item.path);
-        const content = typeof item.content === "string" ? item.content : "";
-        if (item.ok === true && itemPath && content) {
-          contentByPath.set(itemPath, {
-            content,
-            truncated: item.truncated === true,
-          });
-        }
-      }
-    }
-  }
-
   const lines = [
-    "## Groovy Skills Manager Context",
-    "Use these explicitly assigned capabilities when relevant. Git is the source of truth; Groovy uses the local connector copy when available and otherwise the bounded server snapshot created by the latest sync.",
+    "## Enabled Skills & Docs (local catalog only)",
+    "The entries below are enabled for this worker, but their bodies are not included in this prompt.",
+    "Before starting a task for which an entry clearly applies, read that exact local file first and follow it. Do not read capabilities for unrelated tasks.",
   ];
 
   for (const artifact of artifacts.slice(0, 20)) {
@@ -1461,46 +2199,161 @@ async function buildAssignedSkillsPromptContextWithContext(
     const sync = syncByRepo.get(repoId);
     const relativePath = asString(artifact.relative_path);
     const localPath = pathByRepoAndRel.get(`${repoId}:${relativePath}`);
-    const snapshot =
-      typeof artifact.content_snapshot === "string"
-        ? artifact.content_snapshot
-        : "";
-    const snapshotTruncated = artifact.content_snapshot_truncated === true;
     const kind = asString(artifact.artifact_type) === "skill" ? "Skill" : "Instruction";
     const label = asString(artifact.name) || asString(artifact.slug) || relativePath;
     const repoLabel = asString(repo?.label) || "skills repo";
     const commit = asString(sync?.commit_sha || artifact.commit_sha || repo?.last_commit_sha);
     if (localPath) {
-      const localContent = contentByPath.get(localPath);
+      const readablePath =
+        kind === "Skill"
+          ? `${localPath.replace(/[\\/]+$/, "")}/SKILL.md`
+          : localPath;
       lines.push(
-        `\n### ${kind}: ${label}\nSource: ${repoLabel} at ${commit ? commit.slice(0, 8) : "unsynced"} (${localPath})`
-      );
-      if (localContent) {
-        lines.push(
-          `<assigned_artifact>\n${localContent.content}\n${localContent.truncated ? "\n[Content truncated by Groovy's context limit.]" : ""}\n</assigned_artifact>`
-        );
-      } else if (snapshot) {
-        lines.push(
-          `<assigned_artifact>\n${snapshot}\n${snapshotTruncated ? "\n[Content truncated by Groovy's snapshot limit.]" : ""}\n</assigned_artifact>`,
-        );
-      } else {
-        lines.push("The assigned body could not be read. Do not claim this assignment was applied.");
-      }
-    } else if (snapshot) {
-      lines.push(
-        `\n### ${kind}: ${label}\nSource: ${repoLabel} at ${commit ? commit.slice(0, 8) : "unsynced"} (server snapshot)`,
-      );
-      lines.push(
-        `<assigned_artifact>\n${snapshot}\n${snapshotTruncated ? "\n[Content truncated by Groovy's snapshot limit.]" : ""}\n</assigned_artifact>`,
+        `- ${kind}: ${label} — ${asString(artifact.description) || "No description provided."} [${repoLabel} at ${commit ? commit.slice(0, 8) : "unsynced"}; local path: ${readablePath}]`,
       );
     } else {
       lines.push(
-        `- ${kind}: ${label} (${repoLabel}) is assigned but has no readable snapshot yet. Ask a workspace admin to sync the Skills library.`
+        `- ${kind}: ${label} (${repoLabel}) is enabled but has no readable local path. Do not claim it was applied.`,
       );
     }
   }
 
   return { text: `${lines.join("\n")}\n`, artifactCount: artifacts.length };
+}
+
+async function readAssignedSkillWithContext(
+  ctx: AuthedContext,
+  input: {
+    artifact: string;
+    deviceId?: string | null;
+    agentId?: string | null;
+    profileId?: string | null;
+    additionalArtifactIds?: string[];
+    target: "flow" | "claude" | "codex";
+  },
+) {
+  const { target, agentId, artifacts } = await loadAssignedArtifactsForTarget(
+    ctx,
+    input,
+  );
+  const catalog = artifacts.map(assignedSkillCatalogItem);
+  const resolved = resolveAssignedSkillReference(catalog, input.artifact);
+  if (!resolved.ok) throw new Error(resolved.error);
+  const artifact = artifacts.find(
+    (candidate) => asString(candidate.id) === resolved.item.id,
+  );
+  if (!artifact) throw new Error("Assigned capability is unavailable.");
+
+  const deviceId = asString(input.deviceId || "");
+  const repositoryId = asString(artifact.repository_id);
+  let content = "";
+  let source = "server_snapshot";
+  let truncated = artifact.content_snapshot_truncated === true;
+
+  if (deviceId && repositoryId) {
+    try {
+      const repo = await getRepository(ctx, repositoryId);
+      const materialized = await callSkillsConnectorRpc({
+        ctx,
+        deviceId,
+        rpcType: "skills_artifact_materialize",
+        timeoutMs: 3 * 60 * 1000,
+        payload: {
+          repository_id: repositoryId,
+          workspace_id: ctx.workspace.id,
+          repo_url: asString(repo.repo_url),
+          ref: asString(repo.default_ref) || "main",
+          target,
+          agent_id: agentId,
+          artifacts: [
+            {
+              id: asString(artifact.id),
+              artifact_type: asString(artifact.artifact_type),
+              slug: asString(artifact.slug),
+              name: asString(artifact.name),
+              relative_path: asString(artifact.relative_path),
+              exact_filename: asString(artifact.exact_filename),
+              checksum: asString(artifact.checksum),
+            },
+          ],
+        },
+      });
+      await recordSyncResult({
+        ctx,
+        repositoryId,
+        deviceId,
+        operation: "materialize",
+        result: materialized,
+        artifactCount: 1,
+      });
+      const materializedItem = asArray(materialized.artifacts)
+        .map(asRecord)
+        .find(
+          (item) =>
+            item.ok === true &&
+            asString(item.relativePath || item.relative_path) ===
+              asString(artifact.relative_path),
+        );
+      const localPath = asString(materializedItem?.path);
+      if (localPath) {
+        const readResult = await callSkillsConnectorRpc({
+          ctx,
+          deviceId,
+          rpcType: "skills_assigned_context_read",
+          timeoutMs: 30_000,
+          payload: { paths: [localPath] },
+        });
+        const readItem = asArray(readResult.items).map(asRecord)[0];
+        if (readItem?.ok === true && typeof readItem.content === "string") {
+          content = readItem.content;
+          truncated = readItem.truncated === true;
+          source = "local_connector";
+        }
+      }
+    } catch (error) {
+      console.warn("[skills-manager] assigned skill local read failed", {
+        artifactId: resolved.item.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (!content && typeof artifact.content_snapshot === "string") {
+    const bounded = truncateUtf8(artifact.content_snapshot, 32 * 1024);
+    content = bounded.value;
+    truncated = truncated || bounded.truncated;
+  }
+  if (!content) {
+    throw new Error(
+      "This enabled capability has no readable content. Ask a workspace admin to sync the Skills library.",
+    );
+  }
+
+  await audit(ctx, "assigned_skill_read", {
+    repositoryId,
+    artifactId: resolved.item.id,
+    metadata: { target, agentId, source, truncated },
+  });
+  return {
+    ...resolved.item,
+    source,
+    truncated,
+    content,
+  };
+}
+
+export async function readAssignedSkillForUser(input: {
+  userId: string;
+  workspaceId?: string | null;
+  artifact: string;
+  deviceId?: string | null;
+  agentId?: string | null;
+  profileId?: string | null;
+  additionalArtifactIds?: string[];
+  target: "flow" | "claude" | "codex";
+}) {
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
+  return readAssignedSkillWithContext(ctx, input);
 }
 
 export async function buildAssignedSkillsPromptContext(input: {
@@ -1516,12 +2369,13 @@ export async function buildAssignedSkillsPromptContext(input: {
 
 export async function buildAssignedSkillsPromptContextForUser(input: {
   userId: string;
+  workspaceId?: string | null;
   deviceId: string;
   agentId?: string | null;
   profileId?: string | null;
   additionalArtifactIds?: string[];
   target: "flow" | "claude" | "codex";
 }): Promise<{ text: string; artifactCount: number }> {
-  const ctx = await getContextForUser(input.userId, false);
+  const ctx = await getContextForUser(input.userId, false, input.workspaceId);
   return buildAssignedSkillsPromptContextWithContext(ctx, input);
 }

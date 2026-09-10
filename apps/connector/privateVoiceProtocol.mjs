@@ -1,0 +1,11 @@
+export function normalizePrivateVoiceProvider() { return null; }
+export function isPrivateVoiceProtocol() { return false; }
+export function privateVoiceDeviceSessionPath() { return ""; }
+export function isPrivateVoiceAudioDeltaEvent() { return false; }
+export function privateVoiceAudioTimeline() { return null; }
+export function isPrivateVoiceAssistantStartedEvent() { return false; }
+export function isPrivateVoiceAssistantFinishedEvent() { return false; }
+export function isPrivateVoiceAssistantTranscriptEvent() { return false; }
+export function isPrivateVoiceSessionClosedEvent() { return false; }
+export function createPrivateVoiceInputAudioEvent() { return {}; }
+export function createPrivateVoiceCloseEvent() { return {}; }

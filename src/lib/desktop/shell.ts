@@ -40,9 +40,14 @@ export type DesktopUiUpdateStatus = {
   revision?: string | null;
 };
 
+export type DesktopNativeNotificationPermission =
+  | NotificationPermission
+  | "unknown"
+  | "unsupported";
+
 export type DesktopNativeNotificationStatus = {
   supported: boolean;
-  permission: NotificationPermission | "unsupported";
+  permission: DesktopNativeNotificationPermission;
 };
 
 export type DesktopChatNotification = {
@@ -51,7 +56,29 @@ export type DesktopChatNotification = {
   title: string;
   body: string;
   url: string;
+  silent?: boolean;
 };
+
+export type DesktopNativeComposerShortcut = "mod-enter" | "mod-j";
+
+export type DesktopNativeAppAreaShortcut =
+  | "command-center"
+  | "chat"
+  | "email";
+
+export type DesktopNativeEmailShortcut =
+  | "escape"
+  | "open-shortcuts"
+  | "search"
+  | "compose"
+  | "next"
+  | "previous"
+  | "open-reply-all"
+  | "forward"
+  | "mark-done"
+  | "archive"
+  | "toggle-star"
+  | "mark-unread";
 
 export type DesktopSettings = {
   keepRunningInBackground: boolean;
@@ -72,10 +99,28 @@ export type GroovyDesktopApi = {
   onUiUpdateStatus: (cb: (status: DesktopUiUpdateStatus) => void) => () => void;
   reloadUi: () => Promise<void>;
   getNativeNotificationStatus: () => Promise<DesktopNativeNotificationStatus>;
+  testNativeNotification: () => Promise<{
+    requested: boolean;
+    reason?: string;
+  }>;
+  openNativeNotificationSettings: () => Promise<{
+    opened: boolean;
+    reason?: string;
+  }>;
   showChatNotification: (
     payload: DesktopChatNotification
   ) => Promise<{ shown: boolean; reason?: string }>;
+  setChatBadgeCount: (count: number) => Promise<{ updated: boolean }>;
   onSystemResume: (cb: () => void) => () => void;
+  onNativeComposerShortcut: (
+    cb: (shortcut: DesktopNativeComposerShortcut) => void
+  ) => () => void;
+  onNativeAppAreaShortcut: (
+    cb: (shortcut: DesktopNativeAppAreaShortcut) => void
+  ) => () => void;
+  onNativeEmailShortcut: (
+    cb: (shortcut: DesktopNativeEmailShortcut) => void
+  ) => () => void;
   getSettings: () => Promise<DesktopSettings>;
   setSetting: (
     key: keyof DesktopSettings,
@@ -116,11 +161,23 @@ const noopApi: GroovyDesktopApi = {
     supported: false,
     permission: "unsupported" as const,
   }),
+  testNativeNotification: async () => ({
+    requested: false,
+    reason: "desktop_update_required",
+  }),
+  openNativeNotificationSettings: async () => ({
+    opened: false,
+    reason: "desktop_update_required",
+  }),
   showChatNotification: async () => ({
     shown: false,
     reason: "desktop_update_required",
   }),
+  setChatBadgeCount: async () => ({ updated: false }),
   onSystemResume: () => () => {},
+  onNativeComposerShortcut: () => () => {},
+  onNativeAppAreaShortcut: () => () => {},
+  onNativeEmailShortcut: () => () => {},
   getSettings: async () => ({ keepRunningInBackground: true }),
   setSetting: async () => {},
   openLogs: async () => {},

@@ -56,6 +56,7 @@ import { CliAuthSection } from "@/components/onboarding/steps/CliAuthSection";
 import { WhatsAppStep, type WhatsAppMode } from "@/components/onboarding/steps/WhatsAppStep";
 import { TelegramStep } from "@/components/onboarding/steps/TelegramStep";
 import { MODEL_CATALOG } from "@/lib/ai/modelCatalog";
+import { isWorkspaceRequiredForAgentCreation } from "@/lib/agents/workspaceRequirement.mjs";
 import { useConnectorInstallGuide } from "@/lib/connector/installGuide";
 
 type HarnessStep =
@@ -109,7 +110,7 @@ const BRAIN_MODELS: Array<{
 const AGENT_NAME_SUGGESTIONS = ["Scout", "Forge", "Patch", "Nova", "Wrench", "Atlas"];
 
 const FIRST_TASK_PROMPT =
-  "List the 5 largest files in this workspace and suggest cleanups";
+  "List the 5 largest files in the current working directory and suggest cleanups";
 
 type OnboardingData = Record<string, unknown>;
 
@@ -167,9 +168,10 @@ const stepMotion = {
 type HarnessOnboardingProps = {
   onComplete: () => void;
   autoPair: DesktopAutoPairResult;
+  mobileUi: boolean;
 };
 
-export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingProps) {
+export function HarnessOnboarding({ onComplete, autoPair, mobileUi }: HarnessOnboardingProps) {
   const supabase = getSupabaseBrowserClient();
   const connectorInstallGuide = useConnectorInstallGuide();
 
@@ -194,7 +196,7 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
     relay: device.relay,
     activeDeviceId: device.activeDeviceId,
   });
-  const taskFeed = useAgentTasks({ userId });
+  const taskFeed = useAgentTasks({ userId, relay: device.relay });
   const settings = useSettingsState(userId);
   // ---- Step machine ----
   const [step, setStep] = useState<HarnessStep>("welcome");
@@ -341,14 +343,16 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
     agentHarness === "claude"
       ? device.capabilities.claudeCliInstalled === true
       : device.capabilities.codexCliInstalled === true;
+  const workspaceRequired = isWorkspaceRequiredForAgentCreation({ mobileUi });
   const canCreateAgent =
     device.connectorOnline &&
     !!agentName.trim() &&
-    !!workspace &&
+    (!workspaceRequired || !!workspace) &&
     selectedAgentCliInstalled &&
     !creatingAgent;
 
   const handlePickWorkspace = useCallback(async () => {
+    if (mobileUi) return;
     setPickingWorkspace(true);
     setAgentError(null);
     try {
@@ -359,7 +363,7 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
     } finally {
       setPickingWorkspace(false);
     }
-  }, [workers]);
+  }, [mobileUi, workers]);
 
   const handleCreateAgent = useCallback(async () => {
     if (!canCreateAgent) return;
@@ -486,58 +490,14 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
         whatsapp_group_name: enabled ? groupName.trim() : "",
         whatsapp_app_url: window.location.origin,
       };
-      // Best-effort persistence so the connector keeps the config after restarts.
       try {
-        const { data } = await supabase
-          .from("devices")
-          .select("connector_config")
-          .eq("id", deviceId)
-          .limit(1)
-          .maybeSingle();
-        const current =
-          data?.connector_config &&
-          typeof data.connector_config === "object" &&
-          !Array.isArray(data.connector_config)
-            ? (data.connector_config as Record<string, unknown>)
-            : {};
-        await supabase
-          .from("devices")
-          .update({ connector_config: { ...current, ...config } })
-          .eq("id", deviceId);
+        await device.configureConnector(config, { restart: true });
+        return true;
       } catch {
-        // ignore; live config below is what matters for the QR flow
+        return false;
       }
-      return await new Promise<boolean>((resolve) => {
-        const requestId = `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        let settled = false;
-        let unsub: (() => void) | null = null;
-        const finish = (ok: boolean) => {
-          if (settled) return;
-          settled = true;
-          window.clearTimeout(timer);
-          unsub?.();
-          resolve(ok);
-        };
-        const timer = window.setTimeout(() => finish(false), 20_000);
-        unsub = device.relay.subscribe((msg) => {
-          const m = msg as { request_id?: string; ok?: boolean };
-          if (String(m.request_id || "") !== requestId) return;
-          finish(m.ok !== false);
-        });
-        try {
-          device.relay.send({
-            type: "connector_configure",
-            request_id: requestId,
-            device_id: deviceId,
-            config,
-            restart: true,
-          });
-        } catch {
-          finish(false);
-        }
-      });
     },
-    [device.activeDeviceId, device.relayConnected, device.relay, supabase]
+    [device]
   );
 
   const saveHeartbeatChannel = useCallback(
@@ -967,7 +927,10 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
                                 device.connectorOutdated
                               }
                               onUpdateConnector={
-                                device.supportsInPlaceUpdate ? device.updateConnector : undefined
+                                device.supportsInPlaceUpdate &&
+                                device.capabilities.managedByDesktop !== true
+                                  ? device.updateConnector
+                                  : undefined
                               }
                             />
                           </div>
@@ -1036,8 +999,9 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
                     </div>
                   </div>
                   <p className="mt-3 text-center text-[11px] leading-relaxed text-zinc-500">
-                    The worker uses the selected coding harness and can work only inside the folder
-                    you choose below.
+                    {mobileUi
+                      ? "The worker uses the selected coding harness and starts in your computer's home directory."
+                      : "The worker uses the selected coding harness and starts inside the folder you choose below."}
                   </p>
                 </div>
 
@@ -1145,9 +1109,20 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
                   {/* Workspace */}
                   <div>
                     <label className="mb-1.5 block text-xs text-zinc-400">
-                      Worker workspace <span className="text-cyan-400/80">(required)</span>
+                      Worker workspace{" "}
+                      <span className={mobileUi ? "text-zinc-600" : "text-cyan-400/80"}>
+                        ({mobileUi ? "optional on mobile" : "required"})
+                      </span>
                     </label>
-                    {workspace ? (
+                    {mobileUi ? (
+                      <div className="flex items-start gap-2 rounded-xl border border-white/10 bg-black/30 px-4 py-3">
+                        <FolderOpen className="mt-0.5 h-4 w-4 shrink-0 text-zinc-500" />
+                        <p className="text-xs leading-relaxed text-zinc-400">
+                          No folder needed. This agent will start in your computer&apos;s home
+                          directory. You can attach a project later from your computer.
+                        </p>
+                      </div>
+                    ) : workspace ? (
                       <div className="flex items-center gap-2 rounded-xl border border-cyan-500/20 bg-cyan-500/5 px-4 py-3">
                         <FolderOpen className="h-4 w-4 shrink-0 text-cyan-300" />
                         <span className="truncate font-mono text-xs text-zinc-200">
@@ -1182,7 +1157,9 @@ export function HarnessOnboarding({ onComplete, autoPair }: HarnessOnboardingPro
                       </button>
                     )}
                     <p className="mt-1.5 text-[11px] text-zinc-600">
-                      Choose the project folder this agent is allowed to work in. You can change it later.
+                      {mobileUi
+                        ? "Mobile cannot browse folders on the connector computer."
+                        : "Choose the project folder this agent should start in. You can change it later."}
                     </p>
                   </div>
 

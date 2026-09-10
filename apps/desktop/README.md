@@ -35,15 +35,29 @@ shell at a local deployment with `GROOVY_APP_URL` and `GROOVY_RELAY_URL`.
 
 ## Release
 
-Use the `Release Groovy Desktop (macOS)` GitHub workflow
-(`.github/workflows/release-desktop.yml`, workflow_dispatch). It bundles the
-connector, builds + signs + notarizes the DMG/ZIP with electron-builder, and
-publishes the license-gated artifacts + `latest-mac.yml` update feed via
+The `Release Groovy Desktop (macOS)` GitHub workflow
+(`.github/workflows/release-desktop.yml`) bundles the connector, builds, signs,
+and notarizes the DMG/ZIP with electron-builder, then publishes the
+license-gated artifacts and `latest-mac.yml` update feed via
 `scripts/publish-connector-downloads.mjs --desktop-*`.
+
+Normal releases are automatic and coupled to connector releases. The Connector
+and Desktop versions in both `package.json` and `package-lock.json` must stay
+identical. After the connector regression gates pass on `main`,
+`release-connector.yml` publishes the standalone connector artifacts and then
+calls `release-desktop.yml` for that exact source commit and version. The
+Desktop artifact therefore always contains the connector version that triggered
+the release. Pull requests that change native Desktop code must bump both
+products to the same next version. Use `workflow_dispatch` only to retry the
+synchronized version already present in the package manifests.
 
 Auto-updates are served from `https://www.gogroovy.ai/api/updates/desktop-feed`
 (generic electron-updater feed, authenticated with the connector's device
-token and license-gated like `/api/updates/check`).
+token and license-gated like `/api/updates/check`). Desktop checks on launch,
+every 30 minutes, on wake/unlock, and when its window returns to the
+foreground. It downloads updates immediately and installs them automatically
+once Groovy is hidden or minimized; while the window is open, the user can
+install from the update badge without interrupting the current session.
 
 ## Connector lifecycle
 

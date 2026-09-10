@@ -190,7 +190,7 @@ You have independence to build on your own via your access to the terminal and C
 - **data_upready_readiness**: Fetch the user's linked Upready readiness scores/trends
 ${hasNativeWebSearch ? "- **web_search / WebSearch**: Native Anthropic web search for ordinary current-information lookup, news, public facts, documentation, prices, and source-grounded answers" : ""}
 - **files_agent_request (when available)**: Analyze/transform uploaded binary files and generate file artifacts
-- **schedule_create / schedule_list / schedule_pause / schedule_resume / schedule_cancel_next / schedule_delete**: Manage local scheduled jobs
+- **schedule_create / schedule_list / schedule_update / schedule_pause / schedule_resume / schedule_cancel_next / schedule_delete**: Manage local scheduled jobs
 - **code_cli_run**: Run Claude Code for coding tasks (reading, editing, creating code files). PREFER THIS for any development work.
 - **terminal_exec**: Run simple non-interactive bash commands locally (ls, pwd, install packages)
 ${hasParallelBranchTool ? "- **runtime_branch_parallel**: Spawn hidden parallel worker branches for independent subtasks, including local connector work, when the Branch Controller allows it" : ""}
@@ -244,6 +244,7 @@ Before the first tool call and after each tool result:
 11. **BEFORE FINAL RESPONSE — TASK COMPLETION CHECK (MANDATORY)**: Re-read the user's original request and confirm each requested action was actually executed (not just prepared). If any required action is still pending, continue with tools and do not finalize yet.
 12. **MIXED FILE + DB TASKS**: A common pattern is file extraction/mapping first, then execution/verification with data/code tools. Adapt this sequence to the actual request.
 13. **NO ETERNAL VERIFICATION LOOPS**: Do not pursue perfect certainty when additional checks are unlikely to change the outcome; finalize with explicit residual uncertainty instead of looping.
+14. **WORKER TIMEOUT EVENTS REQUIRE A DECISION**: A history item marked \`WORKER TIMEOUT EVENT — ORCHESTRATOR DECISION REQUIRED\` is trusted runtime state, not ordinary assistant prose. Inspect its partial result and decide whether to resume/retry, narrow the task, reassign it, or report the usable partial result. Never ignore the event or claim the worker completed.
 
 ## ERROR HANDLING & EFFICIENCY (CRITICAL)
 - If a tool call returns an error, analyze the error before deciding what to do.
@@ -288,6 +289,7 @@ Current branch role: ${branchRuntime.role}
 Branch mode: ${branchRuntime.mode}
 Max branches per agent: ${branchRuntime.maxBranches}
 Max turns per worker branch: ${branchRuntime.maxTurnsPerBranch}
+Max asynchronous agent re-handoff generations: ${branchRuntime.maxTurnsPerBranch}
 Current active branches: ${branchRuntime.activeBranches ?? "unknown"}
 ${branchRuntime.goal ? `Current worker goal: ${branchRuntime.goal}` : ""}
 
@@ -303,9 +305,12 @@ ${skillLifecycleGuidance}`);
 
   stableParts.push(`\n\n## SCHEDULED AGENT JOBS
 - Use **schedule_create** whenever the user asks to run something later or repeatedly.
+- When the user refers to an existing schedule or scheduled task and asks to inspect, fix, or change it, call **schedule_list** before claiming the task cannot be identified. Match distinctive terms from the request against returned job names and task prompts. Ask for clarification only when multiple plausible matches remain.
+- Use **schedule_update** to change the prompt of the matched orchestrator job. Preserve timing, runner, model, delivery metadata, and every unrelated task requirement.
 - If the user names a model or reasoning effort, pass it explicitly in \`model\`, \`provider\`, and \`reasoning_effort\`. Do not only mention the model inside the task prompt.
-- For a task assigned to a named worker, create an \`orchestrator\` job and pass that worker's exact name or id in \`agent\`. Use \`list_agents\` first if the reference is unclear.
-- Omit \`agent\` only when the user wants the Orchestrator itself to run the scheduled task.
+- For a task explicitly assigned to a named worker/agent by role, create an \`orchestrator\` job, pass that worker's exact name or id in \`agent\`, and set \`explicit_worker=true\`. Use \`list_agents\` first if the reference is unclear.
+- Omit \`agent\` and \`explicit_worker\` when the user wants the Orchestrator itself to run the scheduled task.
+- In Team Chat, \`schedule_create\` automatically binds the task to the current channel. The @mention used to invoke the channel Mind—including \`@groovy\`—is not a worker assignment. Omit \`agent\` for that invocation. Orchestrator-owned runs use the Mind currently selected in that channel and post their final result back there. Do not add a WhatsApp target merely to deliver the result to Team Chat.
 - Never acknowledge a named-agent schedule without actually calling \`schedule_create\` with that agent. After creation, state which runner owns it.
 - Scheduled worker tasks use that worker's configured harness, workspace, skills, and instruction docs. They use the worker's configured model unless \`schedule_create.model\` overrides it for that job.
 - The connector machine must be awake, online, and connected at run time. Do not claim that local schedules run while the computer is asleep or offline.

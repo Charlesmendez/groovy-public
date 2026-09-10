@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRelay } from "@/hooks/useRelay";
+import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import {
   MIN_CONNECTOR_VERSION,
   SELF_UPDATE_MIN_CONNECTOR_VERSION,
@@ -54,6 +55,7 @@ export type ConnectorDeviceState = {
   supportsInPlaceUpdate: boolean;
   onlineDevices: Array<{ deviceId: string; version?: string }>;
   prefersHostedConnector: boolean;
+  connectorConfig: Record<string, unknown>;
 };
 
 export function useConnectorDevice(): ConnectorDeviceState & {
@@ -62,8 +64,13 @@ export function useConnectorDevice(): ConnectorDeviceState & {
   restartConnector(): void;
   updateConnector(): void;
   setConnectorMode(mode: "local" | "groovy"): Promise<void>;
+  configureConnector(
+    patch: Record<string, unknown>,
+    options?: { restart?: boolean }
+  ): Promise<void>;
 } {
   const relay = useRelay();
+  const supabase = getSupabaseBrowserClient();
 
   const [connectorOnline, setConnectorOnline] = useState(false);
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null);
@@ -81,6 +88,10 @@ export function useConnectorDevice(): ConnectorDeviceState & {
   const [preferredConnectorDeviceId, setPreferredConnectorDeviceId] = useState<string | null>(
     null
   );
+  const [connectorConfigState, setConnectorConfigState] = useState<{
+    deviceId: string;
+    value: Record<string, unknown>;
+  } | null>(null);
 
   const onlineDevicesRef = useRef<Map<string, OnlineDeviceInfo>>(new Map());
   const relayStatusRef = useRef(relay.status);
@@ -89,6 +100,33 @@ export function useConnectorDevice(): ConnectorDeviceState & {
   useEffect(() => {
     activeDeviceIdRef.current = activeDeviceId;
   }, [activeDeviceId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeDeviceId) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    void (async () => {
+      const { data, error } = await supabase
+        .from("devices")
+        .select("connector_config")
+        .eq("id", activeDeviceId)
+        .maybeSingle();
+      if (cancelled || error) return;
+      const next =
+        data?.connector_config &&
+        typeof data.connector_config === "object" &&
+        !Array.isArray(data.connector_config)
+          ? (data.connector_config as Record<string, unknown>)
+          : {};
+      setConnectorConfigState({ deviceId: activeDeviceId, value: next });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeDeviceId, supabase]);
 
   useEffect(() => {
     relayStatusRef.current = relay.status;
@@ -389,12 +427,87 @@ export function useConnectorDevice(): ConnectorDeviceState & {
     }
   }, [relay, activeDeviceId]);
 
+  const configureConnector = useCallback(
+    async (patch: Record<string, unknown>, options: { restart?: boolean } = {}) => {
+      const deviceId = activeDeviceIdRef.current;
+      if (!deviceId) throw new Error("No active connector device");
+
+      const { data, error: loadError } = await supabase
+        .from("devices")
+        .select("connector_config")
+        .eq("id", deviceId)
+        .maybeSingle();
+      if (loadError) throw new Error(loadError.message || "Failed to load connector settings");
+      const current =
+        data?.connector_config &&
+        typeof data.connector_config === "object" &&
+        !Array.isArray(data.connector_config)
+          ? (data.connector_config as Record<string, unknown>)
+          : {};
+      const next = { ...current, ...patch };
+      const { error: saveError } = await supabase
+        .from("devices")
+        .update({ connector_config: next })
+        .eq("id", deviceId);
+      if (saveError) throw new Error(saveError.message || "Failed to save connector settings");
+      setConnectorConfigState({ deviceId, value: next });
+
+      if (!onlineDevicesRef.current.has(deviceId) || relayStatusRef.current !== "ready") return;
+
+      await new Promise<void>((resolve, reject) => {
+        const requestId = `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        let settled = false;
+        let unsubscribe: (() => void) | null = null;
+        const finish = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          unsubscribe?.();
+          if (error) reject(error);
+          else resolve();
+        };
+        const timer = window.setTimeout(
+          () => finish(new Error("Connector did not acknowledge the settings update")),
+          20_000
+        );
+        unsubscribe = relay.subscribe((message) => {
+          const response = message as { type?: string; request_id?: string; ok?: boolean; error?: string };
+          if (
+            response.type !== "connector_configure_ack" ||
+            String(response.request_id || "") !== requestId
+          ) {
+            return;
+          }
+          finish(
+            response.ok === false
+              ? new Error(response.error || "Connector rejected the settings update")
+              : undefined
+          );
+        });
+        try {
+          relay.send({
+            type: "connector_configure",
+            request_id: requestId,
+            device_id: deviceId,
+            config: patch,
+            restart: options.restart === true,
+          });
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error("Failed to send connector settings"));
+        }
+      });
+    },
+    [relay, supabase]
+  );
+
   const connectorOutdated =
     connectorOnline && isConnectorVersionOutdated(connectorVersion, MIN_CONNECTOR_VERSION);
   const supportsInPlaceUpdate =
     connectorOnline &&
     !!connectorVersion &&
     !isConnectorVersionOutdated(connectorVersion, SELF_UPDATE_MIN_CONNECTOR_VERSION);
+  const connectorConfig =
+    connectorConfigState?.deviceId === activeDeviceId ? connectorConfigState.value : {};
 
   return {
     relayStatus: relay.status,
@@ -414,10 +527,12 @@ export function useConnectorDevice(): ConnectorDeviceState & {
     supportsInPlaceUpdate,
     onlineDevices,
     prefersHostedConnector,
+    connectorConfig,
     relay,
     refresh,
     restartConnector,
     updateConnector,
     setConnectorMode,
+    configureConnector,
   };
 }

@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { execFileSync } from "child_process";
 import { buildRnnoiseNativeAddon } from "./rnnoiseNative.mjs";
+import { CONNECTOR_MJS_FILES } from "./bundle-connector-runtime.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,21 +14,7 @@ const tarballName = "Groovy-Connector-Headless.tar.gz";
 const tarballPath = path.resolve(distDir, tarballName);
 
 const requiredPaths = [
-  "connector.mjs",
-  "codexPlans.mjs",
-  "browser.mjs",
-  "browserTask.mjs",
-  "files.mjs",
-  "obsidian.mjs",
-  "siteDev.mjs",
-  "linkdb.mjs",
-  "credentials.mjs",
-  "sqlitedb.mjs",
-  "sqliteProjects.mjs",
-  "whatsapp.mjs",
-  "aiyraVoice.mjs",
-  "aec.mjs",
-  "rnnoise.mjs",
+  ...CONNECTOR_MJS_FILES,
   "native",
   "platform",
   "package.json",

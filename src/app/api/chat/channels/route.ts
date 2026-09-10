@@ -6,6 +6,7 @@ import { listWorkerAgents } from "@/lib/orchestrator/agentTasks";
 import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
 import {
   createChatChannelInRlsOrder,
+  newChannelOrchestratorMode,
   parseChannelOrchestratorInstructions,
   slugifyChatChannel,
 } from "@/lib/teamChat";
@@ -13,6 +14,15 @@ import {
   GUEST_SAFE_MIND_REQUIREMENT,
   isGuestSafeMind,
 } from "@/lib/chat/guestMind";
+import {
+  memberDisplayName,
+  socialSchemaUnavailable,
+} from "@/lib/chat/social";
+import { directMessageDisplayName } from "@/lib/chat/directMessages";
+import {
+  ensureDefaultChatNotificationPreferences,
+  notificationPreferencesSchemaUnavailable,
+} from "@/lib/notifications/defaults";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -45,13 +55,84 @@ export async function GET() {
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
   const channelIds = (channels || []).map((channel) => String(channel.id));
+  const admin = createSupabaseAdminClient();
+  const profileIds = Array.from(
+    new Set(
+      (channels || [])
+        .map((channel) =>
+          typeof channel.profile_id === "string" ? channel.profile_id : "",
+        )
+        .filter(Boolean),
+    ),
+  );
+  // Everything below only needs the workspace and the channel list, so it
+  // runs as one concurrent batch instead of a serial round-trip chain.
+  const [
+    unreadResult,
+    membersResult,
+    allAgents,
+    boundProfilesResult,
+    skillArtifactsResult,
+    skillAssignmentsResult,
+    huddlesResult,
+  ] = await Promise.all([
+    channelIds.length > 0
+      ? supabase.rpc("chat_channel_unread_counts", {
+          p_channel_ids: channelIds,
+        })
+      : Promise.resolve({ data: [], error: null }),
+    channelIds.length
+      ? supabase
+          .from("chat_channel_members")
+          .select("id,channel_id,member_type,user_id,agent_id")
+          .in("channel_id", channelIds)
+      : Promise.resolve({ data: [] }),
+    listWorkerAgents(workspace.billing_admin_user_id, {
+      supabase: admin,
+    }).catch(() => []),
+    profileIds.length
+      ? admin
+          .from("orchestrator_profiles")
+          .select(
+            "id,name,slug,is_default,workspace_id,agent_roster,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
+          )
+          .eq("workspace_id", workspace.id)
+          .in("id", profileIds)
+      : Promise.resolve({ data: [] }),
+    workspace.role === "guest"
+      ? Promise.resolve({ data: [] })
+      : supabase
+          .from("workspace_skill_artifacts")
+          .select(
+            "id,artifact_type,name,description,relative_path,targets,lifecycle",
+          )
+          .eq("workspace_id", workspace.id)
+          .eq("lifecycle", "active")
+          .order("name", { ascending: true }),
+    workspace.role === "guest" || channelIds.length === 0
+      ? Promise.resolve({ data: [] })
+      : supabase
+          .from("chat_channel_skill_assignments")
+          .select("id,channel_id,artifact_id,created_at")
+          .in("channel_id", channelIds),
+    channelIds.length > 0
+      ? supabase
+          .from("chat_huddles")
+          .select(
+            "id,channel_id,started_by,status,title,started_at,ended_at,updated_at",
+          )
+          .in("channel_id", channelIds)
+          .eq("status", "active")
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+
   const unreadCounts = new Map<string, number>();
   let unreadMigrationPending = false;
   if (channelIds.length > 0) {
-    const { data: unreadRows, error: unreadError } = await supabase.rpc(
-      "chat_channel_unread_counts",
-      { p_channel_ids: channelIds },
-    );
+    const { data: unreadRows, error: unreadError } = unreadResult as {
+      data: unknown;
+      error: { code?: string | null; message?: string | null } | null;
+    };
     if (unreadError) {
       unreadMigrationPending = unreadCountsMigrationPending(unreadError);
       if (!unreadMigrationPending) {
@@ -74,16 +155,7 @@ export async function GET() {
       }
     }
   }
-  const { data: members } = channelIds.length
-    ? await supabase
-        .from("chat_channel_members")
-        .select("id,channel_id,member_type,user_id,agent_id")
-        .in("channel_id", channelIds)
-    : { data: [] };
-  const admin = createSupabaseAdminClient();
-  const allAgents = await listWorkerAgents(workspace.billing_admin_user_id, {
-    supabase: admin,
-  }).catch(() => []);
+  const members = membersResult.data;
   const visibleUserIds = new Set<string>([user.id]);
   const visibleAgentIds = new Set<string>();
   for (const member of members || []) {
@@ -102,35 +174,7 @@ export async function GET() {
     workspace.role === "guest"
       ? allAgents.filter((agent) => visibleAgentIds.has(agent.id))
       : allAgents;
-  const profileIds = Array.from(
-    new Set(
-      (channels || [])
-        .map((channel) =>
-          typeof channel.profile_id === "string" ? channel.profile_id : "",
-        )
-        .filter(Boolean),
-    ),
-  );
-  const { data: boundProfiles } = profileIds.length
-    ? await admin
-        .from("orchestrator_profiles")
-        .select(
-          "id,name,slug,is_default,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
-        )
-        .eq("workspace_id", workspace.id)
-        .in("id", profileIds)
-    : { data: [] };
-  const skillArtifactsResult =
-    workspace.role === "guest"
-      ? { data: [] }
-      : await supabase
-          .from("workspace_skill_artifacts")
-          .select(
-            "id,artifact_type,name,description,relative_path,targets,lifecycle",
-          )
-          .eq("workspace_id", workspace.id)
-          .eq("lifecycle", "active")
-          .order("name", { ascending: true });
+  const boundProfiles = boundProfilesResult.data;
   if ("error" in skillArtifactsResult && skillArtifactsResult.error) {
     return NextResponse.json(
       { error: skillArtifactsResult.error.message },
@@ -148,13 +192,6 @@ export async function GET() {
       targets.includes("flow")
     );
   });
-  const skillAssignmentsResult =
-    workspace.role === "guest" || channelIds.length === 0
-      ? { data: [] }
-      : await supabase
-          .from("chat_channel_skill_assignments")
-          .select("id,channel_id,artifact_id,created_at")
-          .in("channel_id", channelIds);
   if ("error" in skillAssignmentsResult && skillAssignmentsResult.error) {
     const migrationPending =
       skillAssignmentsResult.error.code === "PGRST205" ||
@@ -173,6 +210,100 @@ export async function GET() {
     );
   }
   const skillAssignments = skillAssignmentsResult.data;
+  const visibleMemberIds = visibleMembers.map((member) => member.user_id);
+  const activeHuddleIds = (huddlesResult.data || []).map((huddle) =>
+    String(huddle.id),
+  );
+  const [memberProfilesResult, presenceResult, huddleParticipantsResult] =
+    await Promise.all([
+      visibleMemberIds.length > 0
+        ? supabase
+            .from("chat_member_profiles")
+            .select(
+              "user_id,display_name,avatar_path,status_emoji,status_text,status_expires_at,updated_at",
+            )
+            .in("user_id", visibleMemberIds)
+        : Promise.resolve({ data: [], error: null }),
+      visibleMemberIds.length > 0
+        ? supabase
+            .from("chat_member_presence")
+            .select("user_id,availability,last_active_at,updated_at")
+            .in("user_id", visibleMemberIds)
+        : Promise.resolve({ data: [], error: null }),
+      activeHuddleIds.length > 0
+        ? supabase
+            .from("chat_huddle_participants")
+            .select(
+              "huddle_id,channel_id,user_id,muted,camera_on,screen_sharing,joined_at,left_at,updated_at",
+            )
+            .in("huddle_id", activeHuddleIds)
+            .is("left_at", null)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+  const socialErrors = [
+    memberProfilesResult.error,
+    presenceResult.error,
+    huddlesResult.error,
+  ].filter(Boolean);
+  let socialMigrationPending = socialErrors.some(socialSchemaUnavailable);
+  const unexpectedSocialError = socialErrors.find(
+    (socialError) => !socialSchemaUnavailable(socialError),
+  );
+  if (unexpectedSocialError) {
+    return NextResponse.json(
+      { error: unexpectedSocialError.message },
+      { status: 500 },
+    );
+  }
+  if (huddleParticipantsResult.error) {
+    if (!socialSchemaUnavailable(huddleParticipantsResult.error)) {
+      return NextResponse.json(
+        { error: huddleParticipantsResult.error.message },
+        { status: 500 },
+      );
+    }
+    socialMigrationPending = true;
+  }
+  const populatedHuddleIds = new Set(
+    (huddleParticipantsResult.data || []).map((participant) =>
+      String(participant.huddle_id),
+    ),
+  );
+  const populatedHuddles = (huddlesResult.data || []).filter((huddle) =>
+    populatedHuddleIds.has(String(huddle.id)),
+  );
+  const memberProfileByUserId = new Map(
+    (memberProfilesResult.data || []).map((profile) => [
+      String(profile.user_id),
+      profile,
+    ]),
+  );
+  const memberNameByUserId = new Map(
+    visibleMembers.map((member) => [
+      member.user_id,
+      memberDisplayName({
+        email: member.email,
+        profile: memberProfileByUserId.get(member.user_id),
+      }),
+    ]),
+  );
+  const membersByChannelId = new Map<
+    string,
+    Array<{
+      member_type: string;
+      user_id: string | null;
+    }>
+  >();
+  for (const member of members || []) {
+    const channelId = String(member.channel_id);
+    const channelMembers = membersByChannelId.get(channelId) || [];
+    channelMembers.push({
+      member_type: String(member.member_type),
+      user_id:
+        typeof member.user_id === "string" ? member.user_id : null,
+    });
+    membersByChannelId.set(channelId, channelMembers);
+  }
 
   return NextResponse.json({
     workspace: {
@@ -184,6 +315,20 @@ export async function GET() {
     },
     channels: (channels || []).map((channel) => ({
       ...channel,
+      display_name:
+        channel.kind === "dm"
+          ? directMessageDisplayName({
+              fallbackName: String(channel.name),
+              currentUserId: user.id,
+              memberUserIds: (
+                membersByChannelId.get(String(channel.id)) || []
+              ).map((member) => member.user_id),
+              hasAgent: (
+                membersByChannelId.get(String(channel.id)) || []
+              ).some((member) => member.member_type === "agent"),
+              memberNames: memberNameByUserId,
+            })
+          : String(channel.name),
       unread_count: unreadCounts.get(String(channel.id)) || 0,
     })),
     unreadMigrationPending,
@@ -198,6 +343,21 @@ export async function GET() {
     })),
     skills: flowSkillArtifacts,
     skillAssignments: skillAssignments || [],
+    memberProfiles: (memberProfilesResult.data || []).map((profile) => ({
+      user_id: profile.user_id,
+      display_name: profile.display_name,
+      has_avatar:
+        typeof profile.avatar_path === "string" &&
+        profile.avatar_path.length > 0,
+      status_emoji: profile.status_emoji,
+      status_text: profile.status_text,
+      status_expires_at: profile.status_expires_at,
+      updated_at: profile.updated_at,
+    })),
+    presence: presenceResult.data || [],
+    activeHuddles: populatedHuddles,
+    huddleParticipants: huddleParticipantsResult.data || [],
+    socialMigrationPending,
   });
 }
 
@@ -218,6 +378,22 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const name = typeof body?.name === "string" ? body.name.trim().slice(0, 100) : "";
   const kind = body?.kind === "dm" ? "dm" : "channel";
+  const agentIds = Array.isArray(body?.agentIds)
+    ? Array.from(new Set(body.agentIds.map(String).filter(Boolean)))
+    : [];
+  const isDirectAgentDm = kind === "dm" && agentIds.length === 1;
+  const requestedUserIds = Array.isArray(body?.userIds)
+    ? body.userIds.map(String)
+    : [];
+  if (
+    isDirectAgentDm &&
+    requestedUserIds.some((requestedUserId) => requestedUserId !== user.id)
+  ) {
+    return NextResponse.json(
+      { error: "An Agent direct message can only include you and that Agent." },
+      { status: 400 },
+    );
+  }
   const slug =
     typeof body?.slug === "string" && body.slug.trim()
       ? slugifyChatChannel(body.slug)
@@ -225,12 +401,17 @@ export async function POST(req: Request) {
   if (!name || !slug) {
     return NextResponse.json({ error: "name is required" }, { status: 400 });
   }
-  const orchestratorMode =
-    body?.orchestratorMode === "always" || body?.orchestratorMode === "off"
-      ? body.orchestratorMode
-      : "mention";
-  const profileId =
-    typeof body?.profileId === "string" && body.profileId.trim()
+  // A selected Agent DM is a direct worker boundary. Ignore stale/hostile
+  // client requests that try to attach a Mind or enable orchestration here.
+  const orchestratorMode = isDirectAgentDm
+    ? "off"
+    : newChannelOrchestratorMode({
+        kind,
+        requestedMode: body?.orchestratorMode,
+      });
+  const profileId = isDirectAgentDm
+    ? null
+    : typeof body?.profileId === "string" && body.profileId.trim()
       ? body.profileId.trim()
       : null;
   const visibility =
@@ -251,9 +432,6 @@ export async function POST(req: Request) {
   // front, insert with return=minimal, add members, and read the channel only
   // after it is visible to the creator.
   const channelId = randomUUID();
-  const requestedUserIds = Array.isArray(body?.userIds)
-    ? body.userIds.map(String)
-    : [];
   const workspaceUserIds = new Set(workspace.members.map((member) => member.user_id));
   if (requestedUserIds.some((id) => !workspaceUserIds.has(id))) {
     return NextResponse.json(
@@ -305,9 +483,6 @@ export async function POST(req: Request) {
       { status: 409 },
     );
   }
-  const agentIds = Array.isArray(body?.agentIds)
-    ? Array.from(new Set(body.agentIds.map(String).filter(Boolean)))
-    : [];
   const skillArtifactIds =
     kind === "channel" && Array.isArray(body?.skillArtifactIds)
       ? Array.from(
@@ -349,15 +524,6 @@ export async function POST(req: Request) {
   }
 
   if (skillArtifactIds.length > 0) {
-    if (includesGuests) {
-      return NextResponse.json(
-        {
-          error:
-            "Channel skills cannot be assigned while a channel guest participates",
-        },
-        { status: 400 },
-      );
-    }
     const { data: availableSkills, error: skillsError } = await supabase
       .from("workspace_skill_artifacts")
       .select("id,targets")
@@ -510,7 +676,11 @@ export async function POST(req: Request) {
     );
   }
 
-  const [createdMembersResult, createdSkillAssignmentsResult] =
+  const [
+    createdMembersResult,
+    createdSkillAssignmentsResult,
+    defaultNotificationsResult,
+  ] =
     await Promise.all([
       supabase
         .from("chat_channel_members")
@@ -522,7 +692,23 @@ export async function POST(req: Request) {
             .select("id,channel_id,artifact_id,created_at")
             .eq("channel_id", channelId)
         : Promise.resolve({ data: [], error: null }),
+      ensureDefaultChatNotificationPreferences({
+        admin: profileAdmin,
+        channelId,
+        kind,
+        userIds,
+      }),
     ]);
+  if (
+    defaultNotificationsResult.error &&
+    !notificationPreferencesSchemaUnavailable(defaultNotificationsResult.error)
+  ) {
+    console.warn("[team-chat] default notification preference failed", {
+      channelId,
+      kind,
+      code: defaultNotificationsResult.error.code || null,
+    });
+  }
 
   return NextResponse.json(
     {

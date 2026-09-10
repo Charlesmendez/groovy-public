@@ -2,6 +2,8 @@
  * ConnectorManager — runs the bundled connector as a managed child process.
  *
  * - Spawns resources/connector/node/bin/node connector.mjs --relay <url>
+ *   --no-autostart --kill-others, making Desktop the definitive owner even
+ *   when an orphaned pre-update connector still holds the PID lock.
  *   (the connector's native addons are built for the vanilla Node ABI, so we
  *   must NOT use utilityProcess/ELECTRON_RUN_AS_NODE).
  * - Env: GROOVY_MANAGED_BY_DESKTOP=1 (reported in capabilities) and
@@ -24,6 +26,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import log from "electron-log/main";
+import { buildManagedConnectorArgs } from "./connectorLaunch";
 import { launchAgentInstalled, removeLaunchAgent } from "./launchAgent";
 import { configuredAppUrl, configuredRelayUrl } from "./runtimeConfig";
 import { groovyDir } from "./settings";
@@ -158,15 +161,11 @@ export class ConnectorManager extends EventEmitter {
     this.clearRestartTimer();
     this.setState("starting");
 
-    const args = [
-      path.join(this.connectorDir, "connector.mjs"),
-      "--relay",
-      relayUrl(),
-      // Desktop owns the connector lifecycle. Never let the bundled runtime
-      // install its legacy self-managed LaunchAgent and race this child.
-      "--no-autostart",
-      ...extraArgs,
-    ];
+    const args = buildManagedConnectorArgs({
+      connectorDir: this.connectorDir,
+      relayUrl: relayUrl(),
+      extraArgs,
+    });
     log.info(`[connector] spawning ${this.nodeBin} ${args.join(" ")}`);
     const child = spawn(this.nodeBin, args, {
       cwd: this.connectorDir,

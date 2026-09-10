@@ -74,11 +74,27 @@ ${JSON.stringify(parsed.value)}`;
 }
 
 export type TeamChatControlRequest = {
-  action: "stop" | "redirect";
+  action: "stop" | "redirect" | "approve" | "reject";
   target: "orchestrator" | "agent";
   taskId: string | null;
   direction: string | null;
 };
+
+export function newChannelOrchestratorMode(input: {
+  kind: "channel" | "dm";
+  requestedMode: unknown;
+}): "mention" | "always" | "off" {
+  if (
+    input.requestedMode === "mention" ||
+    input.requestedMode === "always" ||
+    input.requestedMode === "off"
+  ) {
+    return input.requestedMode;
+  }
+  // A conversation with another person begins as a private human exchange.
+  // A Mind can be deliberately attached later from conversation settings.
+  return input.kind === "dm" ? "off" : "mention";
+}
 
 type ChatChannelMutationError = {
   message: string;
@@ -149,7 +165,10 @@ export function parseTeamChatControlRequest(
       ? (input as Record<string, unknown>)
       : null;
   const action =
-    body?.action === "stop" || body?.action === "redirect"
+    body?.action === "stop" ||
+    body?.action === "redirect" ||
+    body?.action === "approve" ||
+    body?.action === "reject"
       ? body.action
       : null;
   const target =
@@ -165,6 +184,15 @@ export function parseTeamChatControlRequest(
       : null;
   if (target === "agent" && !taskId) {
     return { ok: false, error: "taskId is required" };
+  }
+  if (
+    target === "orchestrator" &&
+    (action === "approve" || action === "reject")
+  ) {
+    return {
+      ok: false,
+      error: "approval decisions require an agent task",
+    };
   }
   const direction =
     typeof body?.direction === "string" && body.direction.trim()

@@ -1,11 +1,12 @@
 {
   "name": "groovy-connector",
-  "version": "0.24.15",
+  "version": "0.24.46",
   "private": true,
   "type": "module",
   "scripts": {
     "postinstall": "patch-package && npm run build:rnnoise:addon",
     "start": "node connector.mjs",
+    "test:browser-report": "node scripts/run-browser-report-test.mjs",
     "build:rnnoise:addon": "node packaging/build-rnnoise-addon.mjs",
     "build:macos": "node packaging/build-macos.mjs",
     "build:headless": "node packaging/build-headless.mjs",
@@ -16,11 +17,12 @@
     "@mastra/node-speaker": "^0.1.0",
     "@picovoice/porcupine-node": "^4.0.2",
     "@picovoice/pvrecorder-node": "^1.2.8",
+    "@playwright/cli": "0.1.18",
     "@roamhq/wrtc": "^0.9.1",
     "better-sqlite3": "^12.2.0",
     "keytar": "^7.9.0",
     "node-pty": "^1.1.0",
-    "puppeteer": "^23.11.1",
+    "puppeteer": "24.36.0",
     "speaker": "^0.5.5",
     "whatsapp-web.js": "^1.34.6",
     "ws": "^8.18.0"

@@ -7,6 +7,8 @@
  */
 
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
+import { resolveProviderCostUsd } from "@/lib/billing/usageCost";
 
 export type AgentUsageEntry = {
   agentId: string | null;
@@ -14,15 +16,24 @@ export type AgentUsageEntry = {
   harness: string | null;
   models: Record<string, { totalTokens: number; costUsd: number; events: number }>;
   totalTokens: number;
+  /** API-equivalent model value, including usage that Groovy did not charge for. */
   costUsd: number;
+  /** Amount actually charged by Groovy. */
+  chargedUsd: number;
   events: number;
+  derivedCostEvents: number;
+  unmeteredEvents: number;
+  noChargeEvents: number;
+  billableEvents: number;
   tasks: { done: number; failed: number; canceled: number; open: number };
 };
 
 export type AgentUsageReport = {
   days: number;
   since: string;
+  until: string;
   totalCostUsd: number;
+  totalChargedUsd: number;
   totalTokens: number;
   agents: AgentUsageEntry[];
 };
@@ -34,27 +45,76 @@ function asNumber(value: unknown): number {
 
 export async function buildAgentUsageReport(args: {
   userId: string;
+  workspaceId?: string;
+  teamMemberId?: string | null;
+  from?: string;
+  to?: string;
   days?: number;
 }): Promise<AgentUsageReport> {
   const admin = createSupabaseAdminClient();
   const days = Math.min(Math.max(1, Math.trunc(args.days || 30)), 365);
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const parsedUntil = args.to ? new Date(args.to) : new Date();
+  const untilDate = Number.isFinite(parsedUntil.getTime()) ? parsedUntil : new Date();
+  const parsedSince = args.from ? new Date(args.from) : null;
+  const sinceDate =
+    parsedSince && Number.isFinite(parsedSince.getTime())
+      ? parsedSince
+      : new Date(untilDate.getTime() - days * 24 * 60 * 60 * 1000);
+  const since = sinceDate.toISOString();
+  const until = untilDate.toISOString();
 
-  const [{ data: events }, { data: agents }, { data: tasks }] = await Promise.all([
-    admin
-      .from("billing_usage_events")
-      .select("agent_id, harness, model, source, total_tokens, model_cost_usd, total_charge_usd")
-      .eq("user_id", args.userId)
-      .gte("created_at", since)
-      .limit(20000),
-    admin.from("agents").select("id, name, type").eq("user_id", args.userId),
-    admin
-      .from("agent_tasks")
-      .select("agent_id, status")
-      .eq("user_id", args.userId)
-      .gte("created_at", since)
-      .limit(5000),
-  ]);
+  const membership = args.workspaceId
+    ? null
+    : await getWorkspaceMembershipForUser({ userId: args.userId, admin });
+  const workspaceId = args.workspaceId || membership?.workspace_id || null;
+  if (!workspaceId) {
+    return {
+      days,
+      since,
+      until,
+      totalCostUsd: 0,
+      totalChargedUsd: 0,
+      totalTokens: 0,
+      agents: [],
+    };
+  }
+
+  let eventsQuery = admin
+    .from("billing_usage_events")
+    .select("agent_id, harness, model, source, input_tokens, output_tokens, total_tokens, model_cost_usd, total_charge_usd, billable, charge_type, meta")
+    .eq("workspace_id", workspaceId)
+    .gte("created_at", since)
+    .lte("created_at", until);
+  if (args.teamMemberId) {
+    eventsQuery = eventsQuery.eq("user_id", args.teamMemberId);
+  }
+  const { data: events, error: eventsError } = await eventsQuery.limit(20000);
+  if (eventsError) throw new Error(eventsError.message);
+
+  const agentIds = Array.from(
+    new Set(
+      (events || [])
+        .map((event) => String(event.agent_id || ""))
+        .filter(Boolean),
+    ),
+  );
+  const [{ data: agents, error: agentsError }, { data: tasks, error: tasksError }] =
+    await Promise.all([
+      agentIds.length > 0
+        ? admin.from("agents").select("id, name, type").in("id", agentIds)
+        : Promise.resolve({ data: [], error: null }),
+      agentIds.length > 0 && !args.teamMemberId
+        ? admin
+            .from("agent_tasks")
+            .select("agent_id, status")
+            .in("agent_id", agentIds)
+            .gte("created_at", since)
+            .lte("created_at", until)
+            .limit(5000)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+  if (agentsError) throw new Error(agentsError.message);
+  if (tasksError) throw new Error(tasksError.message);
 
   const agentNameById = new Map<string, { name: string; type: string }>();
   for (const agent of agents || []) {
@@ -64,11 +124,21 @@ export async function buildAgentUsageReport(args: {
 
   const entries = new Map<string, AgentUsageEntry>();
   const virtualAttributionForSource = (source: string | null) => {
-    if (source?.startsWith("orchestrator")) {
+    if (
+      source?.startsWith("orchestrator") ||
+      source === "durable_context_checkpoint"
+    ) {
       return {
         key: "__orchestrator__",
         name: "Orchestrator",
         harness: "orchestrator",
+      };
+    }
+    if (source?.startsWith("heartbeat")) {
+      return {
+        key: "__heartbeat__",
+        name: "Heartbeat",
+        harness: "heartbeat",
       };
     }
     if (source === "compaction") {
@@ -78,9 +148,14 @@ export async function buildAgentUsageReport(args: {
         harness: "utility",
       };
     }
+    const normalizedSource = String(source || "unknown").trim();
     return {
-      key: "__unattributed__",
-      name: "Unattributed",
+      key: `__source__:${normalizedSource}`,
+      name: normalizedSource
+        .split("_")
+        .filter(Boolean)
+        .map((part) => part[0]?.toUpperCase() + part.slice(1))
+        .join(" ") || "Unattributed",
       harness: null,
     };
   };
@@ -107,7 +182,12 @@ export async function buildAgentUsageReport(args: {
         models: {},
         totalTokens: 0,
         costUsd: 0,
+        chargedUsd: 0,
         events: 0,
+        derivedCostEvents: 0,
+        unmeteredEvents: 0,
+        noChargeEvents: 0,
+        billableEvents: 0,
         tasks: { done: 0, failed: 0, canceled: 0, open: 0 },
       };
       entries.set(key, entry);
@@ -117,6 +197,7 @@ export async function buildAgentUsageReport(args: {
   };
 
   let totalCostUsd = 0;
+  let totalChargedUsd = 0;
   let totalTokens = 0;
   for (const event of events || []) {
     const e = event as {
@@ -124,23 +205,45 @@ export async function buildAgentUsageReport(args: {
       harness: string | null;
       model: string | null;
       source: string | null;
+      input_tokens: unknown;
+      output_tokens: unknown;
       total_tokens: unknown;
       model_cost_usd: unknown;
       total_charge_usd: unknown;
+      billable: boolean | null;
+      charge_type: string | null;
+      meta: Record<string, unknown> | null;
     };
     const entry = ensureEntry(e.agent_id, e.harness, e.source);
     const tokens = asNumber(e.total_tokens);
-    const cost = asNumber(e.total_charge_usd) || asNumber(e.model_cost_usd);
+    const providerCost = resolveProviderCostUsd({
+      model: e.model,
+      inputTokens: e.input_tokens,
+      outputTokens: e.output_tokens,
+      totalTokens: e.total_tokens,
+      storedModelCostUsd: e.model_cost_usd,
+      meta: e.meta,
+    });
+    const chargedUsd = asNumber(e.total_charge_usd);
     const modelKey = e.model || "unknown";
     const model = (entry.models[modelKey] ||= { totalTokens: 0, costUsd: 0, events: 0 });
     model.totalTokens += tokens;
-    model.costUsd += cost;
+    model.costUsd += providerCost.costUsd;
     model.events += 1;
     entry.totalTokens += tokens;
-    entry.costUsd += cost;
+    entry.costUsd += providerCost.costUsd;
+    entry.chargedUsd += chargedUsd;
     entry.events += 1;
+    if (providerCost.derived) entry.derivedCostEvents += 1;
+    if (tokens <= 0) entry.unmeteredEvents += 1;
+    if (e.billable === false || e.charge_type === "no_charge") {
+      entry.noChargeEvents += 1;
+    } else {
+      entry.billableEvents += 1;
+    }
     totalTokens += tokens;
-    totalCostUsd += cost;
+    totalCostUsd += providerCost.costUsd;
+    totalChargedUsd += chargedUsd;
   }
 
   for (const task of tasks || []) {
@@ -152,11 +255,21 @@ export async function buildAgentUsageReport(args: {
     else entry.tasks.open += 1;
   }
 
-  const list = Array.from(entries.values()).sort((a, b) => b.costUsd - a.costUsd);
+  const list = Array.from(entries.values()).sort(
+    (a, b) =>
+      b.totalTokens - a.totalTokens ||
+      b.costUsd - a.costUsd ||
+      b.events - a.events,
+  );
   return {
-    days,
+    days: Math.max(
+      1,
+      Math.ceil((untilDate.getTime() - sinceDate.getTime()) / (24 * 60 * 60 * 1000)),
+    ),
     since,
+    until,
     totalCostUsd: Math.round(totalCostUsd * 10000) / 10000,
+    totalChargedUsd: Math.round(totalChargedUsd * 10000) / 10000,
     totalTokens,
     agents: list,
   };

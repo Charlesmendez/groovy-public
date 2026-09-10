@@ -3,15 +3,91 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import {
   cloudScheduledJobEligibility,
   isCloudScheduleDue,
+  isSafeCloudScheduleRetry,
   type CloudScheduledJob,
 } from "@/lib/scheduler/cloud";
 import { schedulerCronSecret } from "@/lib/scheduler/cronAuth";
+import { getAppUrl } from "@/lib/config/appConfig";
 
 type TickResult = {
   jobId: string;
   status: "success" | "error" | "skipped" | "ignored" | "locked";
   reason?: string;
 };
+
+const SCHEDULER_RUN_PATH = "/api/scheduler/run";
+
+export function schedulerDispatchUrl(appUrl: string): string {
+  return new URL(SCHEDULER_RUN_PATH, appUrl).toString();
+}
+
+function isWwwVariant(left: string, right: string): boolean {
+  const withoutWww = (value: string) =>
+    value.toLowerCase().replace(/^www\./, "");
+  return withoutWww(left) === withoutWww(right);
+}
+
+export function schedulerDispatchRedirectTarget(
+  currentUrl: string,
+  location: string | null,
+): string | null {
+  if (!location) return null;
+  try {
+    const current = new URL(currentUrl);
+    const target = new URL(location, current);
+    const secureTransport =
+      target.protocol === "https:" ||
+      (process.env.NODE_ENV !== "production" &&
+        target.protocol === "http:" &&
+        (target.hostname === "localhost" || target.hostname === "127.0.0.1"));
+    if (
+      !secureTransport ||
+      target.username ||
+      target.password ||
+      target.pathname !== SCHEDULER_RUN_PATH ||
+      target.search ||
+      target.hash ||
+      target.port !== current.port ||
+      !isWwwVariant(target.hostname, current.hostname)
+    ) {
+      return null;
+    }
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function dispatchScheduledJob(args: {
+  url: string;
+  secret: string;
+  body: string;
+}): Promise<Response> {
+  let url = args.url;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${args.secret}`,
+        "Content-Type": "application/json",
+        "X-Groovy-Scheduler-Dispatch": "cloud",
+      },
+      body: args.body,
+      cache: "no-store",
+      redirect: "manual",
+    });
+    if (![301, 302, 307, 308].includes(response.status)) {
+      return response;
+    }
+    const target = schedulerDispatchRedirectTarget(
+      url,
+      response.headers.get("location"),
+    );
+    if (!target || attempt > 0) return response;
+    url = target;
+  }
+  throw new Error("scheduler_dispatch_redirect_limit");
+}
 
 function parseJsonBody(raw: string): Record<string, unknown> | null {
   try {
@@ -31,7 +107,7 @@ function maxCloudJobsPerTick(): number {
     : 4;
 }
 
-export async function runCloudSchedulerTick(req: Request): Promise<{
+export async function runCloudSchedulerTick(): Promise<{
   ok: boolean;
   checked: number;
   due: number;
@@ -89,7 +165,11 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
     )
     .slice(0, maxCloudJobsPerTick());
 
-  const dispatchUrl = new URL("/api/scheduler/run", req.url).toString();
+  // Vercel may expose a protected deployment origin through req.url even
+  // when the cron arrived through the public domain. Self-dispatch through
+  // the stable public origin so the request reaches this route instead of
+  // being rejected by deployment protection before app authentication.
+  const dispatchUrl = schedulerDispatchUrl(getAppUrl());
   const results = await Promise.all(
     due.map(async ({ job }): Promise<TickResult> => {
       const lockToken = randomUUID();
@@ -107,6 +187,7 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
       if (claimed !== true) return { jobId: job.id, status: "locked" };
 
       const started = new Date();
+      let previousLastRunAt = job.last_run_at || null;
       try {
         // The due/device snapshot above is intentionally broad. Re-check after
         // claiming the job so a connector run or reconnect that happened
@@ -126,6 +207,7 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
           };
         }
         const latestJob = latestRow as unknown as CloudScheduledJob;
+        previousLastRunAt = latestJob.last_run_at || null;
         const latestDue = isCloudScheduleDue(latestJob, started);
         const latestEligibility = cloudScheduledJobEligibility(latestJob);
         if (!latestDue.due || !latestEligibility.eligible) {
@@ -205,19 +287,14 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
           };
         }
 
-        const response = await fetch(dispatchUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${secret}`,
-            "Content-Type": "application/json",
-            "X-Groovy-Scheduler-Dispatch": "cloud",
-          },
+        const response = await dispatchScheduledJob({
+          url: dispatchUrl,
+          secret,
           body: JSON.stringify({
             jobId: job.id,
             runId: randomUUID(),
             timezone: latestDue.timezone,
           }),
-          cache: "no-store",
         });
         const raw = await response.text();
         const payload = parseJsonBody(raw);
@@ -230,6 +307,8 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
             : payload?.kind === "needs_connector"
               ? "cloud_scheduler_connector_tool_blocked"
               : `scheduler_dispatch_http_${response.status}`;
+        const safeRetry =
+          !success && isSafeCloudScheduleRetry(payload?.error);
         const text =
           typeof payload?.text === "string"
             ? payload.text
@@ -243,6 +322,9 @@ export async function runCloudSchedulerTick(req: Request): Promise<{
           admin
             .from("scheduled_jobs")
             .update({
+              ...(safeRetry
+                ? { last_run_at: previousLastRunAt }
+                : {}),
               last_status: success ? "success" : "error",
               last_exit_code: success ? 0 : 1,
               updated_at: finished.toISOString(),

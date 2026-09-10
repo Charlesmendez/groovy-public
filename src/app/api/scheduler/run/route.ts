@@ -19,8 +19,19 @@ import { inferScheduledWhatsAppDeliveryIntent } from "@/lib/scheduler/delivery";
 import { inferProviderForModelId } from "@/lib/ai/modelCatalog";
 import { isSchedulerCronAuthorized } from "@/lib/scheduler/cronAuth";
 import { runCloudSchedulerTick } from "@/lib/scheduler/cloudRunner";
-import { cloudScheduledJobEligibility } from "@/lib/scheduler/cloud";
+import {
+  cloudScheduledJobEligibility,
+  normalizeScheduleTimezone,
+  withScheduleTimezone,
+} from "@/lib/scheduler/cloud";
 import { getAppUrl } from "@/lib/config/appConfig";
+import { isIncompleteScheduledFinal } from "@/lib/scheduler/finalResult";
+import { acquireTurnLock } from "@/lib/teamChat";
+import {
+  publishScheduledChannelResult,
+  resolveScheduledChannelRuntime,
+  ScheduledChannelRuntimeError,
+} from "@/lib/chat/scheduledChannelRuntime";
 
 // Ensure long-running scheduled jobs don't get cut off by Edge defaults.
 export const runtime = "nodejs";
@@ -228,6 +239,8 @@ async function selfHealScheduledRuntimeScope(args: {
   userId: string;
   jobName: string | null;
   jobAgentId: string | null;
+  jobSessionId: string | null;
+  preferredSessionId?: string | null;
   taskObj: Record<string, unknown> | null;
 }): Promise<{
   agentId: string | null;
@@ -237,7 +250,12 @@ async function selfHealScheduledRuntimeScope(args: {
   const taskObj = args.taskObj ? { ...args.taskObj } : {};
   const rawTaskAgentId = requireString(taskObj.orchestrator_agent_id);
   const rawJobAgentId = requireString(args.jobAgentId);
-  const currentSessionId = requireString(taskObj.orchestrator_session_id);
+  const rawTaskSessionId = requireString(taskObj.orchestrator_session_id);
+  const rawJobSessionId = requireString(args.jobSessionId);
+  const currentSessionId =
+    requireString(args.preferredSessionId) ||
+    rawTaskSessionId ||
+    rawJobSessionId;
   const taskAgentId = await resolveOwnedAgentId(args.supabase, args.userId, rawTaskAgentId);
   const jobAgentId = await resolveOwnedAgentId(args.supabase, args.userId, rawJobAgentId);
   const hadDeletedAgentReference =
@@ -251,7 +269,10 @@ async function selfHealScheduledRuntimeScope(args: {
   let sessionId = await resolveExistingOrchestratorSessionId({
     supabase: args.supabase,
     userId: args.userId,
-    sessionId: hadDeletedAgentReference ? null : currentSessionId,
+    sessionId:
+      hadDeletedAgentReference && !args.preferredSessionId
+        ? null
+        : currentSessionId,
   });
 
   if (!sessionId && agentId) {
@@ -274,12 +295,18 @@ async function selfHealScheduledRuntimeScope(args: {
     delete taskObj.orchestrator_session_id;
   }
 
-  if (rawTaskAgentId !== agentId || rawJobAgentId !== agentId || currentSessionId !== sessionId) {
+  if (
+    rawTaskAgentId !== agentId ||
+    rawJobAgentId !== agentId ||
+    rawTaskSessionId !== sessionId ||
+    rawJobSessionId !== sessionId
+  ) {
     try {
       const { error } = await args.supabase
         .from("scheduled_jobs")
         .update({
           agent_id: agentId,
+          session_id: sessionId,
           task: taskObj,
           updated_at: new Date().toISOString(),
         })
@@ -313,12 +340,13 @@ export async function POST(req: Request) {
   }
 
   const body = (await req.json().catch(() => null)) as Body | null;
+  const connectorTimezone = normalizeScheduleTimezone(body?.timezone);
   if (body?.cronTick === true) {
     if (!cronAuthorized) {
       return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
     }
     try {
-      return NextResponse.json(await runCloudSchedulerTick(req));
+      return NextResponse.json(await runCloudSchedulerTick());
     } catch (error) {
       console.error("[scheduler-run] cloud tick failed", error);
       return NextResponse.json(
@@ -341,7 +369,7 @@ export async function POST(req: Request) {
   let jobQuery = supabase
     .from("scheduled_jobs")
     .select(
-      "id,user_id,name,agent_id,device_id,kind,task,schedule,enabled,target_agent_id,last_run_at,skip_next_run"
+      "id,user_id,name,agent_id,device_id,kind,task,schedule,enabled,target_agent_id,last_run_at,skip_next_run,session_id"
     )
     .eq("id", jobId)
     .limit(1);
@@ -364,6 +392,32 @@ export async function POST(req: Request) {
   const actor = verified;
   if (!actor) {
     return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  // Device-authenticated runs know the connector's actual IANA timezone.
+  // Persist it onto legacy daily/weekly rows so future cloud fallbacks evaluate
+  // the same local wall-clock time as the connector instead of assuming UTC.
+  if (!cronAuthorized && connectorTimezone) {
+    const localized = withScheduleTimezone(job.schedule, connectorTimezone);
+    if (localized.changed && localized.schedule) {
+      const { error: timezoneUpdateError } = await supabase
+        .from("scheduled_jobs")
+        .update({
+          schedule: localized.schedule,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", jobId)
+        .eq("device_id", actor.deviceId);
+      if (timezoneUpdateError) {
+        console.warn("[scheduler-run] timezone persistence failed", {
+          jobId,
+          deviceId: actor.deviceId,
+          error: timezoneUpdateError.message,
+        });
+      } else {
+        job.schedule = localized.schedule;
+      }
+    }
   }
 
   // Piggyback the agent-task reconciler on scheduler activity.
@@ -427,7 +481,38 @@ export async function POST(req: Request) {
     : null;
   const scheduledReasoningEffort = requireString(taskOptions?.reasoning_effort);
   const requiresWhatsAppDelivery = scheduledTaskRequiresWhatsAppDelivery(taskObj);
+  const scheduledRunId =
+    requireString(body?.runId) ||
+    `legacy-${jobId}-${requireString(job.last_run_at) || "untracked"}`;
 
+  let scheduledChannelRuntime:
+    | Awaited<ReturnType<typeof resolveScheduledChannelRuntime>>
+    | null = null;
+  try {
+    scheduledChannelRuntime = await resolveScheduledChannelRuntime({
+      admin: supabase,
+      jobId,
+      userId: actor.userId,
+      taskSessionId: requireString(taskObj?.orchestrator_session_id),
+      jobSessionId: requireString(
+        (job as { session_id?: unknown }).session_id,
+      ),
+    });
+  } catch (error) {
+    const permanent = error instanceof ScheduledChannelRuntimeError;
+    const code = permanent
+      ? error.code
+      : "scheduled_channel_resolution_failed";
+    return NextResponse.json(
+      {
+        ok: false,
+        error: code,
+        detail: error instanceof Error ? error.message : String(error),
+        retryable: !permanent,
+      },
+      { status: permanent ? 409 : 503 },
+    );
+  }
   // ── Heartbeat branch ──────────────────────────────────────────────────
   if (taskObj?.type === "heartbeat_v1") {
     // Continuation round: connector already sent WhatsApp, we're done.
@@ -508,7 +593,7 @@ export async function POST(req: Request) {
         agentId: currentTaskAgentId,
         taskConfig: effectiveTaskConfig,
         jobId,
-        timezone: typeof body?.timezone === "string" ? body.timezone : undefined,
+        timezone: connectorTimezone || undefined,
       });
 
       console.log("[scheduler-run] heartbeat result", {
@@ -681,6 +766,9 @@ export async function POST(req: Request) {
     userId: actor.userId,
     jobName: requireString((job as { name?: unknown }).name),
     jobAgentId: requireString((job as { agent_id?: unknown }).agent_id),
+    jobSessionId:
+      requireString((job as { session_id?: unknown }).session_id),
+    preferredSessionId: scheduledChannelRuntime?.sessionId || null,
     taskObj,
   });
   taskObj = healedRuntimeScope.taskObj;
@@ -694,11 +782,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: "job_task_message_missing" }, { status: 400 });
   }
 
-  // IMPORTANT:
-  // runOrchestratorRound expects the caller to include the user's message in `history`.
-  // The `message` arg is used mainly for routing and file attachment logic, but is NOT
-  // automatically appended to the model messages. For scheduled jobs, we treat the job's
-  // task message as the single user message.
+  // Scheduled jobs treat the task prompt as the current user message. Keep it
+  // in both caller history and `message`: durable-context reconciliation uses
+  // the latter to append/replace the exact current turn without duplicating it.
   const currentTaskOptions =
     taskObj && typeof taskObj.options === "object" && taskObj.options
       ? (taskObj.options as Record<string, unknown>)
@@ -740,6 +826,26 @@ export async function POST(req: Request) {
     : [];
 
   const incomingTraceId = requireString(body?.traceId) || undefined;
+  const targetAgentId =
+    typeof (job as { target_agent_id?: unknown }).target_agent_id === "string" &&
+    (job as { target_agent_id: string }).target_agent_id.trim()
+      ? (job as { target_agent_id: string }).target_agent_id.trim()
+      : null;
+  if (
+    targetAgentId &&
+    scheduledChannelRuntime &&
+    !scheduledChannelRuntime.allowedAgentIds.includes(targetAgentId)
+  ) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "scheduled_channel_worker_unavailable",
+        detail:
+          "The worker assigned to this scheduled task is no longer selected in the channel.",
+      },
+      { status: 409 },
+    );
+  }
 
   // Fast-path: once connector tool results are available, avoid re-running the model.
   // This prevents expensive duplicate data_query execution after connector delivery attempts.
@@ -792,11 +898,93 @@ export async function POST(req: Request) {
     }
 
     if (primaryAllOk || allOk) {
+      let deliveryText = `Sent scheduled WhatsApp message to ${target}.`;
+      if (scheduledChannelRuntime) {
+        let deliveryLock:
+          | Awaited<ReturnType<typeof acquireTurnLock>>
+          | null = null;
+        if (!targetAgentId) {
+          try {
+            deliveryLock = await acquireTurnLock(
+              supabase,
+              scheduledChannelRuntime.sessionId,
+            );
+          } catch (error) {
+            return NextResponse.json(
+              {
+                ok: false,
+                error: "scheduled_channel_resolution_failed",
+                detail: error instanceof Error ? error.message : String(error),
+                retryable: true,
+              },
+              { status: 503 },
+            );
+          }
+          if (!deliveryLock) {
+            return NextResponse.json(
+              {
+                ok: false,
+                error: "scheduled_channel_busy",
+                detail:
+                  "The channel Mind is handling another turn. Retry this scheduled delivery shortly.",
+                retryable: true,
+              },
+              { status: 409 },
+            );
+          }
+        }
+        try {
+          deliveryText = await publishScheduledChannelResult({
+            admin: supabase,
+            runtime: scheduledChannelRuntime,
+            jobId,
+            jobName: requireString((job as { name?: unknown }).name),
+            runId: scheduledRunId,
+            traceId: incomingTraceId || scheduledRunId,
+            taskMessage: message,
+            text: deliveryText,
+            author: targetAgentId
+              ? {
+                  type: "agent",
+                  agentId: targetAgentId,
+                  agentName:
+                    scheduledChannelRuntime.agentNamesById[targetAgentId] ||
+                    "Worker agent",
+                }
+              : { type: "orchestrator" },
+          });
+        } catch (error) {
+          return NextResponse.json(
+            {
+              ok: false,
+              error: "scheduled_channel_publish_failed",
+              detail: error instanceof Error ? error.message : String(error),
+              retryable: true,
+            },
+            { status: 503 },
+          );
+        } finally {
+          await deliveryLock?.release().catch((error) => {
+            console.warn(
+              "[scheduler-run] channel delivery lock release failed",
+              {
+                jobId,
+                channelId: scheduledChannelRuntime.channelId,
+                error:
+                  error instanceof Error ? error.message : String(error),
+              },
+            );
+          });
+        }
+      }
       return NextResponse.json({
         ok: true,
         kind: "final",
         traceId: incomingTraceId,
-        text: `Sent scheduled WhatsApp message to ${target}.`,
+        text: deliveryText,
+        ...(scheduledChannelRuntime
+          ? { deliveredToChannel: scheduledChannelRuntime.channelId }
+          : {}),
       });
     }
 
@@ -818,52 +1006,7 @@ export async function POST(req: Request) {
   // task runner (headless claude_run on the worker's device) instead of an
   // orchestrator round. The job stays bound to the TICKING device; execution
   // routes cross-device over the relay internal RPC.
-  const targetAgentId =
-    typeof (job as { target_agent_id?: unknown }).target_agent_id === "string" &&
-    (job as { target_agent_id: string }).target_agent_id.trim()
-      ? (job as { target_agent_id: string }).target_agent_id.trim()
-      : null;
   if (targetAgentId) {
-    // A worker delivery is a two-round exchange: first run the worker and ask
-    // the connector to send, then consume that connector result here. Without
-    // this continuation guard, a successful WhatsApp send would run through
-    // the worker branch again and request the same send on every round.
-    const workerToolResults = Array.isArray(body?.toolResults) ? body.toolResults : [];
-    const workerWhatsAppResult = workerToolResults.find(
-      (result) =>
-        result &&
-        typeof result === "object" &&
-        (result.toolName === "whatsapp_send_default_group" ||
-          result.toolName === "whatsapp_send_text")
-    );
-    if (workerWhatsAppResult) {
-      const rawResult = workerWhatsAppResult.result;
-      const parsedResult =
-        typeof rawResult === "string"
-          ? parseJson(rawResult)
-          : rawResult && typeof rawResult === "object"
-            ? rawResult
-            : null;
-      const resultObj =
-        parsedResult && typeof parsedResult === "object"
-          ? (parsedResult as Record<string, unknown>)
-          : null;
-      if (resultObj?.ok === true) {
-        return NextResponse.json({
-          ok: true,
-          kind: "final",
-          traceId: requireString(body?.traceId),
-          text: "Scheduled worker result delivered.",
-        });
-      }
-      const deliveryError = requireString(resultObj?.error) || "whatsapp_send_failed";
-      const retryable = isRetryableWhatsAppSendError(deliveryError);
-      return NextResponse.json(
-        { ok: false, error: deliveryError, retryable },
-        { status: retryable ? 503 : 502 }
-      );
-    }
-
     const explicitDelivery =
       taskObj && typeof taskObj.delivery === "object" && taskObj.delivery
         ? (taskObj.delivery as { dashboard?: boolean; whatsapp?: boolean; telegram?: boolean })
@@ -946,16 +1089,57 @@ export async function POST(req: Request) {
       if (!outcome.ok) {
         return { ok: false, error: outcome.error, retryable: outcome.retryable };
       }
+      const workerTraceId =
+        requireString(outcome.traceId) ||
+        requireString(body?.traceId) ||
+        scheduledRunId;
       if (outcome.kind === "needs_connector") {
         return {
           ok: true,
           kind: "needs_connector",
-          traceId: outcome.traceId,
+          traceId: workerTraceId,
           partialText: outcome.partialText,
           connectorExecutes: outcome.connectorExecutes,
         };
       }
-      return { ok: true, kind: "final", traceId: outcome.traceId, text: outcome.text };
+      let finalText = outcome.text;
+      if (isIncompleteScheduledFinal(finalText)) {
+        return {
+          ok: false,
+          error: "scheduled_orchestrator_incomplete_final",
+          retryable: true,
+        };
+      }
+      if (scheduledChannelRuntime) {
+        finalText = await publishScheduledChannelResult({
+          admin: supabase,
+          runtime: scheduledChannelRuntime,
+          jobId,
+          jobName: requireString((job as { name?: unknown }).name),
+          runId: scheduledRunId,
+          traceId: workerTraceId,
+          taskMessage: message,
+          text: finalText,
+          author: {
+            type: "agent",
+            agentId: targetAgentId,
+            agentName:
+              scheduledChannelRuntime.agentNamesById[targetAgentId] ||
+              "Worker agent",
+          },
+        });
+      }
+      return {
+        ok: true,
+        kind: "final",
+        traceId: workerTraceId,
+        text: finalText,
+        ...(scheduledChannelRuntime
+          ? {
+              deliveredToChannel: scheduledChannelRuntime.channelId,
+            }
+          : {}),
+      };
     });
   }
   // ── End worker-agent branch ─────────────────────────────────────────────
@@ -969,13 +1153,13 @@ export async function POST(req: Request) {
     messagePreview: message.slice(0, 140),
   });
 
-  const jobProfile = jobProfileId
+  const jobProfile = !scheduledChannelRuntime && jobProfileId
     ? await resolveHarnessProfile(supabase, {
         userId: actor.userId,
         explicitProfileId: jobProfileId,
       })
     : undefined;
-  if (jobProfileId && !jobProfile) {
+  if (!scheduledChannelRuntime && jobProfileId && !jobProfile) {
     return NextResponse.json(
       {
         ok: false,
@@ -984,6 +1168,39 @@ export async function POST(req: Request) {
       },
       { status: 409 },
     );
+  }
+  let scheduledChannelTurnLock:
+    | Awaited<ReturnType<typeof acquireTurnLock>>
+    | null = null;
+  if (scheduledChannelRuntime) {
+    try {
+      scheduledChannelTurnLock = await acquireTurnLock(
+        supabase,
+        scheduledChannelRuntime.sessionId,
+      );
+    } catch (error) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "scheduled_channel_resolution_failed",
+          detail: error instanceof Error ? error.message : String(error),
+          retryable: true,
+        },
+        { status: 503 },
+      );
+    }
+    if (!scheduledChannelTurnLock) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "scheduled_channel_busy",
+          detail:
+            "The channel Mind is handling another turn. Retry this scheduled run shortly.",
+          retryable: true,
+        },
+        { status: 409 },
+      );
+    }
   }
 
   // IMPORTANT:
@@ -1030,22 +1247,43 @@ export async function POST(req: Request) {
           supabase,
           userId: actor.userId,
           userEmail,
-          // Job-pinned mind wins; otherwise session-sticky/default resolution
-          // happens inside runOrchestratorRound.
-          profile: jobProfile,
+          // Team Chat schedules always use the Mind currently selected in the
+          // originating channel. Personal schedules keep their pinned Mind.
+          profile: scheduledChannelRuntime
+            ? scheduledChannelRuntime.profile
+            : jobProfile,
           orchestratorAgentId: resolvedTaskAgentId,
-          orchestratorSessionId: resolvedTaskSessionId,
+          orchestratorSessionId:
+            scheduledChannelRuntime?.sessionId || resolvedTaskSessionId,
           appBaseUrl: origin,
           deviceId: cronAuthorized ? null : actor.deviceId,
           connectorPlatform,
           turnId: incomingTraceId,
           history,
-          message: "",
+          message,
           memoryEnabled: false,
           cookies: undefined,
           // Pass device token so internal API calls (data_query -> /api/datagran/chat) can authenticate
           deviceToken: cronAuthorized ? undefined : deviceToken,
-          sourceProvider: cronAuthorized ? "scheduler_cloud" : "scheduler",
+          sourceProvider:
+            scheduledChannelRuntime?.sourceProvider ||
+            (cronAuthorized ? "scheduler_cloud" : "scheduler"),
+          sourceThreadKey: scheduledChannelRuntime?.channelId || null,
+          memoryScopeId: scheduledChannelRuntime?.hasGuests
+            ? scheduledChannelRuntime.channelId
+            : null,
+          channelInstructions:
+            scheduledChannelRuntime?.channelInstructions || null,
+          channelParticipantContext:
+            scheduledChannelRuntime?.channelParticipantContext || null,
+          additionalSkillArtifactIds:
+            scheduledChannelRuntime?.additionalSkillArtifactIds,
+          skillWorkspaceId: scheduledChannelRuntime?.workspaceId,
+          taskRequestedChannel: scheduledChannelRuntime
+            ? `team_chat:${scheduledChannelRuntime.channelId}`
+            : null,
+          allowedAgentIds: scheduledChannelRuntime?.allowedAgentIds,
+          agentRosterMode: scheduledChannelRuntime ? "replace" : undefined,
           traceId: incomingTraceId,
           toolResults: toolResults.length ? toolResults : undefined,
           // Scheduled jobs need all tools, even if task text contains "weekly" or schedule keywords
@@ -1055,7 +1293,7 @@ export async function POST(req: Request) {
           // Keep each invocation under maxDuration by sharing a soft deadline with tools.
           scheduledHardDeadlineAtMs: Date.now() + softBudgetMsForJob,
           scheduledDataQueryTimeoutMs: dataQueryTimeoutMsForJob || undefined,
-          localTimezone: typeof body?.timezone === "string" ? body.timezone : undefined,
+          localTimezone: connectorTimezone || undefined,
           // Explicitly cap steps in scheduled mode to avoid hitting maxDuration.
           maxSteps: maxStepsForJob,
           modelOverride:
@@ -1212,12 +1450,33 @@ export async function POST(req: Request) {
             };
           }
         } else {
+          let finalText = round.text || "";
+          if (isIncompleteScheduledFinal(finalText)) {
+            throw new Error("scheduled_orchestrator_incomplete_final");
+          }
+          if (scheduledChannelRuntime) {
+            finalText = await publishScheduledChannelResult({
+              admin: supabase,
+              runtime: scheduledChannelRuntime,
+              jobId,
+              jobName: requireString((job as { name?: unknown }).name),
+              runId: scheduledRunId,
+              traceId: round.traceId,
+              taskMessage: message,
+              text: finalText,
+            });
+          }
           payload = {
             ok: true,
             kind: "final",
             traceId: round.traceId,
-            text: round.text || "",
+            text: finalText,
             requiresWhatsAppDelivery,
+            ...(scheduledChannelRuntime
+              ? {
+                  deliveredToChannel: scheduledChannelRuntime.channelId,
+                }
+              : {}),
           };
         }
 
@@ -1230,10 +1489,23 @@ export async function POST(req: Request) {
       } catch (err) {
         if (keepalive) clearInterval(keepalive);
         const msg = err instanceof Error ? err.message : String(err);
-        console.error("[scheduler-run] error", { jobId, traceId: incomingTraceId || null, error: msg });
+        const errorCode =
+          err instanceof ScheduledChannelRuntimeError ? err.code : msg;
+        console.error("[scheduler-run] error", {
+          jobId,
+          traceId: incomingTraceId || null,
+          error: msg,
+        });
         try {
           controller.enqueue(
-            encoder.encode(JSON.stringify({ ok: false, error: msg || "scheduler_run_failed" }))
+            encoder.encode(
+              JSON.stringify({
+                ok: false,
+                error: errorCode || "scheduler_run_failed",
+                detail: msg || undefined,
+                retryable: true,
+              }),
+            ),
           );
         } catch {
           // ignore
@@ -1243,6 +1515,14 @@ export async function POST(req: Request) {
         } catch {
           // ignore
         }
+      } finally {
+        await scheduledChannelTurnLock?.release().catch((error) => {
+          console.warn("[scheduler-run] channel turn lock release failed", {
+            jobId,
+            channelId: scheduledChannelRuntime?.channelId || null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
       }
     },
   });
@@ -1265,7 +1545,7 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
   }
   try {
-    return NextResponse.json(await runCloudSchedulerTick(req));
+    return NextResponse.json(await runCloudSchedulerTick());
   } catch (error) {
     console.error("[scheduler-run] cloud GET tick failed", error);
     return NextResponse.json(

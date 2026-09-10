@@ -7,7 +7,11 @@ import {
   parseBrowserPushSubscription,
   parseChatNotificationMode,
 } from "@/lib/notifications/push";
-import { getWebPushPublicKey } from "@/lib/notifications/webPush";
+import { notificationUnreadState } from "@/lib/notifications/badge";
+import {
+  getWebPushPublicKey,
+  sendWebPushTestNotification,
+} from "@/lib/notifications/webPush";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -49,6 +53,17 @@ function readStateMigrationPending(error: {
   );
 }
 
+function unreadCountMigrationPending(error: {
+  code?: string | null;
+  message?: string | null;
+}): boolean {
+  return (
+    error.code === "42883" ||
+    error.code === "PGRST202" ||
+    error.message?.includes("chat_channel_unread_counts") === true
+  );
+}
+
 export async function GET(req: Request) {
   const supabase = await createSupabaseServerClient();
   const {
@@ -57,6 +72,70 @@ export async function GET(req: Request) {
   if (!user) return json({ error: "Unauthorized" }, { status: 401 });
 
   const searchParams = new URL(req.url).searchParams;
+  if (searchParams.get("state") === "1") {
+    const { data: preferenceRows, error: preferenceError } = await supabase
+      .from("chat_notification_preferences")
+      .select("channel_id")
+      .eq("user_id", user.id)
+      .neq("mode", "off");
+    if (preferenceError) {
+      if (migrationPending(preferenceError)) {
+        return json({
+          migrationPending: true,
+          unreadCount: 0,
+          unreadChannelIds: [],
+        });
+      }
+      return json({ error: preferenceError.message }, { status: 500 });
+    }
+    const channelIds = Array.from(
+      new Set(
+        (preferenceRows || [])
+          .map((row) => row.channel_id)
+          .filter(
+            (channelId): channelId is string =>
+              typeof channelId === "string",
+          ),
+      ),
+    );
+    if (channelIds.length === 0) {
+      return json({
+        migrationPending: false,
+        unreadCount: 0,
+        unreadChannelIds: [],
+      });
+    }
+    const { data: unreadRows, error: unreadError } = await supabase.rpc(
+      "chat_channel_unread_counts",
+      { p_channel_ids: channelIds },
+    );
+    if (unreadError) {
+      if (unreadCountMigrationPending(unreadError)) {
+        return json(
+          {
+            error: "Unread notification state is still being activated",
+            migrationPending: true,
+          },
+          { status: 503 },
+        );
+      }
+      return json({ error: unreadError.message }, { status: 500 });
+    }
+    const counts = new Map<string, unknown>(
+      channelIds.map((channelId) => [channelId, 0] as const),
+    );
+    for (const row of (unreadRows || []) as Array<{
+      channel_id?: unknown;
+      unread_count?: unknown;
+    }>) {
+      if (typeof row.channel_id !== "string") continue;
+      counts.set(row.channel_id, row.unread_count);
+    }
+    return json({
+      migrationPending: false,
+      ...notificationUnreadState(counts),
+    });
+  }
   const channelId = searchParams.get("channelId");
   const messageId = searchParams.get("messageId");
   if (channelId && !UUID_PATTERN.test(channelId)) {
@@ -249,6 +328,62 @@ export async function POST(req: Request) {
       );
     }
     return json({ ok: true });
+  }
+
+  if (body.action === "test") {
+    const endpoint =
+      typeof body.endpoint === "string" ? body.endpoint.trim() : "";
+    let parsedEndpoint: URL;
+    try {
+      parsedEndpoint = new URL(endpoint);
+    } catch {
+      return json({ error: "Invalid endpoint" }, { status: 400 });
+    }
+    if (parsedEndpoint.protocol !== "https:" || endpoint.length > 2048) {
+      return json({ error: "Invalid endpoint" }, { status: 400 });
+    }
+    try {
+      const result = await sendWebPushTestNotification({
+        admin: createSupabaseAdminClient(),
+        userId: user.id,
+        endpoint,
+      });
+      if (!result.delivered) {
+        const expired = result.reason === "subscription_expired";
+        const rateLimited = result.reason === "rate_limited";
+        return json(
+          {
+            error: rateLimited
+              ? "A notification was just delivered to this device. Wait a few seconds and try again."
+              : expired
+                ? "This device subscription expired. Reconnect notifications and try again."
+                : result.reason === "not_configured"
+                  ? "Web Push is not configured on this deployment."
+                  : "This device is not connected for notifications.",
+            reason: result.reason || "not_delivered",
+          },
+          {
+            status: rateLimited
+              ? 429
+              : result.reason === "not_configured"
+                ? 503
+                : expired
+                  ? 410
+                  : 404,
+          },
+        );
+      }
+      return json({ ok: true, delivered: true });
+    } catch (cause) {
+      console.warn("[web-push] test notification failed", {
+        userId: user.id,
+        error: cause instanceof Error ? cause.message : "Unknown error",
+      });
+      return json(
+        { error: "The test alert could not be delivered. Try again shortly." },
+        { status: 502 },
+      );
+    }
   }
 
   if (body.action === "unsubscribe") {

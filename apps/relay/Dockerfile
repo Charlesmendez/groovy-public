@@ -6,6 +6,12 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY server.mjs ./
+COPY privateLiveVoiceProxy.mjs ./
+COPY liveProtocol.mjs ./
+COPY agentTaskCompletionUrl.mjs ./
+COPY scheduledJobManualRun.mjs ./
+COPY scheduledJobSafety.mjs ./
+COPY workspacePickRequest.mjs ./
 RUN addgroup -S app && adduser -S -G app app && chown -R app:app /app
 
 ENV PORT=8080

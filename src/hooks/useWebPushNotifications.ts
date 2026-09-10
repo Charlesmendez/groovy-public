@@ -1,8 +1,13 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getDesktopApi, isDesktopShell } from "@/lib/desktop/shell";
+import {
+  getDesktopApi,
+  isDesktopShell,
+  type DesktopNativeNotificationPermission,
+} from "@/lib/desktop/shell";
 import type { ChatNotificationMode } from "@/lib/notifications/push";
+import { NOTIFICATION_AUDIO_UNLOCK_EVENT } from "@/lib/chat/events";
 
 type PushPreference = {
   channel_id: string;
@@ -64,6 +69,32 @@ async function responsePayload(response: Response): Promise<PushApiPayload> {
   return (await response.json().catch(() => ({}))) as PushApiPayload;
 }
 
+// Several components mount this hook during boot (settings, room controls,
+// install nudge). Share one in-flight config response for a few seconds so a
+// cold open issues a single /api/notifications/push request instead of three.
+const PUSH_CONFIG_SHARE_MS = 5_000;
+let sharedPushConfigFetch: {
+  at: number;
+  promise: Promise<Response>;
+} | null = null;
+
+function fetchPushConfig(): Promise<Response> {
+  const now = Date.now();
+  if (
+    sharedPushConfigFetch &&
+    now - sharedPushConfigFetch.at < PUSH_CONFIG_SHARE_MS
+  ) {
+    return sharedPushConfigFetch.promise.then((response) => response.clone());
+  }
+  const promise = fetch("/api/notifications/push", { cache: "no-store" });
+  const entry = { at: now, promise };
+  sharedPushConfigFetch = entry;
+  promise.catch(() => {
+    if (sharedPushConfigFetch === entry) sharedPushConfigFetch = null;
+  });
+  return promise.then((response) => response.clone());
+}
+
 export function useWebPushNotifications() {
   const [transport, setTransport] =
     useState<NotificationTransport>("web-push");
@@ -71,14 +102,15 @@ export function useWebPushNotifications() {
   const [configured, setConfigured] = useState(false);
   const [migrationPending, setMigrationPending] = useState(false);
   const [publicKey, setPublicKey] = useState("");
-  const [permission, setPermission] = useState<
-    NotificationPermission | "unsupported"
-  >("unsupported");
+  const [permission, setPermission] =
+    useState<DesktopNativeNotificationPermission>("unsupported");
   const [deviceSubscribed, setDeviceSubscribed] = useState(false);
   const [subscriptionCount, setSubscriptionCount] = useState(0);
   const [preferences, setPreferences] = useState<PushPreference[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [testBusy, setTestBusy] = useState(false);
+  const [testStatus, setTestStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -95,9 +127,7 @@ export function useWebPushNotifications() {
     setError(null);
     try {
       const [response, nativeStatus] = await Promise.all([
-        fetch("/api/notifications/push", {
-          cache: "no-store",
-        }),
+        fetchPushConfig(),
         desktop
           ? getDesktopApi().getNativeNotificationStatus()
           : Promise.resolve(null),
@@ -118,9 +148,7 @@ export function useWebPushNotifications() {
         setSupport(nativeSupported ? "supported" : "unsupported");
         setPermission(
           nativeSupported
-            ? nativeStatus?.permission === "denied"
-              ? "denied"
-              : "granted"
+            ? nativeStatus?.permission || "unknown"
             : "unsupported",
         );
         setDeviceSubscribed(nativeSupported);
@@ -150,6 +178,8 @@ export function useWebPushNotifications() {
     if (isDesktopShell() || !("serviceWorker" in navigator)) return;
     const onMessage = (event: MessageEvent) => {
       if (event.data?.type === "groovy-push-subscription-changed") {
+        void refresh();
+      } else if (event.data?.type === "groovy-notification-state") {
         void refresh();
       }
     };
@@ -185,7 +215,7 @@ export function useWebPushNotifications() {
       setTransport("desktop-native");
       setSupport("supported");
       setConfigured(true);
-      setPermission("granted");
+      setPermission(nativeStatus.permission);
       setDeviceSubscribed(true);
       return null;
     }
@@ -194,6 +224,10 @@ export function useWebPushNotifications() {
         "This browser cannot receive background notifications. On iPhone or iPad, add Groovy to your Home Screen first.",
       );
     }
+    // This function starts in a click handler. Notify the global bridge before
+    // the first await so Web Audio receives the same browser activation and
+    // notification tones do not begin only after unrelated product use.
+    window.dispatchEvent(new Event(NOTIFICATION_AUDIO_UNLOCK_EVENT));
     if (!configured || !publicKey) {
       throw new Error(
         migrationPending
@@ -307,6 +341,7 @@ export function useWebPushNotifications() {
       return false;
     }
     setBusy(true);
+    setTestStatus(null);
     setError(null);
     try {
       const registration = await navigator.serviceWorker.getRegistration("/");
@@ -341,6 +376,91 @@ export function useWebPushNotifications() {
     }
   }, [busy]);
 
+  const testThisDevice = useCallback(async () => {
+    if (busy || testBusy) return false;
+    setTestBusy(true);
+    setTestStatus(null);
+    setError(null);
+    try {
+      if (isDesktopShell()) {
+        const desktop = getDesktopApi();
+        const status = await desktop.getNativeNotificationStatus();
+        if (!status.supported) {
+          throw new Error(
+            "Update Groovy Desktop to send a native test alert.",
+          );
+        }
+        const result = await desktop.testNativeNotification();
+        if (!result.requested) {
+          throw new Error(
+            result.reason === "desktop_update_required"
+              ? "Update Groovy Desktop to send a native test alert."
+              : "Groovy could not request the native test alert. Open macOS notification settings and allow Groovy.",
+          );
+        }
+        setPermission(status.permission);
+        setTestStatus(
+          "Test alert requested. If no banner appeared, check Groovy in macOS Notifications and your current Focus mode.",
+        );
+        return true;
+      }
+      const subscription = await ensureDeviceSubscription();
+      if (!subscription) {
+        throw new Error("This device is not connected for browser alerts.");
+      }
+      const response = await fetch("/api/notifications/push", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "test",
+          endpoint: subscription.endpoint,
+        }),
+      });
+      const payload = await responsePayload(response);
+      if (!response.ok) {
+        if (response.status === 410) {
+          await subscription.unsubscribe().catch(() => false);
+          setDeviceSubscribed(false);
+          setSubscriptionCount((current) => Math.max(0, current - 1));
+        }
+        throw new Error(
+          payload.error || "The test alert could not be delivered.",
+        );
+      }
+      setTestStatus(
+        "Test alert sent. Your system’s notification settings control the final sound and vibration.",
+      );
+      return true;
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "The test alert could not be delivered.",
+      );
+      return false;
+    } finally {
+      setTestBusy(false);
+    }
+  }, [busy, ensureDeviceSubscription, testBusy]);
+
+  const openNativeNotificationSettings = useCallback(async () => {
+    if (!isDesktopShell()) return false;
+    setError(null);
+    try {
+      const result = await getDesktopApi().openNativeNotificationSettings();
+      if (result.opened) return true;
+      setError(
+        result.reason === "desktop_update_required"
+          ? "Update Groovy Desktop to open notification settings from the app."
+          : "Could not open macOS notification settings.",
+      );
+      return false;
+    } catch {
+      setError("Could not open macOS notification settings.");
+      return false;
+    }
+  }, []);
+
   return {
     transport,
     support,
@@ -352,11 +472,22 @@ export function useWebPushNotifications() {
     preferenceMap,
     loading,
     busy,
+    testBusy,
+    testStatus,
     error,
     setError,
     setRoomMode,
     disableThisDevice,
+    testThisDevice,
+    openNativeNotificationSettings,
     canDisableDevice: transport === "web-push",
+    canTestDevice:
+      support === "supported" &&
+      configured &&
+      !migrationPending &&
+      (transport === "desktop-native" || deviceSubscribed),
+    canOpenNativeNotificationSettings:
+      transport === "desktop-native" && support === "supported",
     refresh,
   };
 }

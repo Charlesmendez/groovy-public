@@ -8,16 +8,28 @@ import pkg from "whatsapp-web.js";
 const { Client, LocalAuth, MessageMedia } = pkg;
 import { execPortableCommand } from "./platform/shell/index.mjs";
 import {
-  getProcessTreeMemory,
+  getProcessTreeUsage,
   killProcessesByCommandFragment,
   removeSingletonLocks,
 } from "./platform/process/index.mjs";
 import {
-  getWhatsAppRecycleCheckIntervalMs,
+  getRssGrowthRateMbPerMin,
+  getWhatsAppRecycleCircuitDecision,
   getWhatsAppRecycleDecision,
   getWhatsAppRecycleRetryCooldownMs,
   shouldCheckWhatsAppRecycle,
 } from "./platform/whatsapp/recycle.mjs";
+import {
+  buildPowerEfficientPuppeteerOptions,
+  resolveWhatsAppBrowserRuntime,
+} from "./platform/whatsapp/browserRuntime.mjs";
+import {
+  resolveInboundPollIntervalMs,
+  resolveWhatsAppImageBlocking,
+  resolveWhatsAppResourceMonitorPolicy,
+} from "./platform/whatsapp/powerPolicy.mjs";
+import { readLoadedMessageTail } from "./platform/whatsapp/inboundPoll.mjs";
+import { prepareWhatsAppProfile } from "./platform/whatsapp/profilePolicy.mjs";
 import { runHeadlessClaude } from "./platform/claude/runHeadless.mjs";
 
 import {
@@ -40,7 +52,7 @@ import {
   closeBrowser,
 } from "./browser.mjs";
 import { runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
-import { credentialGetMeta, credentialRequest } from "./credentials.mjs";
+import { credentialGetMeta, credentialRequest, workspaceSecretDelete, workspaceSecretGetMeta, workspaceSecretRequest } from "./credentials.mjs";
 import {
   fileRead,
   fileWrite,
@@ -439,66 +451,6 @@ async function executeLocalUnsubscribe({ unsubscribeUrl, unsubscribeMailto }) {
   return { ok: false, error: "missing_unsubscribe_target" };
 }
 
-/**
- * The packaged connector does not ship Puppeteer's external browser cache.
- * Prefer an installed Chromium-family browser so WhatsApp Web does not depend on
- * ~/.cache/puppeteer having the exact Chrome revision required by whatsapp-web.js.
- */
-function detectBrowserExecutable() {
-  const envCandidates = [
-    process.env.GROOVY_WHATSAPP_CHROME_PATH,
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    process.env.CHROME_PATH,
-  ];
-
-  const macApp = (appName, executableName = appName) => [
-    path.join("/Applications", `${appName}.app`, "Contents", "MacOS", executableName),
-    path.join(homeDir(), "Applications", `${appName}.app`, "Contents", "MacOS", executableName),
-  ];
-
-  let platformCandidates = [];
-  if (process.platform === "darwin") {
-    platformCandidates = [
-      ...macApp("Google Chrome"),
-      ...macApp("Google Chrome Beta"),
-      ...macApp("Chromium"),
-      ...macApp("Microsoft Edge"),
-      ...macApp("Brave Browser"),
-      ...macApp("Arc"),
-    ];
-  } else if (process.platform === "win32") {
-    platformCandidates = [
-      // Edge (always present on Windows 10+)
-      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
-      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
-      // Chrome
-      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
-      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Google", "Chrome", "Application", "chrome.exe"),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
-    ];
-  } else {
-    platformCandidates = [
-      "/usr/bin/google-chrome-stable",
-      "/usr/bin/google-chrome",
-      "/usr/bin/chromium",
-      "/usr/bin/chromium-browser",
-      "/snap/bin/chromium",
-      "/usr/bin/microsoft-edge",
-      "/usr/bin/microsoft-edge-stable",
-      "/usr/bin/brave-browser",
-    ];
-  }
-
-  const candidates = [
-    ...envCandidates,
-    ...platformCandidates,
-  ].filter(Boolean);
-  for (const p of candidates) {
-    try { if (fs.existsSync(p)) return p; } catch { /* skip */ }
-  }
-  return null;
-}
-
 function log(...args) {
   console.log("[whatsapp]", ...args);
 }
@@ -833,10 +785,10 @@ function resolveWhatsAppHeadless(opts = {}, dataPath = getDataPath()) {
 }
 
 function resolveWhatsAppBlockImages(opts = {}) {
-  if (opts.blockImages === false) return false;
-  const envValue = parseEnvSwitch(process.env.GROOVY_WHATSAPP_BLOCK_IMAGES);
-  if (envValue === false) return false;
-  return true;
+  return resolveWhatsAppImageBlocking({
+    option: opts.blockImages,
+    envValue: process.env.GROOVY_WHATSAPP_BLOCK_IMAGES,
+  });
 }
 
 function resolveWhatsAppWebVersion() {
@@ -922,6 +874,33 @@ const WHATSAPP_RECYCLE_MEMORY_MB = Number.parseInt(
   process.env.GROOVY_WHATSAPP_RECYCLE_MEMORY_MB || "",
   10
 );
+const WHATSAPP_RECYCLE_CPU_PERCENT = Number.parseFloat(
+  process.env.GROOVY_WHATSAPP_RECYCLE_CPU_PERCENT || ""
+);
+const WHATSAPP_RECYCLE_CPU_CHECKS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_CPU_CHECKS || "",
+  10
+);
+const WHATSAPP_RECYCLE_CPU_MIN_AGE_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RECYCLE_CPU_MIN_AGE_MS || "",
+  10
+);
+const WHATSAPP_RESOURCE_CIRCUIT_MAX_RECYCLES = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RESOURCE_CIRCUIT_MAX_RECYCLES || "",
+  10
+);
+const WHATSAPP_RESOURCE_CIRCUIT_WINDOW_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RESOURCE_CIRCUIT_WINDOW_MS || "",
+  10
+);
+const WHATSAPP_RESOURCE_LOG_INTERVAL_MS = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_RESOURCE_LOG_INTERVAL_MS || "",
+  10
+);
+const WHATSAPP_PROFILE_MAX_MB = Number.parseInt(
+  process.env.GROOVY_WHATSAPP_PROFILE_MAX_MB || "",
+  10
+);
 
 const WHATSAPP_VIEWPORT_WIDTH = 1280;
 const WHATSAPP_VIEWPORT_HEIGHT = 800;
@@ -968,11 +947,7 @@ function resolveWhatsAppApiTimeoutAutoRecoveries() {
 }
 
 function resolveWhatsAppInboundPollIntervalMs() {
-  if (Number.isFinite(WHATSAPP_INBOUND_POLL_INTERVAL_MS)) {
-    if (WHATSAPP_INBOUND_POLL_INTERVAL_MS <= 0) return 0;
-    return Math.max(5000, Math.min(120_000, Math.floor(WHATSAPP_INBOUND_POLL_INTERVAL_MS)));
-  }
-  return 15_000;
+  return resolveInboundPollIntervalMs(WHATSAPP_INBOUND_POLL_INTERVAL_MS);
 }
 
 function resolveWhatsAppInboundPollLimit() {
@@ -1022,7 +997,58 @@ function resolveWhatsAppRecycleMemoryLimitBytes() {
     const boundedMb = Math.max(512, Math.min(32 * 1024, WHATSAPP_RECYCLE_MEMORY_MB));
     return Math.floor(boundedMb * 1024 * 1024);
   }
-  return 5 * 1024 ** 3;
+  return 2 * 1024 ** 3;
+}
+
+function resolveWhatsAppRecycleCpuPercent() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_CPU_PERCENT)) {
+    if (WHATSAPP_RECYCLE_CPU_PERCENT <= 0) return 0;
+    return Math.max(25, Math.min(1600, WHATSAPP_RECYCLE_CPU_PERCENT));
+  }
+  return 125;
+}
+
+function resolveWhatsAppRecycleCpuChecks() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_CPU_CHECKS)) {
+    return Math.max(2, Math.min(15, Math.trunc(WHATSAPP_RECYCLE_CPU_CHECKS)));
+  }
+  return 3;
+}
+
+function resolveWhatsAppRecycleCpuMinAgeMs() {
+  if (Number.isFinite(WHATSAPP_RECYCLE_CPU_MIN_AGE_MS)) {
+    return Math.max(60_000, Math.min(60 * 60_000, WHATSAPP_RECYCLE_CPU_MIN_AGE_MS));
+  }
+  return 5 * 60_000;
+}
+
+function resolveWhatsAppResourceCircuitMaxRecycles() {
+  if (Number.isFinite(WHATSAPP_RESOURCE_CIRCUIT_MAX_RECYCLES)) {
+    return Math.max(1, Math.min(10, WHATSAPP_RESOURCE_CIRCUIT_MAX_RECYCLES));
+  }
+  return 2;
+}
+
+function resolveWhatsAppResourceCircuitWindowMs() {
+  if (Number.isFinite(WHATSAPP_RESOURCE_CIRCUIT_WINDOW_MS)) {
+    return Math.max(5 * 60_000, Math.min(24 * 60 * 60_000, WHATSAPP_RESOURCE_CIRCUIT_WINDOW_MS));
+  }
+  return 60 * 60_000;
+}
+
+function resolveWhatsAppResourceLogIntervalMs() {
+  if (Number.isFinite(WHATSAPP_RESOURCE_LOG_INTERVAL_MS)) {
+    return Math.max(60_000, Math.min(60 * 60_000, WHATSAPP_RESOURCE_LOG_INTERVAL_MS));
+  }
+  return 10 * 60_000;
+}
+
+function resolveWhatsAppProfileMaxBytes() {
+  if (Number.isFinite(WHATSAPP_PROFILE_MAX_MB)) {
+    if (WHATSAPP_PROFILE_MAX_MB <= 0) return 0;
+    return Math.max(512, Math.min(64 * 1024, WHATSAPP_PROFILE_MAX_MB)) * 1024 ** 2;
+  }
+  return 4 * 1024 ** 3;
 }
 
 function buildWhatsAppIngressTraceId(messageLike) {
@@ -1349,6 +1375,7 @@ async function executeConnectorRpc({
   connectorParams,
   codeRuntime,
   whatsappRuntime,
+  browserTaskRuntime,
   deviceToken,
   onProgress,
 }) {
@@ -1763,6 +1790,9 @@ async function executeConnectorRpc({
     // Credentials (local prompt + local encrypted vault)
     if (t === "browser_credential_get") return await credentialGetMeta({ domain: p.domain });
     if (t === "browser_credential_request") return await credentialRequest({ domain: p.domain, reason: p.reason });
+    if (t === "workspace_secret_get") return await workspaceSecretGetMeta({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key });
+    if (t === "workspace_secret_request") return await workspaceSecretRequest({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key, name: p.name, reason: p.reason });
+    if (t === "workspace_secret_delete") return await workspaceSecretDelete({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key });
 
     // Browser
     if (t === "runtime_branch_parallel_batch") {
@@ -1805,62 +1835,72 @@ async function executeConnectorRpc({
       }
 
       const executeBatchRows = async (rows) => {
-        const toolResults = [];
-        for (let i = 0; i < rows.length; i++) {
-          const row = rows[i] && typeof rows[i] === "object" ? rows[i] : {};
-          const branchId = String(row.branchId || "").trim();
-          const toolCallId = String(row.toolCallId || "").trim();
-          const toolName = String(row.toolName || "").trim();
-          const nestedType = String(row.connectorType || "").trim();
-          const nestedParams =
-            row.connectorParams && typeof row.connectorParams === "object"
-              ? row.connectorParams
-              : {};
+        const results = new Array(rows.length);
+        let nextIndex = 0;
+        const workerCount = Math.min(4, Math.max(1, rows.length));
+        await Promise.all(Array.from({ length: workerCount }, async () => {
+          while (nextIndex < rows.length) {
+            const i = nextIndex++;
+            const row = rows[i] && typeof rows[i] === "object" ? rows[i] : {};
+            const branchId = String(row.branchId || "").trim();
+            const toolCallId = String(row.toolCallId || "").trim();
+            const toolName = String(row.toolName || "").trim();
+            const nestedType = String(row.connectorType || "").trim();
+            const nestedParams =
+              row.connectorParams && typeof row.connectorParams === "object"
+                ? row.connectorParams
+                : {};
 
-          if (!branchId || !toolCallId || !toolName || !nestedType) {
-            toolResults.push({
+            if (!branchId || !toolCallId || !toolName || !nestedType) {
+              results[i] = {
+                branchId,
+                toolCallId: toolCallId || `parallel-branch-missing-${Date.now()}-${i}`,
+                toolName: toolName || "unknown_connector_tool",
+                result: JSON.stringify({ ok: false, error: "invalid_parallel_branch_execute" }),
+              };
+              continue;
+            }
+
+            const progressText = typeof row.message === "string" && row.message.trim()
+              ? row.message.trim()
+              : `Running ${nestedType} for worker ${branchId.slice(0, 8)}...`;
+            emitProgress(progressText);
+
+            let nestedResult;
+            try {
+              nestedResult = await executeConnectorRpc({
+                connectorType: nestedType,
+                connectorParams: nestedParams,
+                codeRuntime,
+                whatsappRuntime,
+                browserTaskRuntime,
+                deviceToken,
+                onProgress,
+              });
+            } catch (err) {
+              nestedResult = {
+                ok: false,
+                error: err instanceof Error ? err.message : String(err || "connector_execute_failed"),
+              };
+            }
+            results[i] = {
               branchId,
-              toolCallId: toolCallId || `parallel-branch-missing-${Date.now()}-${i}`,
-              toolName: toolName || "unknown_connector_tool",
-              result: JSON.stringify({ ok: false, error: "invalid_parallel_branch_execute" }),
-            });
-            continue;
-          }
-
-          const progressText = typeof row.message === "string" && row.message.trim()
-            ? row.message.trim()
-            : `Running ${nestedType} for worker ${branchId.slice(0, 8)}...`;
-          emitProgress(progressText);
-
-          let nestedResult;
-          try {
-            nestedResult = await executeConnectorRpc({
-              connectorType: nestedType,
-              connectorParams: nestedParams,
-              codeRuntime,
-              whatsappRuntime,
-              deviceToken,
-              onProgress,
-            });
-          } catch (err) {
-            nestedResult = {
-              ok: false,
-              error: err instanceof Error ? err.message : String(err || "connector_execute_failed"),
+              toolCallId,
+              toolName,
+              result: compactParallelToolResult(toolName, nestedResult),
             };
           }
-          toolResults.push({
-            branchId,
-            toolCallId,
-            toolName,
-            result: compactParallelToolResult(toolName, nestedResult),
-          });
-        }
-        return toolResults;
+        }));
+        return results;
       };
 
       let state = p.state && typeof p.state === "object" ? p.state : null;
       let rows = Array.isArray(p.connectorExecutes) ? p.connectorExecutes : [];
-      const MAX_BRANCH_BATCH_ROUNDS = 20;
+      const configuredBatchRounds = Number(state?.branchController?.maxTurnsPerBranch);
+      const MAX_BRANCH_BATCH_ROUNDS =
+        Number.isFinite(configuredBatchRounds) && configuredBatchRounds > 0
+          ? Math.max(1, Math.min(64, Math.floor(configuredBatchRounds)))
+          : 20;
       if (rows.length === 0) {
         return { ok: false, error: "missing_parallel_branch_executes" };
       }
@@ -1906,11 +1946,14 @@ async function executeConnectorRpc({
     if (t === "browser_task_run") {
       const apiKey = typeof p.api_key === "string" ? p.api_key.trim() : "";
       const cliToken = typeof p.cli_token === "string" ? p.cli_token.trim() : "";
-      const usePlaywright = await isPlaywrightAvailable();
+      const usePlaywright = await isPlaywrightAvailable(browserTaskRuntime || {});
 
       if (usePlaywright) {
-        console.log("[whatsapp] browser_task_run using Playwright MCP");
+        console.log("[whatsapp] browser_task_run using Playwright", {
+          driver: browserTaskRuntime?.playwrightDriver || "cli",
+        });
         return await runBrowserTaskViaPlaywright({
+          ...(browserTaskRuntime || {}),
           task: p.task,
           start_url: p.start_url,
           api_key: apiKey,
@@ -1920,12 +1963,12 @@ async function executeConnectorRpc({
         });
       }
 
-      console.log("[whatsapp] browser_task_run blocked because Playwright MCP is unavailable");
+      console.log("[whatsapp] browser_task_run blocked because Playwright is unavailable");
       return {
         ok: false,
         error: "playwright_mcp_unavailable",
         message:
-          "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
+          "Browser automation requires the selected Claude Code or Codex runtime plus Playwright.",
       };
     }
     if (t === "browser_init") return await initBrowser(p);
@@ -2529,6 +2572,7 @@ async function handleCodeMessage({
           connectorParams: ex.connectorParams,
           codeRuntime: runtime,
           whatsappRuntime,
+          browserTaskRuntime: opts.browserTaskRuntime || null,
           deviceToken,
           onProgress: (msg) => {
             sendProgress(msg).catch(() => {});
@@ -2663,6 +2707,56 @@ export async function startWhatsAppBridge(opts = {}) {
 
   fs.mkdirSync(dataPath, { recursive: true });
 
+  const browserRuntime = await resolveWhatsAppBrowserRuntime();
+  if (!browserRuntime.ok) {
+    const rejectedSummary = browserRuntime.rejected
+      .filter((candidate) => candidate.reason !== "not_found")
+      .slice(0, 4)
+      .map((candidate) =>
+        `${candidate.source}:${candidate.reason}${candidate.version ? `:${candidate.version}` : ""}`
+      )
+      .join(", ");
+    const detail = [
+      `WhatsApp requires Chrome, Edge, or Chromium ${browserRuntime.minimumMajor || 150}+`,
+      `Puppeteer ${browserRuntime.puppeteerVersion || "unknown"} expects ${browserRuntime.expectedRevision || "an unspecified revision"}`,
+      rejectedSummary ? `rejected ${rejectedSummary}` : "no supported installed browser was found",
+    ].join("; ");
+    emitHealth("degraded", "supported_browser_not_found", detail);
+    stopBridgeRuntime("supported_browser_not_found");
+    throw new Error(`whatsapp_supported_browser_not_found:${detail}`);
+  }
+
+  // Profile rotation must happen only after browser compatibility is known and
+  // after stale processes release their profile handles (important on Windows).
+  await killStaleBrowserForSession();
+
+  const profileMaxBytes = resolveWhatsAppProfileMaxBytes();
+  let profilePreparation;
+  try {
+    profilePreparation = prepareWhatsAppProfile({
+      dataPath,
+      maxProfileBytes: profileMaxBytes,
+    });
+  } catch (error) {
+    const detail = formatErrorWithCause(error);
+    emitHealth("degraded", "profile_rotation_failed", detail);
+    stopBridgeRuntime("profile_rotation_failed");
+    throw new Error(`whatsapp_profile_rotation_failed:${detail}`);
+  }
+  if (profilePreparation.rotated) {
+    const profileSizeMb = Math.round(profilePreparation.sizeBytes / 1024 / 1024);
+    warn("archived oversized WhatsApp browser profile", {
+      profileSizeMb,
+      profileLimitMb: Math.round(profilePreparation.limitBytes / 1024 / 1024),
+      backupPath: profilePreparation.backupPath,
+    });
+    emitHealth(
+      "recovering",
+      "profile_rotated_oversize",
+      `Archived a ${profileSizeMb} MB WhatsApp browser profile to protect battery; scan the QR once to relink`
+    );
+  }
+
   const hasExistingSession = hasExistingWhatsAppSession(dataPath);
   const whatsappHeadless = resolveWhatsAppHeadless(opts, dataPath);
   const blockImages = resolveWhatsAppBlockImages(opts);
@@ -2670,7 +2764,18 @@ export async function startWhatsAppBridge(opts = {}) {
   const recycleIdleMs = resolveWhatsAppRecycleIdleMs();
   const recycleMaxAgeMs = resolveWhatsAppRecycleMaxAgeMs();
   const recycleMemoryLimitBytes = resolveWhatsAppRecycleMemoryLimitBytes();
-  const recycleCheckIntervalMs = getWhatsAppRecycleCheckIntervalMs(recycleIntervalMs);
+  const recycleCpuLimitPercent = resolveWhatsAppRecycleCpuPercent();
+  const recycleRequiredHighCpuChecks = resolveWhatsAppRecycleCpuChecks();
+  const recycleCpuMinAgeMs = resolveWhatsAppRecycleCpuMinAgeMs();
+  const resourceCircuitMaxRecycles = resolveWhatsAppResourceCircuitMaxRecycles();
+  const resourceCircuitWindowMs = resolveWhatsAppResourceCircuitWindowMs();
+  const resourceLogIntervalMs = resolveWhatsAppResourceLogIntervalMs();
+  const resourceMonitorPolicy = resolveWhatsAppResourceMonitorPolicy({
+    recycleIntervalMs,
+    memoryLimitBytes: recycleMemoryLimitBytes,
+    cpuLimitPercent: recycleCpuLimitPercent,
+  });
+  const recycleCheckIntervalMs = resourceMonitorPolicy.checkIntervalMs;
 
   log("starting WhatsApp Web bridge", {
     groupName,
@@ -2678,17 +2783,22 @@ export async function startWhatsAppBridge(opts = {}) {
     dataPath,
     headless: whatsappHeadless,
     hasExistingSession,
+    profileRotated: profilePreparation.rotated,
+    profileSizeMb: Math.round(profilePreparation.sizeBytes / 1024 / 1024),
+    profileLimitMb: Math.round(profileMaxBytes / 1024 / 1024),
     blockImages,
     recycleIntervalMs,
     recycleIdleMs,
     recycleMaxAgeMs,
     recycleMemoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+    recycleCpuLimitPercent,
+    recycleRequiredHighCpuChecks,
+    recycleCpuMinAgeMs,
+    resourceCircuitMaxRecycles,
+    resourceCircuitWindowMs,
     recycleCheckIntervalMs,
   });
   emitHealth("recovering", "starting", "Starting WhatsApp Web bridge");
-
-  // Kill any stale browser processes from previous runs (prevents "browser already running" errors)
-  await killStaleBrowserForSession();
 
   // Proactively clear Chrome caches that can get corrupted by unclean shutdowns.
   // This is cheap (Chrome rebuilds them) and prevents the "Target closed" crash loop.
@@ -2714,13 +2824,22 @@ export async function startWhatsAppBridge(opts = {}) {
     });
   }
 
-  const browserExecutable = detectBrowserExecutable();
-  if (browserExecutable) {
-    log("using installed browser for WhatsApp Web", { executablePath: browserExecutable });
-  } else {
-    warn(
-      "no installed Chromium browser detected for WhatsApp Web; falling back to Puppeteer browser cache"
-    );
+  log("using compatible browser for WhatsApp Web", {
+    source: browserRuntime.source,
+    executablePath: browserRuntime.executablePath,
+    version: browserRuntime.version,
+    puppeteerVersion: browserRuntime.puppeteerVersion,
+    expectedRevision: browserRuntime.expectedRevision,
+    minimumMajor: browserRuntime.minimumMajor,
+    compatible: browserRuntime.compatible,
+    protocolExact: browserRuntime.protocolExact,
+    protocolMajorSkew: browserRuntime.protocolMajorSkew,
+  });
+  if (browserRuntime.mismatchAllowed) {
+    warn("using explicitly allowed browser below WhatsApp's tested minimum", {
+      actualMajor: browserRuntime.actualMajor,
+      minimumMajor: browserRuntime.minimumMajor,
+    });
   }
 
   const clientOptions = {
@@ -2729,35 +2848,12 @@ export async function startWhatsAppBridge(opts = {}) {
     // a baked-in Chrome/101 UA, which can load enough DOM to trip the fallback
     // path while never finishing Store bootstrap on current WhatsApp Web.
     userAgent: false,
-    puppeteer: {
+    puppeteer: buildPowerEfficientPuppeteerOptions({
+      executablePath: browserRuntime.executablePath,
       headless: whatsappHeadless,
-      ...(browserExecutable ? { executablePath: browserExecutable } : {}),
-      // 4 min: cold boots after app updates can be significantly slower on some Macs.
-      // A higher timeout avoids false-negative startup failures that require manual restarts.
-      protocolTimeout: 240_000,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-accelerated-2d-canvas",
-        "--disable-gpu",
-        "--mute-audio",
-        "--hide-scrollbars",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--use-fake-device-for-media-stream",
-        "--disable-features=MediaFoundationVideoCapture,AudioServiceOutOfProcess",
-        "--disable-blink-features=AutomationControlled",
-        "--js-flags=--max-old-space-size=256",
-        "--window-position=0,0",
-        `--window-size=${WHATSAPP_VIEWPORT_WIDTH},${WHATSAPP_VIEWPORT_HEIGHT}`,
-      ],
-      defaultViewport: {
-        width: WHATSAPP_VIEWPORT_WIDTH,
-        height: WHATSAPP_VIEWPORT_HEIGHT,
-        deviceScaleFactor: 1,
-      },
-    },
+      width: WHATSAPP_VIEWPORT_WIDTH,
+      height: WHATSAPP_VIEWPORT_HEIGHT,
+    }),
   };
   const webVersionCachePath = path.join(getDataPath(), ".wwebjs_cache");
   if (pinWebVersion) {
@@ -2796,6 +2892,11 @@ export async function startWhatsAppBridge(opts = {}) {
   let lastRecycleAtMs = Date.now();
   let lastRecycleAttemptAtMs = 0;
   let lastRecycleCheckAtMs = 0;
+  let consecutiveHighCpuChecks = 0;
+  let previousResourceSample = null;
+  let lastResourceLogAtMs = 0;
+  let pressureRecycleTimestampsMs = [];
+  let resourceCircuitOpen = false;
 
   function noteBridgeActivity() {
     lastBridgeActivityAtMs = Date.now();
@@ -2840,8 +2941,8 @@ export async function startWhatsAppBridge(opts = {}) {
   }
 
   async function maybeRecycleWhatsAppPage(reason = "interval") {
-    if (recycleIntervalMs <= 0) return;
-    if (!isCurrentBridgeGeneration() || recycleInFlight) return;
+    if (recycleCheckIntervalMs <= 0) return;
+    if (!isCurrentBridgeGeneration() || recycleInFlight || resourceCircuitOpen) return;
     const now = Date.now();
     if (
       !shouldCheckWhatsAppRecycle({
@@ -2855,10 +2956,55 @@ export async function startWhatsAppBridge(opts = {}) {
     }
     lastRecycleCheckAtMs = now;
     const browserPid = Number(client?.pupBrowser?.process?.()?.pid || 0);
-    const browserMemory =
-      recycleMemoryLimitBytes > 0 && browserPid > 0
-        ? await getProcessTreeMemory(browserPid)
+    const browserUsage =
+      (recycleMemoryLimitBytes > 0 || recycleCpuLimitPercent > 0) && browserPid > 0
+        ? await getProcessTreeUsage(browserPid)
         : null;
+    const browserAgeMs = Math.max(0, now - lastRecycleAtMs);
+    const browserCpuPercent = Math.max(0, Number(browserUsage?.totalCpuPercent) || 0);
+    if (
+      recycleCpuLimitPercent > 0 &&
+      browserAgeMs >= recycleCpuMinAgeMs &&
+      browserCpuPercent >= recycleCpuLimitPercent
+    ) {
+      consecutiveHighCpuChecks += 1;
+    } else {
+      consecutiveHighCpuChecks = 0;
+    }
+    const currentResourceSample = browserUsage
+      ? { atMs: now, rssBytes: browserUsage.totalRssBytes }
+      : null;
+    const rssGrowthMbPerMin = getRssGrowthRateMbPerMin(
+      previousResourceSample,
+      currentResourceSample
+    );
+    if (currentResourceSample) previousResourceSample = currentResourceSample;
+    const memoryPressure =
+      recycleMemoryLimitBytes > 0 &&
+      Number(browserUsage?.totalRssBytes || 0) >= recycleMemoryLimitBytes * 0.75;
+    const cpuPressure =
+      recycleCpuLimitPercent > 0 && browserCpuPercent >= recycleCpuLimitPercent;
+    if (
+      browserUsage &&
+      (now - lastResourceLogAtMs >= resourceLogIntervalMs || memoryPressure || cpuPressure)
+    ) {
+      lastResourceLogAtMs = now;
+      log("WhatsApp browser resource sample", {
+        browserSource: browserRuntime.source,
+        browserPid: browserUsage.rootPid,
+        browserProcessCount: browserUsage.processCount,
+        browserRssMb: Math.round(browserUsage.totalRssBytes / 1024 / 1024),
+        browserMaxProcessRssMb: Math.round(browserUsage.maxRssBytes / 1024 / 1024),
+        browserCpuPercent: Math.round(browserCpuPercent * 10) / 10,
+        browserMaxProcessCpuPercent:
+          Math.round(Number(browserUsage.maxCpuPercent || 0) * 10) / 10,
+        browserRssGrowthMbPerMin:
+          rssGrowthMbPerMin == null ? null : Math.round(rssGrowthMbPerMin * 10) / 10,
+        consecutiveHighCpuChecks,
+        recycleCpuLimitPercent,
+        recycleMemoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+      });
+    }
     const decision = getWhatsAppRecycleDecision({
       nowMs: now,
       lastRecycleAtMs,
@@ -2866,13 +3012,17 @@ export async function startWhatsAppBridge(opts = {}) {
       recycleIntervalMs,
       recycleIdleMs,
       recycleMaxAgeMs,
-      memoryRssBytes: browserMemory?.totalRssBytes || 0,
+      memoryRssBytes: browserUsage?.totalRssBytes || 0,
       memoryLimitBytes: recycleMemoryLimitBytes,
+      cpuPercent: browserCpuPercent,
+      cpuLimitPercent: recycleCpuLimitPercent,
+      consecutiveHighCpuChecks,
+      requiredHighCpuChecks: recycleRequiredHighCpuChecks,
       activeBridgeOperations,
       ready: readyResolved,
       qrPending,
-      authFailure: !!authFailureText,
-      disconnected: !!disconnectedReason,
+      authFailure: authFailureText,
+      disconnected: disconnectedReason,
       recoveryPending: recycleRecoveryPending,
     });
     if (!decision.due) return;
@@ -2887,6 +3037,36 @@ export async function startWhatsAppBridge(opts = {}) {
       !page || (typeof page.isClosed === "function" && page.isClosed());
     if (pageUnavailable && decision.reason !== "recovery_retry") return;
 
+    const circuitDecision = getWhatsAppRecycleCircuitDecision({
+      nowMs: now,
+      pressureRecycleTimestampsMs,
+      reason: decision.reason,
+      windowMs: resourceCircuitWindowMs,
+      maxPressureRecycles: resourceCircuitMaxRecycles,
+    });
+    pressureRecycleTimestampsMs = circuitDecision.recentTimestampsMs;
+    if (circuitDecision.open) {
+      resourceCircuitOpen = true;
+      storeReadyResolved = false;
+      readyResolved = false;
+      const detail =
+        `WhatsApp browser exceeded resource limits ${resourceCircuitMaxRecycles + 1} times ` +
+        `within ${Math.round(resourceCircuitWindowMs / 60_000)} minutes; stopped to protect battery`;
+      warn("WhatsApp browser resource circuit opened", {
+        trigger: decision.reason,
+        pressureRecycleCount: pressureRecycleTimestampsMs.length,
+        browserRssMb: browserUsage
+          ? Math.round(browserUsage.totalRssBytes / 1024 / 1024)
+          : null,
+        browserCpuPercent: Math.round(browserCpuPercent * 10) / 10,
+      });
+      emitHealth("degraded", "resource_circuit_open", detail);
+      await client.destroy().catch(() => {});
+      await killStaleBrowserForSession();
+      stopBridgeRuntime("resource_circuit_open");
+      return;
+    }
+
     recycleInFlight = true;
     lastRecycleAttemptAtMs = now;
     const endActivity = beginBridgeActivity();
@@ -2899,15 +3079,20 @@ export async function startWhatsAppBridge(opts = {}) {
         idleMs: decision.idleMs,
         recycleIntervalMs,
         recycleMaxAgeMs,
-        browserPid: browserMemory?.rootPid || browserPid || null,
-        browserProcessCount: browserMemory?.processCount || null,
-        browserRssMb: browserMemory
-          ? Math.round(browserMemory.totalRssBytes / 1024 / 1024)
+        browserPid: browserUsage?.rootPid || browserPid || null,
+        browserProcessCount: browserUsage?.processCount || null,
+        browserRssMb: browserUsage
+          ? Math.round(browserUsage.totalRssBytes / 1024 / 1024)
           : null,
-        browserMaxProcessRssMb: browserMemory
-          ? Math.round(browserMemory.maxRssBytes / 1024 / 1024)
+        browserMaxProcessRssMb: browserUsage
+          ? Math.round(browserUsage.maxRssBytes / 1024 / 1024)
           : null,
+        browserCpuPercent: Math.round(browserCpuPercent * 10) / 10,
+        browserRssGrowthMbPerMin:
+          rssGrowthMbPerMin == null ? null : Math.round(rssGrowthMbPerMin * 10) / 10,
+        consecutiveHighCpuChecks,
         recycleMemoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+        recycleCpuLimitPercent,
       });
       storeReadyResolved = false;
       readyResolved = false;
@@ -2928,6 +3113,8 @@ export async function startWhatsAppBridge(opts = {}) {
       disconnectedReason = "";
       await client.initialize();
       lastRecycleAtMs = Date.now();
+      consecutiveHighCpuChecks = 0;
+      previousResourceSample = null;
       await installPostAuthResourceThrottling("page_recycle");
       const ready = await waitForOperationalReadyForSend(120_000, "page_recycle", {
         requireTargetBinding: true,
@@ -3187,6 +3374,13 @@ export async function startWhatsAppBridge(opts = {}) {
     source = "send",
     { requireTargetBinding = false } = {}
   ) {
+    if (resourceCircuitOpen) {
+      return {
+        ok: false,
+        error: "resource_circuit_open",
+        detail: "WhatsApp browser stopped after repeated CPU or memory pressure to protect battery",
+      };
+    }
     if (qrPending) {
       return {
         ok: false,
@@ -4840,6 +5034,7 @@ export async function startWhatsAppBridge(opts = {}) {
                 connectorParams: ex.connectorParams,
                 codeRuntime: opts.codeRuntime || null,
                 whatsappRuntime: { resolveRecipient, sendTextToChatId, sendMediaToChatId },
+                browserTaskRuntime: opts.browserTaskRuntime || null,
                 deviceToken,
                 onProgress: (msg) => {
                   sendProgress(msg).catch(() => {});
@@ -5071,7 +5266,6 @@ export async function startWhatsAppBridge(opts = {}) {
   const inboundPollLookbackMs = resolveWhatsAppInboundPollLookbackMs();
   const inboundPollStartedAtMs = Date.now();
   let inboundPollInFlight = false;
-  let inboundPollLoadedMessagesOnly = false;
 
   async function pollTargetChatForMissedCommands(reason = "interval") {
     if (!isCurrentBridgeGeneration() || !targetChatId || inboundPollInFlight) return;
@@ -5085,31 +5279,24 @@ export async function startWhatsAppBridge(opts = {}) {
       });
       if (!ready || ready.ok !== true) return;
 
-      const chat = await resolveTargetChatSafe();
-      if (!chat || typeof chat.fetchMessages !== "function") return;
-
       const pollLimit = resolveWhatsAppInboundPollLimit();
-      let messages;
-      try {
-        messages = await chat.fetchMessages({
-          // A zero limit reads the messages already loaded in the chat without
-          // invoking WhatsApp Web's version-sensitive history loader.
-          limit: inboundPollLoadedMessagesOnly ? 0 : pollLimit,
-        });
-      } catch (err) {
-        const errorText = formatErrorWithCause(err);
-        if (!errorText.includes("waitForChatLoading")) throw err;
-        inboundPollLoadedMessagesOnly = true;
-        warn(
-          "WhatsApp history loader is unavailable; inbound recovery will use loaded messages"
-        );
-        messages = await chat.fetchMessages({ limit: 0 });
-      }
+      // Read only the already-loaded tail from WhatsApp's in-page collection.
+      // Chat.fetchMessages can invoke history loading and serialize the entire
+      // collection, which is disproportionately expensive for an idle fallback.
+      const rawMessages = await readLoadedMessageTail(
+        client.pupPage,
+        targetChatId,
+        pollLimit
+      );
+      const messages = Array.isArray(rawMessages)
+        ? rawMessages.map((message) => ({
+            ...message,
+            // Resolve/serialize the chat only when the loaded tail actually
+            // contains a command. Ordinary idle polls stay page-local.
+            getChat: () => resolveTargetChatSafe(),
+          }))
+        : [];
       if (!Array.isArray(messages) || messages.length === 0) return;
-
-      if (messages.length > pollLimit) {
-        messages = messages.slice(-pollLimit);
-      }
 
       const oldestAllowedMs = Math.max(
         inboundPollStartedAtMs - inboundPollLookbackMs,
@@ -5178,7 +5365,7 @@ export async function startWhatsAppBridge(opts = {}) {
     if (typeof pollTimer.unref === "function") pollTimer.unref();
     const initialTimer = trackBridgeTimer(setTimeout(() => {
       pollTargetChatForMissedCommands("startup").catch(() => {});
-    }, Math.min(5000, inboundPollIntervalMs)));
+    }, Math.min(30_000, inboundPollIntervalMs)));
     if (typeof initialTimer.unref === "function") initialTimer.unref();
     log("WhatsApp inbound poll fallback enabled", {
       intervalMs: inboundPollIntervalMs,
@@ -5187,20 +5374,26 @@ export async function startWhatsAppBridge(opts = {}) {
     });
   }
 
-  if (recycleIntervalMs > 0) {
+  if (resourceMonitorPolicy.enabled) {
     const recycleTimer = trackBridgeTimer(setInterval(() => {
       maybeRecycleWhatsAppPage("interval").catch(() => {});
     }, recycleCheckIntervalMs));
     if (typeof recycleTimer.unref === "function") recycleTimer.unref();
-    log("WhatsApp idle page recycle enabled", {
+    log("WhatsApp browser resource monitor enabled", {
+      timeBasedRecycleEnabled: resourceMonitorPolicy.timeBasedRecycleEnabled,
       intervalMs: recycleIntervalMs,
       idleMs: recycleIdleMs,
       maxAgeMs: recycleMaxAgeMs,
       memoryLimitMb: Math.round(recycleMemoryLimitBytes / 1024 / 1024),
+      cpuLimitPercent: recycleCpuLimitPercent,
+      requiredHighCpuChecks: recycleRequiredHighCpuChecks,
+      cpuMinAgeMs: recycleCpuMinAgeMs,
+      resourceCircuitMaxRecycles,
+      resourceCircuitWindowMs,
       checkIntervalMs: recycleCheckIntervalMs,
     });
   } else {
-    log("WhatsApp idle page recycle disabled");
+    log("WhatsApp browser resource monitor disabled");
   }
 
   client.on("disconnected", (reason) => {

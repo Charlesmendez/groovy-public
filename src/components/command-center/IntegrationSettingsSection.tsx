@@ -21,6 +21,11 @@ import {
   type WebPixel,
 } from "@/components/command-center/DataIntegrationsPanel";
 import IntegrationsPanel from "@/components/command-center/IntegrationsPanel";
+import {
+  connectDatagranInSystemBrowser,
+  providerUsesDesktopBrowserOAuth,
+} from "@/lib/datagran/desktopConnect";
+import { isDesktopShell } from "@/lib/desktop/shell";
 
 type CatalogIntegration = {
   id: string;
@@ -196,10 +201,15 @@ export function IntegrationSettingsSection({
 
   const connect = useCallback(
     async (platform: PlatformType) => {
+      const provider = getDatagranProvider(platform);
+      if (isDesktopShell() && providerUsesDesktopBrowserOAuth(provider)) {
+        await connectDatagranInSystemBrowser({ provider });
+        await refreshAll();
+        return;
+      }
       if (!datagranScriptLoaded || !window.DatagranLink) {
         throw new Error("The secure connection window is still loading. Try again in a moment.");
       }
-      const provider = getDatagranProvider(platform);
       const tokenRes = await fetch("/api/datagran/link-token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -241,6 +251,25 @@ export function IntegrationSettingsSection({
 
   const reconnect = useCallback(
     async (agentId: string) => {
+      const existing = connections.find(
+        (connection) => connection.id === agentId,
+      );
+      const provider = existing
+        ? getDatagranProvider(existing.platform)
+        : null;
+      if (
+        isDesktopShell() &&
+        provider &&
+        providerUsesDesktopBrowserOAuth(provider)
+      ) {
+        if (!existing) throw new Error("The integration could not be found.");
+        await connectDatagranInSystemBrowser({
+          provider,
+          agentId,
+        });
+        await refreshAll();
+        return;
+      }
       if (!datagranScriptLoaded || !window.DatagranLink) {
         throw new Error("The secure connection window is still loading. Try again in a moment.");
       }
@@ -275,7 +304,7 @@ export function IntegrationSettingsSection({
         });
       });
     },
-    [datagranScriptLoaded, refreshAll]
+    [connections, datagranScriptLoaded, refreshAll]
   );
 
   const connectWithId = useCallback(

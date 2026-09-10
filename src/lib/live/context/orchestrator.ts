@@ -15,6 +15,8 @@ import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
 import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 import type { LiveTurnProgress } from "../turn";
 import { getAppUrl } from "@/lib/config/appConfig";
+import { resolveUserDeviceId } from "@/lib/devices/resolveUserDeviceId";
+import type { ToolExecutionContext } from "@/lib/orchestrator/toolExecutor";
 
 const MAX_TOOL_RESULT_CHARS = 20_000;
 
@@ -23,23 +25,34 @@ export async function loadLiveOrchestratorContext(args: {
   userId: string;
   userEmail?: string | null;
   message: string;
+  history?: ModelMessage[];
+  orchestratorAgentId?: string | null;
+  orchestratorSessionId?: string | null;
+  sourceProvider?: string;
+  actionAuthorization?: "default" | "confirmation_required";
   cookies?: string;
   userAgent?: string;
   progress?: LiveTurnProgress;
+  includeToolOutput?: boolean;
+  onUiAction?: ToolExecutionContext["onUiAction"];
 }): Promise<string> {
   const progress = args.progress ?? (() => undefined);
   const message = args.message.trim();
   if (!message) return "";
 
-  const runtimeAgentId = await ensureOrchestratorRuntimeAgentId(args.supabase, args.userId);
-  const runtimeSessionId = runtimeAgentId
+  const runtimeAgentId =
+    args.orchestratorAgentId ||
+    (await ensureOrchestratorRuntimeAgentId(args.supabase, args.userId));
+  const runtimeSessionId =
+    args.orchestratorSessionId ||
+    (runtimeAgentId
     ? await getOrCreateRuntimeSessionForAgent({
         supabase: args.supabase,
         userId: args.userId,
         agentId: runtimeAgentId,
         title: "Live",
       })
-    : null;
+    : null);
   const runtimeScope =
     runtimeAgentId && runtimeSessionId
       ? await resolveRuntimeScope({
@@ -50,7 +63,7 @@ export async function loadLiveOrchestratorContext(args: {
         }).catch(() => null)
       : null;
   const [deviceId, aiChatAgents, webPixelNames, filesAgent, telegramBotToken] = await Promise.all([
-    resolveLatestDeviceId(args.supabase, args.userId),
+    resolveUserDeviceId(args.supabase, args.userId),
     loadAiChatAgents(args.supabase, args.userId),
     loadWebPixelNames(args.supabase, args.userId),
     runtimeSessionId
@@ -60,7 +73,10 @@ export async function loadLiveOrchestratorContext(args: {
   ]);
 
   await progress("asking the orchestrator what it can see");
-  const baseHistory: ModelMessage[] = [{ role: "user", content: message }];
+  const baseHistory: ModelMessage[] =
+    Array.isArray(args.history) && args.history.length > 0
+      ? args.history
+      : [{ role: "user", content: message }];
   const runRound = (opts?: {
     history?: ModelMessage[];
     toolResults?: Array<{ toolCallId: string; toolName: string; result: string }>;
@@ -79,6 +95,8 @@ export async function loadLiveOrchestratorContext(args: {
       toolResults: opts?.toolResults,
       orchestratorAgentId: runtimeScope?.agentId || runtimeAgentId || null,
       orchestratorSessionId: runtimeSessionId,
+      sourceProvider: args.sourceProvider || "live_canvas",
+      actionAuthorization: args.actionAuthorization || "default",
       branchCurrentTurnCount: runtimeScope?.branchTurnCount ?? null,
       branchActiveCount: runtimeScope?.activeBranchCount ?? null,
       deviceId,
@@ -98,6 +116,7 @@ export async function loadLiveOrchestratorContext(args: {
         const text = event.text.replace(/\s+/g, " ").trim();
         if (text) await progress(`${event.toolName}: ${text}`);
       },
+      onUiAction: args.onUiAction,
     });
 
   let result = await runRound();
@@ -143,7 +162,7 @@ export async function loadLiveOrchestratorContext(args: {
     });
   }
 
-  return formatOrchestratorResult(result);
+  return formatOrchestratorResult(result, args.includeToolOutput !== false);
 }
 
 function connectorStatusMessage(connectorExecutes: ConnectorExecute[]): string {
@@ -238,59 +257,6 @@ function escapeToolAttr(value: string): string {
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-async function resolveLatestDeviceId(
-  supabase: SupabaseClient,
-  userId: string
-): Promise<string | null> {
-  const resolveOwnedDeviceId = async (candidateId: string | null): Promise<string | null> => {
-    const id = asString(candidateId);
-    if (!id) return null;
-    try {
-      const { data } = await supabase
-        .from("devices")
-        .select("id")
-        .eq("user_id", userId)
-        .eq("id", id)
-        .limit(1)
-        .maybeSingle();
-      return asString((data as { id?: unknown } | null)?.id);
-    } catch {
-      return null;
-    }
-  };
-
-  try {
-    const { data: prefs } = await supabase
-      .from("user_preferences")
-      .select("onboarding_data")
-      .eq("user_id", userId)
-      .maybeSingle();
-    const onboardingData =
-      prefs?.onboarding_data && typeof prefs.onboarding_data === "object"
-        ? (prefs.onboarding_data as Record<string, unknown>)
-        : null;
-    const preferredRaw = asString(onboardingData?.connectorDeviceId);
-    const preferred = await resolveOwnedDeviceId(preferredRaw);
-    if (preferred) return preferred;
-  } catch {
-    // ignore preference fallback failures
-  }
-
-  try {
-    const { data: latest } = await supabase
-      .from("devices")
-      .select("id")
-      .eq("user_id", userId)
-      .order("last_seen", { ascending: false, nullsFirst: false })
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    return asString((latest as { id?: unknown } | null)?.id);
-  } catch {
-    return null;
-  }
 }
 
 async function loadAiChatAgents(
@@ -423,9 +389,17 @@ async function loadTelegramBotToken(
   }
 }
 
-function formatOrchestratorResult(result: OrchestratorRoundResult): string {
+export function formatOrchestratorResult(
+  result: OrchestratorRoundResult,
+  includeToolOutput = true,
+): string {
   if (result.kind === "final") {
-    return [result.text, result.toolOutputText ? `\nTool output:\n${result.toolOutputText}` : ""]
+    return [
+      result.text,
+      includeToolOutput && result.toolOutputText
+        ? `\nTool output:\n${result.toolOutputText}`
+        : "",
+    ]
       .filter(Boolean)
       .join("\n")
       .trim();

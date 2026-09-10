@@ -2,17 +2,24 @@
  * Tool Executor
  * Executes tools by routing to the appropriate service (connector, Datagran agents, etc.)
  * 
- * IMPORTANT: Data tools DELEGATE to specialized Datagran agents, not call APIs directly.
- * Each agent has its own specialized prompts and uses Claude Opus with code execution.
+ * Data tools delegate natural-language work to specialized Datagran agents.
+ * Explicit Postgres SQL is sent directly through Datagran's Postgres proxy so
+ * deterministic database work does not depend on an additional model call.
  */
 
 import { toolToAgent, toolToConnectorMessage } from "./tools";
+import { isHomeDataTool } from "../homeInbox/dataContracts";
+import type { HomeDataBridge } from "../homeInbox/dataBridge";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { AgentType } from "./router";
 import type { ConnectorClientPlatform } from "@/lib/connector/platform";
 import { generateText, type ModelMessage } from "ai";
 import { resolveChatModel, type ProviderId } from "@/lib/ai/modelResolver";
-import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
+import {
+  decryptLlmApiKey,
+  encryptLlmApiKey,
+  sha256Hex,
+} from "@/lib/crypto/llmKey";
 import { insertBillingUsageEventBestEffort } from "@/lib/billing/events";
 import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
 import { usageChargeTypeForKeyMode } from "@/lib/billing/pricing";
@@ -20,11 +27,20 @@ import { getUpreadyReadinessForFlowUser } from "@/lib/upready/client";
 import { buildInternalRouteAuthHeaders } from "@/lib/internalRouteAuth";
 import { getAppUrl } from "@/lib/config/appConfig";
 import { inferScheduledWhatsAppDeliveryIntent } from "@/lib/scheduler/delivery";
+import { resolveScheduledExecutionDeviceId } from "@/lib/scheduler/executorSelection";
+import {
+  initialIntervalScheduleAnchor,
+  withScheduleTimezone,
+} from "@/lib/scheduler/cloud";
 import { inferProviderForModelId } from "@/lib/ai/modelCatalog";
 import {
+  canManageChannelSchedules,
+  canManageCurrentChannelSchedules,
+  channelScheduleCreateDenialReason,
   channelScheduleSummary,
   parseTeamChatChannelId,
   publicChannelSchedule,
+  resolveScheduledWorkerRef,
 } from "@/lib/chat/channelSchedules";
 import { ensureOrchestratorRuntimeAgentId } from "./runtimeAgents";
 import { startParallelBranchRuntime } from "./parallelBranchRuntime";
@@ -50,7 +66,26 @@ import {
 } from "@/lib/orchestrator/toolPolicy";
 import type { HarnessProfile } from "@/lib/orchestrator/harnessProfiles";
 import type { ExtensionRuntimeTool } from "@/lib/extensions/types";
+import {
+  actionAuthorizationDenialReason,
+  isBuiltInWriteLikeTool,
+  type ActionAuthorizationMode,
+} from "@/lib/orchestrator/actionAuthorization";
 import { loadIntegrationAssignments } from "@/lib/integrations/assignments";
+import {
+  executeDirectPostgresSql,
+  extractDirectPostgresSql,
+} from "@/lib/datagran/postgresDirect";
+import {
+  appUiActionForDestination,
+  type AppNavigationDestination,
+  type AppUiAction,
+} from "@/lib/navigation/appUiAction";
+import { resolveUserDeviceId } from "@/lib/devices/resolveUserDeviceId";
+import {
+  canUseWorkspaceIntegration,
+  privateIntegrationDenial,
+} from "@/lib/integrations/privateAccess";
 import {
   sendTelegramText,
   sendTelegramPhoto,
@@ -74,6 +109,8 @@ export type AgentActivity = {
 
 export type ToolExecutionContext = {
   userId: string;
+  /** Member who initiated shared workspace work; defaults to userId. */
+  usageActorUserId?: string;
   /** Owner of workspace-scoped integration credentials (distinct from actor). */
   integrationOwnerUserId?: string;
   /**
@@ -82,6 +119,10 @@ export type ToolExecutionContext = {
    * specialized executor.
    */
   toolPolicy?: ToolPolicyExecutionContext;
+  /** Server-owned, project-bound read adapter; never populated from model input. */
+  homeData?: HomeDataBridge;
+  /** Channel-owned side-effect boundary checked before every tool executor. */
+  actionAuthorization?: ActionAuthorizationMode;
   /** Exact resolved profile inherited by nested/parallel orchestrator rounds. */
   harnessProfile?: HarnessProfile | null;
   traceId?: string;
@@ -160,6 +201,10 @@ export type ToolExecutionContext = {
     success?: boolean;
     error?: string;
   }) => void;
+  // Optional trusted-app navigation callback. Server tools also return the URL
+  // so callers without an interactive UI can report it instead of pretending
+  // navigation occurred.
+  onUiAction?: (action: AppUiAction) => void;
   // Available Claude Code sessions (claude-code agents) for UI open commands
   codeSessions?: Array<{ id: string; name: string }>;
   // Dynamically loaded enterprise extension tools available in this runtime.
@@ -178,6 +223,35 @@ export type ToolExecutionContext = {
   disableTerminalExec?: boolean;
   // Orchestrator agent ID (agent-owned runtime and schedules).
   orchestratorAgentId?: string | null;
+  /** Scope used by read_skill_or_doc; artifact ids are supplied by trusted callers. */
+  assignedSkillScope?: {
+    workspaceId?: string | null;
+    agentId?: string | null;
+    profileId?: string | null;
+    additionalArtifactIds?: string[];
+    target: "flow" | "claude" | "codex";
+  };
+  /**
+   * Present only for a live Team Chat turn whose current speaker passed the
+   * channel-management check. The executor revalidates this server-side.
+   */
+  channelSkillManagement?: {
+    workspaceId: string;
+    channelId: string;
+    actorUserId: string;
+    /** Hint used only for tool exposure; the service revalidates admin role. */
+    canCreateSkills: boolean;
+  } | null;
+  /** Trusted Team Chat actor scope; schedule execution revalidates it. */
+  channelScheduleManagement?: {
+    workspaceId: string;
+    channelId: string;
+    actorUserId: string;
+  } | null;
+  workspaceAssignmentManagement?: {
+    workspaceId: string;
+    actorUserId: string;
+  } | null;
   // Branch-controller policy and current runtime branch stats.
   branchControllerMode?: "read_only" | "read_write";
   branchControllerMaxBranches?: number | null;
@@ -195,6 +269,11 @@ export type ToolExecutionContext = {
   taskNotifyTargets?: import("@/lib/orchestrator/agentTasks").AgentTaskNotifyTargets;
   // Channel that requested this turn, recorded on created agent tasks.
   taskRequestedChannel?: string | null;
+  // Team Chat thread that should receive worker completion messages.
+  taskThreadRootMessageId?: string | null;
+  // Zero for tasks delegated from a human turn; incremented each time an
+  // asynchronous worker completion causes the orchestrator to delegate again.
+  taskContinuationDepth?: number;
   // Handshake: active inter-agent communication session
   activeHandshakeId?: string | null;
   handshakePartnerSessionId?: string | null;
@@ -214,44 +293,12 @@ export type ToolExecutionContext = {
   };
 };
 
-const WRITE_LIKE_TOOLS = new Set<string>([
-  "schedule_create",
-  "schedule_pause",
-  "schedule_resume",
-  "schedule_cancel_next",
-  "schedule_delete",
-  "remember",
-  "wiki_file_learning",
-  "files_write",
-  "files_delete",
-  "files_move",
-  "files_mkdir",
-  "obsidian_write",
-  "obsidian_daily",
-  "whatsapp_send_text",
-  "whatsapp_send_media",
-  "terminal_exec",
-  "code_cli_run",
-  "browser_task",
-  "site_publish",
-  "site_attach_domain",
-  "site_unpublish",
-  "site_delete",
-  "sqlite_exec",
-  "linkdb_upsert_links",
-  "linkdb_update",
-  "skill_registry_create_draft",
-  "skill_registry_validate_draft",
-  "skill_registry_activate_draft",
-  "assign_skill_or_doc",
-  "remove_skill_or_doc_assignment",
-]);
-
-function isWriteLikeTool(toolName: string, context?: ToolExecutionContext): boolean {
-  if (WRITE_LIKE_TOOLS.has(toolName)) return true;
-  if (toolName === "skill_registry_list") return false;
-  if (toolName.startsWith("skill_")) return true;
-  if (toolName.startsWith("browser_")) return true;
+function isWriteLikeTool(
+  toolName: string,
+  params: Record<string, unknown>,
+  context?: ToolExecutionContext,
+): boolean {
+  if (isBuiltInWriteLikeTool(toolName, params)) return true;
   const extensionTool = context?.extensionToolsByName?.[toolName];
   if (extensionTool) return extensionTool.riskLevel !== "read";
   return false;
@@ -259,10 +306,11 @@ function isWriteLikeTool(toolName: string, context?: ToolExecutionContext): bool
 
 function applyBranchControllerGate(
   toolName: string,
+  params: Record<string, unknown>,
   context: ToolExecutionContext
 ): { ok: true } | { ok: false; error: string } {
   const mode = context.branchControllerMode || "read_write";
-  const isWriteLike = isWriteLikeTool(toolName, context);
+  const isWriteLike = isWriteLikeTool(toolName, params, context);
   if (mode === "read_only" && isWriteLike) {
     return {
       ok: false,
@@ -477,6 +525,7 @@ async function executeRuntimeBranchTool(
           },
           context: {
             orchestratorAgentId: context.orchestratorAgentId,
+            usageActorUserId: context.usageActorUserId,
             orchestratorSessionId: context.orchestratorSessionId || null,
             epochId: context.runtimeEpochId,
             appBaseUrl: context.appBaseUrl,
@@ -557,6 +606,14 @@ async function executeSkillRegistryTool(
       if (runner !== "code_cli_run" && runner !== "terminal_exec") {
         throw new Error("runner must be code_cli_run or terminal_exec");
       }
+      let defaultState: Record<string, unknown> | null = null;
+      if (typeof params.default_state_json === "string" && params.default_state_json.trim()) {
+        const value = JSON.parse(params.default_state_json) as unknown;
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          throw new Error("default_state_json must be a JSON object");
+        }
+        defaultState = value as Record<string, unknown>;
+      }
       const draft = await createSkillDraft({
         supabase: context.supabase,
         userId: context.userId,
@@ -566,10 +623,7 @@ async function executeSkillRegistryTool(
         description: typeof params.description === "string" ? params.description : null,
         runner,
         source: typeof params.source === "string" ? params.source : "",
-        defaultState:
-          params.default_state && typeof params.default_state === "object" && !Array.isArray(params.default_state)
-            ? (params.default_state as Record<string, unknown>)
-            : null,
+        defaultState,
       });
       return {
         success: true,
@@ -984,6 +1038,16 @@ export async function executeTool(
       executionTime: 0,
     };
   }
+  if ((toolName === "assign_skill_or_doc" || toolName === "remove_skill_or_doc_assignment") &&
+      context.channelSkillManagement && !context.workspaceAssignmentManagement) {
+    return {
+      success: false,
+      error: "Workspace-wide skill assignments require the current channel speaker's verified admin authority.",
+      agent: "harness",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  }
   const policyDenial =
     toolPolicyDenialReason(toolName, context.toolPolicy) ||
     toolPolicyParameterDenialReason(toolName, params, context.toolPolicy);
@@ -1002,9 +1066,49 @@ export async function executeTool(
       executionTime: Date.now() - startTime,
     };
   }
+  const actionDenial = actionAuthorizationDenialReason({
+    mode: context.actionAuthorization,
+    toolName,
+    params,
+    extensionRiskLevel: context.extensionToolsByName?.[toolName]?.riskLevel || null,
+  });
+  if (actionDenial) {
+    logEvent(context, "action_authorization_blocked", { toolName });
+    return {
+      success: false,
+      error: actionDenial,
+      agent: toolToAgent(toolName) || "unknown",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  }
+  if (isHomeDataTool(toolName)) {
+    // Before extension dispatch and generic parameter logging: data queries and
+    // customer records must not enter broad activity logs or extension handlers.
+    const base = { agent: "data", toolName, executionTime: Date.now() - startTime };
+    if (context.toolPolicy?.provider !== "home_inbox" || !context.homeData)
+      return { ...base, success: false, error: "No server-bound Home data access is available." };
+    try {
+      const result = await context.homeData.execute(toolName, params);
+      context.homeData.assertHealthy();
+      logEvent(context, "home_data_read_complete", { toolName, success: true });
+      return { ...base, success: true, result, executionTime: Date.now() - startTime };
+    } catch {
+      logEvent(context, "home_data_read_complete", { toolName, success: false });
+      return { ...base, success: false, error: "Home data could not be verified. This decision is held; do not interpret unavailable evidence as an empty result.", executionTime: Date.now() - startTime };
+    }
+  }
   const extensionTool = context.extensionToolsByName?.[toolName];
-  const agent = extensionTool ? "extension" : toolToAgent(toolName);
-  const gate = applyBranchControllerGate(toolName, context);
+  const agent = extensionTool
+    ? "extension"
+    : toolName === "app_navigate"
+      ? "app"
+      : toolName.startsWith("chat_")
+      ? "chat"
+      : toolName.startsWith("email_")
+        ? "email"
+        : toolToAgent(toolName);
+  const gate = applyBranchControllerGate(toolName, params, context);
   if (!gate.ok) {
     const reason = branchGateReason(gate.error);
     await recordBranchBudgetLimitHit(context, reason);
@@ -1049,6 +1153,56 @@ export async function executeTool(
     return r;
   }
 
+  if (toolName === "app_navigate") {
+    const r = executeAppNavigationTool(params, context, startTime);
+    logEvent(context, "tool_execute_end", {
+      toolName,
+      agent: r.agent,
+      success: r.success,
+      executionTimeMs: r.executionTime,
+      error: r.error,
+    });
+    return r;
+  }
+
+  if (toolName === "chat_resolve_channel" || toolName === "chat_send_message") {
+    const r = await executeChatWorkspaceTool(
+      toolName,
+      params,
+      context,
+      startTime,
+    );
+    logEvent(context, "tool_execute_end", {
+      toolName,
+      agent: r.agent,
+      success: r.success,
+      executionTimeMs: r.executionTime,
+      error: r.error,
+    });
+    return r;
+  }
+
+  if (
+    toolName === "email_search" ||
+    toolName === "email_create_draft" ||
+    toolName === "email_send_draft"
+  ) {
+    const r = await executeEmailWorkspaceTool(
+      toolName,
+      params,
+      context,
+      startTime,
+    );
+    logEvent(context, "tool_execute_end", {
+      toolName,
+      agent: r.agent,
+      success: r.success,
+      executionTimeMs: r.executionTime,
+      error: r.error,
+    });
+    return r;
+  }
+
   if (toolName === "runtime_branch_parallel") {
     const r = await executeRuntimeBranchTool(toolName, params, context, startTime);
     logEvent(context, "tool_execute_end", {
@@ -1065,8 +1219,17 @@ export async function executeTool(
   if (
     toolName === "list_agents" ||
     toolName === "list_skills_and_docs" ||
+    toolName === "read_skill_or_doc" ||
+    toolName === "run_skill_action" ||
     toolName === "assign_skill_or_doc" ||
     toolName === "remove_skill_or_doc_assignment" ||
+    toolName === "list_workspace_secret_assignments" ||
+    toolName === "set_workspace_secret_assignment" ||
+    toolName === "list_channel_skills" ||
+    toolName === "create_channel_skill" ||
+    toolName === "update_channel_skill_actions" ||
+    toolName === "assign_channel_skill" ||
+    toolName === "remove_channel_skill" ||
     toolName === "assign_task" ||
     toolName === "consult_agent" ||
     toolName === "finalize_plan" ||
@@ -1272,6 +1435,227 @@ export async function executeTool(
     error: unknown.error,
   });
   return unknown;
+}
+
+function executeAppNavigationTool(
+  params: Record<string, unknown>,
+  context: ToolExecutionContext,
+  startTime: number,
+): ToolResult {
+  const destination = params.destination;
+  if (
+    destination !== "command_center" &&
+    destination !== "email" &&
+    destination !== "chat" &&
+    destination !== "settings"
+  ) {
+    return {
+      success: false,
+      error: "Choose a supported Groovy destination.",
+      agent: "app",
+      toolName: "app_navigate",
+      executionTime: Date.now() - startTime,
+    };
+  }
+  if (!context.onUiAction) {
+    return {
+      success: false,
+      error: "This Groovy surface cannot perform in-app navigation.",
+      agent: "app",
+      toolName: "app_navigate",
+      executionTime: Date.now() - startTime,
+    };
+  }
+
+  const action = appUiActionForDestination(destination as AppNavigationDestination);
+  try {
+    context.onUiAction(action);
+    return {
+      success: true,
+      result: {
+        opened: true,
+        destination,
+        url: action.url,
+        label: action.label,
+      },
+      agent: "app",
+      toolName: "app_navigate",
+      executionTime: Date.now() - startTime,
+    };
+  } catch {
+    return {
+      success: false,
+      error: "Groovy could not switch the visible app area.",
+      agent: "app",
+      toolName: "app_navigate",
+      executionTime: Date.now() - startTime,
+    };
+  }
+}
+
+async function executeChatWorkspaceTool(
+  toolName: string,
+  params: Record<string, unknown>,
+  context: ToolExecutionContext,
+  startTime: number,
+): Promise<ToolResult> {
+  try {
+    const { resolveGroovyChatChannel, sendGroovyChatMessage } = await import(
+      "@/lib/orchestrator/chatCommands"
+    );
+    if (toolName === "chat_resolve_channel") {
+      const result = await resolveGroovyChatChannel({
+        userId: context.userId,
+        query: asNonEmptyString(params.query) || "",
+        kind:
+          params.kind === "channel" || params.kind === "dm"
+            ? params.kind
+            : undefined,
+        open: params.open === true,
+        onUiAction: context.onUiAction,
+      });
+      return {
+        success: true,
+        result,
+        agent: "chat",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+
+    const result = await sendGroovyChatMessage({
+      userId: context.userId,
+      appBaseUrl: context.appBaseUrl || getAppUrl(),
+      channelId: asNonEmptyString(params.channel_id) || "",
+      content: typeof params.content === "string" ? params.content : "",
+      timezone: context.localTimezone,
+      openAfterSend: params.open_after_send === true,
+      onUiAction: context.onUiAction,
+    });
+    return {
+      success: true,
+      result,
+      agent: "chat",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      agent: "chat",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  }
+}
+
+async function executeEmailWorkspaceTool(
+  toolName: string,
+  params: Record<string, unknown>,
+  context: ToolExecutionContext,
+  startTime: number,
+): Promise<ToolResult> {
+  const ownerUserId = privateEmailCredentialUserId(context);
+  try {
+    if (toolName === "email_search") {
+      if (!context.supabase) {
+        throw new Error("The Email workspace is unavailable in this context.");
+      }
+      const { searchConnectedGmail } = await import(
+        "@/lib/orchestrator/emailSearch"
+      );
+      const connectionIds = Array.isArray(params.connection_ids)
+        ? params.connection_ids
+            .filter((value): value is string => typeof value === "string")
+            .map((value) => value.trim())
+            .filter(Boolean)
+        : undefined;
+      const result = await searchConnectedGmail({
+        supabase: context.supabase,
+        userId: ownerUserId,
+        query: asNonEmptyString(params.query) || undefined,
+        connectionIds,
+        limit:
+          typeof params.limit === "number" && Number.isFinite(params.limit)
+            ? params.limit
+            : undefined,
+        signal: context.abortSignal,
+      });
+      return {
+        success: true,
+        result,
+        agent: "email",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+
+    const { createConnectedGmailDraft, sendConnectedGmailDraft } = await import(
+      "@/lib/orchestrator/emailActions"
+    );
+    if (toolName === "email_create_draft") {
+      if (!context.supabase) {
+        throw new Error("The Email workspace is unavailable in this context.");
+      }
+      const stringArray = (value: unknown): string[] | undefined =>
+        Array.isArray(value)
+          ? value.filter((item): item is string => typeof item === "string")
+          : undefined;
+      const result = await createConnectedGmailDraft({
+        supabase: context.supabase,
+        userId: ownerUserId,
+        mailbox: asNonEmptyString(params.mailbox),
+        mode: params.mode === "reply" ? "reply" : "new",
+        to: stringArray(params.to),
+        cc: stringArray(params.cc),
+        bcc: stringArray(params.bcc),
+        subject: asNonEmptyString(params.subject) || "",
+        body: typeof params.body === "string" ? params.body : "",
+        threadId: asNonEmptyString(params.thread_id),
+        replyAll: params.reply_all === true,
+      });
+      return {
+        success: true,
+        result,
+        agent: "email",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+
+    const result = await sendConnectedGmailDraft({
+      userId: ownerUserId,
+      appBaseUrl: context.appBaseUrl || getAppUrl(),
+      connectionId: asNonEmptyString(params.connection_id) || "",
+      draftId: asNonEmptyString(params.draft_id) || "",
+    });
+    return {
+      success: true,
+      result,
+      agent: "email",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      agent: "email",
+      toolName,
+      executionTime: Date.now() - startTime,
+    };
+  }
+}
+
+/**
+ * Gmail is a private user workspace, not a shared workspace capability.
+ * Never substitute the billing/capability owner for the authenticated user.
+ */
+export function privateEmailCredentialUserId(
+  context: Pick<ToolExecutionContext, "userId" | "integrationOwnerUserId">,
+): string {
+  return context.userId;
 }
 
 async function executeTwilioTool(
@@ -1572,6 +1956,85 @@ async function executeScheduleTool(
   const teamChatChannelId = parseTeamChatChannelId(
     context.taskRequestedChannel,
   );
+
+  if (teamChatChannelId) {
+    const scope = context.channelScheduleManagement;
+    if (!scope || scope.channelId !== teamChatChannelId) {
+      return {
+        success: false,
+        error:
+          "Only workspace members can manage scheduled tasks in this channel.",
+        agent: "schedule",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+    const [
+      { data: channel, error: channelError },
+      { data: membership, error: membershipError },
+      { data: channelMembership, error: channelMembershipError },
+    ] =
+      await Promise.all([
+        supabase
+          .from("chat_channels")
+          .select("id,workspace_id,created_by,kind,visibility,is_archived")
+          .eq("id", teamChatChannelId)
+          .eq("workspace_id", scope.workspaceId)
+          .maybeSingle(),
+        supabase
+          .from("workspace_members")
+          .select("role")
+          .eq("workspace_id", scope.workspaceId)
+          .eq("user_id", scope.actorUserId)
+          .maybeSingle(),
+        supabase
+          .from("chat_channel_members")
+          .select("id")
+          .eq("channel_id", teamChatChannelId)
+          .eq("member_type", "user")
+          .eq("user_id", scope.actorUserId)
+          .limit(1)
+          .maybeSingle(),
+      ]);
+    if (
+      channelError ||
+      membershipError ||
+      channelMembershipError ||
+      !channel ||
+      channel.kind !== "channel" ||
+      channel.is_archived === true
+    ) {
+      return {
+        success: false,
+        error: "The channel schedule authorization could not be verified.",
+        agent: "schedule",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+    if (
+      !canManageCurrentChannelSchedules({
+        workspaceRole: membership?.role || null,
+        visibility: channel.visibility,
+        isChannelMember: Boolean(channelMembership?.id),
+        isArchived: channel.is_archived === true,
+      }) ||
+      !canManageChannelSchedules({
+        workspaceRole: membership?.role || null,
+        channelCreatedBy: String(channel.created_by || ""),
+        userId: scope.actorUserId,
+      })
+    ) {
+      return {
+        success: false,
+        error:
+          "Guests can view channel schedules, but only workspace members can change them.",
+        agent: "schedule",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+  }
   const channelSafeJob = (job: unknown): unknown => {
     if (!job || typeof job !== "object" || Array.isArray(job)) return job;
     const value = job as Record<string, unknown>;
@@ -1609,49 +2072,7 @@ async function executeScheduleTool(
         ? context.deviceId.trim()
         : null;
     if (fromContext) return fromContext;
-
-    // Fallback 1: connector device pinned in onboarding/user preferences.
-    let preferredDeviceId: string | null = null;
-    try {
-      const { data: prefs } = await supabase
-        .from("user_preferences")
-        .select("onboarding_data")
-        .eq("user_id", userId)
-        .maybeSingle();
-      const onboardingData =
-        prefs?.onboarding_data && typeof prefs.onboarding_data === "object"
-          ? (prefs.onboarding_data as Record<string, unknown>)
-          : null;
-      const rawPreferred =
-        onboardingData && typeof onboardingData.connectorDeviceId === "string"
-          ? onboardingData.connectorDeviceId.trim()
-          : "";
-      preferredDeviceId = rawPreferred || null;
-    } catch {
-      preferredDeviceId = null;
-    }
-
-    if (preferredDeviceId) {
-      const { data: ownedPreferred } = await supabase
-        .from("devices")
-        .select("id")
-        .eq("id", preferredDeviceId)
-        .eq("user_id", userId)
-        .limit(1)
-        .maybeSingle();
-      if (ownedPreferred?.id) return String(ownedPreferred.id);
-    }
-
-    // Fallback 2: most recently seen owned device (or most recently created if unseen).
-    const { data: recentOwned } = await supabase
-      .from("devices")
-      .select("id")
-      .eq("user_id", userId)
-      .order("last_seen", { ascending: false, nullsFirst: false })
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    return recentOwned?.id ? String(recentOwned.id) : null;
+    return resolveUserDeviceId(supabase, userId);
   };
 
   const normalizeScheduledWhatsAppTargetValue = (raw: unknown): string => {
@@ -1703,47 +2124,29 @@ async function executeScheduleTool(
 
   try {
     if (toolName === "schedule_create") {
-      const deviceId = await resolveScheduleDeviceId();
-      if (!deviceId) {
-        return {
-          success: false,
-          error:
-            "No paired connector device found for this account. Pair/start the Groovy Connector, then try scheduling again.",
-          agent: "schedule",
-          toolName,
-          executionTime: Date.now() - startTime,
-        };
-      }
-      const { data: ownedDevice, error: ownedDeviceErr } = await supabase
-        .from("devices")
-        .select("id")
-        .eq("id", deviceId)
-        .eq("user_id", userId)
-        .limit(1)
-        .maybeSingle();
-      if (ownedDeviceErr) {
-        return {
-          success: false,
-          error: `Failed to verify connector ownership: ${ownedDeviceErr.message}`,
-          agent: "schedule",
-          toolName,
-          executionTime: Date.now() - startTime,
-        };
-      }
-      if (!ownedDevice) {
-        return {
-          success: false,
-          error:
-            "The selected connector belongs to a different account. Re-pair the connector from this account and retry.",
-          agent: "schedule",
-          toolName,
-          executionTime: Date.now() - startTime,
-        };
-      }
+      let deviceId = await resolveScheduleDeviceId();
 
       const kind = typeof params.kind === "string" ? params.kind.trim() : "shell";
+      const channelCreateDenial = channelScheduleCreateDenialReason({
+        channelId: teamChatChannelId,
+        kind,
+      });
+      if (channelCreateDenial) {
+        return {
+          success: false,
+          error: channelCreateDenial,
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
       const name = typeof params.name === "string" ? params.name.trim() : "";
-      const schedule = params.schedule as unknown;
+      const localizedSchedule = withScheduleTimezone(
+        params.schedule,
+        context.localTimezone,
+      );
+      const schedule = localizedSchedule.schedule || params.schedule;
+      const initialLastRunAt = initialIntervalScheduleAnchor(schedule);
 
       if (kind !== "shell" && kind !== "orchestrator") {
         return {
@@ -1829,7 +2232,15 @@ async function executeScheduleTool(
       // worker instead of an orchestrator round. Never for shell jobs.
       let targetAgentId: string | null = null;
       const workerRef =
-        kind === "orchestrator" && typeof params.agent === "string" ? params.agent.trim() : "";
+        kind === "orchestrator"
+          ? resolveScheduledWorkerRef({
+              requestedAgent: params.agent,
+              teamChatChannelId,
+              currentMindName: context.harnessProfile?.name,
+              currentMindSlug: context.harnessProfile?.slug,
+              explicitWorker: params.explicit_worker,
+            })
+          : null;
       if (workerRef) {
         const { resolveWorkerAgentByRef } = await import("@/lib/orchestrator/agentTasks");
         const resolvedWorker = await resolveWorkerAgentByRef(userId, workerRef);
@@ -1840,6 +2251,19 @@ async function executeScheduleTool(
               resolvedWorker.error === "ambiguous"
                 ? `Multiple worker agents match "${workerRef}": ${(resolvedWorker.candidates || []).join(", ")}. Use the exact name.`
                 : `No worker agent named "${workerRef}". Omit the agent to schedule on the Orchestrator, or use list_agents for the roster.`,
+            agent: "schedule",
+            toolName,
+            executionTime: Date.now() - startTime,
+          };
+        }
+        if (
+          teamChatChannelId &&
+          Array.isArray(context.toolPolicy?.agentRoster) &&
+          !context.toolPolicy.agentRoster.includes(resolvedWorker.agent.id)
+        ) {
+          return {
+            success: false,
+            error: `Worker agent "${resolvedWorker.agent.name}" is not selected in this Team Chat channel. Add it in Channel settings or omit agent to use the channel Mind.`,
             agent: "schedule",
             toolName,
             executionTime: Date.now() - startTime,
@@ -1868,6 +2292,50 @@ async function executeScheduleTool(
           }
         }
         targetAgentId = resolvedWorker.agent.id;
+        // Worker schedules must be delivered to the worker's own connector.
+        // A generic preferred/recent device can be a different or stale Mac,
+        // leaving the job permanently invisible to the assigned worker.
+        deviceId = resolveScheduledExecutionDeviceId({
+          fallbackDeviceId: deviceId,
+          workerDeviceId: resolvedWorker.agent.deviceId,
+        });
+      }
+
+      if (!deviceId) {
+        return {
+          success: false,
+          error:
+            "No paired connector device found for this account. Pair/start the Groovy Connector, then try scheduling again.",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      const { data: ownedDevice, error: ownedDeviceErr } = await supabase
+        .from("devices")
+        .select("id")
+        .eq("id", deviceId)
+        .eq("user_id", userId)
+        .limit(1)
+        .maybeSingle();
+      if (ownedDeviceErr) {
+        return {
+          success: false,
+          error: `Failed to verify connector ownership: ${ownedDeviceErr.message}`,
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      if (!ownedDevice) {
+        return {
+          success: false,
+          error:
+            "The selected connector belongs to a different account. Re-pair the connector from this account and retry.",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
       }
 
       const insertPayload: Record<string, unknown> = {
@@ -1923,6 +2391,7 @@ async function executeScheduleTool(
             ? context.harnessProfile?.id || null
             : null,
         schedule,
+        ...(initialLastRunAt ? { last_run_at: initialLastRunAt } : {}),
       };
       let insertResult = await supabase
         .from("scheduled_jobs")
@@ -2044,6 +2513,115 @@ async function executeScheduleTool(
           jobs: teamChatChannelId
             ? (data || []).map((job) => channelSafeJob(job))
             : data || [],
+        },
+        agent: "schedule",
+        toolName,
+        executionTime: Date.now() - startTime,
+      };
+    }
+
+    if (toolName === "schedule_update") {
+      const jobId =
+        typeof params.job_id === "string" ? params.job_id.trim() : "";
+      const nextPrompt =
+        typeof params.task === "string" ? params.task.trim() : "";
+      if (!jobId || !nextPrompt) {
+        return {
+          success: false,
+          error: "job_id and a non-empty task prompt are required",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      let readQuery = supabase
+        .from("scheduled_jobs")
+        .select("id,user_id,kind,task,updated_at")
+        .eq("id", jobId)
+        .eq("user_id", userId);
+      if (teamChatChannelId) {
+        readQuery = readQuery.eq("channel_id", teamChatChannelId);
+      }
+      const { data: existingJob, error: readError } =
+        await readQuery.maybeSingle();
+      if (readError) {
+        return {
+          success: false,
+          error: readError.message || "Failed to read scheduled task",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      if (!existingJob) {
+        return {
+          success: false,
+          error: "Scheduled task not found",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      if (existingJob.kind !== "orchestrator") {
+        return {
+          success: false,
+          error: "Only orchestrator scheduled-task prompts can be updated",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      const currentTask =
+        existingJob.task &&
+        typeof existingJob.task === "object" &&
+        !Array.isArray(existingJob.task)
+          ? (existingJob.task as Record<string, unknown>)
+          : {};
+      const updatedAt = new Date().toISOString();
+      let updateQuery = supabase
+        .from("scheduled_jobs")
+        .update({
+          task: { ...currentTask, message: nextPrompt },
+          updated_at: updatedAt,
+        })
+        .eq("id", jobId)
+        .eq("user_id", userId)
+        .eq("updated_at", existingJob.updated_at)
+        .select("*");
+      if (teamChatChannelId) {
+        updateQuery = updateQuery.eq("channel_id", teamChatChannelId);
+      }
+      const { data: updatedJobs, error: updateError } = await updateQuery;
+      if (updateError) {
+        return {
+          success: false,
+          error: updateError.message || "Failed to update scheduled task",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+      const updatedJob = updatedJobs?.[0];
+      if (!updatedJob) {
+        return {
+          success: false,
+          error:
+            "The scheduled task changed while it was being updated. Call schedule_list and retry with the latest prompt.",
+          agent: "schedule",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      return {
+        success: true,
+        result: {
+          ok: true,
+          job: teamChatChannelId
+            ? channelSafeJob(updatedJob)
+            : updatedJob,
         },
         agent: "schedule",
         toolName,
@@ -2475,8 +3053,8 @@ function mapToolProviderToDbProviders(provider: string): string[] {
 }
 
 /**
- * Execute data tools by DELEGATING to specialized Datagran agents.
- * Each agent has its own prompts, model, and capabilities.
+ * Execute data tools through specialized Datagran agents, with a direct proxy
+ * path for explicit Postgres SQL.
  */
 async function executeDataToolViaDelegation(
   toolName: string,
@@ -2544,6 +3122,21 @@ async function executeDataToolViaDelegation(
       const query = params.query as string;
       const agentName = typeof params.agentName === "string" ? params.agentName.trim() : "";
       const pixelName = params.pixelName as string | undefined;
+      if (
+        !canUseWorkspaceIntegration({
+          provider,
+          actorUserId: context.userId,
+          ownerUserId: integrationOwnerUserId,
+        })
+      ) {
+        return {
+          success: false,
+          error: privateIntegrationDenial(provider),
+          agent: "data",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
 
       logEvent(context, "data_query_delegating", {
         provider,
@@ -2558,7 +3151,7 @@ async function executeDataToolViaDelegation(
       const { data: configs, error: cfgErr } = await supabase
         .from("datagran_agent_configs")
         .select(
-          "agent_id, provider, connection_id, updated_at, agents!datagran_agent_configs_agent_id_fkey(id, name, type)"
+          "agent_id, provider, connection_id, datagran_api_key_enc, updated_at, agents!datagran_agent_configs_agent_id_fkey(id, name, type)"
         )
         .eq("user_id", integrationOwnerUserId)
         .in("provider", dbProviders)
@@ -2582,6 +3175,10 @@ async function executeDataToolViaDelegation(
           agentId: c.agent_id as string,
           provider: c.provider as string,
           connectionId: connectionIdRaw.trim(),
+          datagranApiKeyEnc:
+            typeof c.datagran_api_key_enc === "string"
+              ? c.datagran_api_key_enc
+              : "",
           agentName: ((c.agents as Record<string, unknown>)?.name as string) || "Data Agent",
           agentType: ((c.agents as Record<string, unknown>)?.type as string) || "datagran",
           updatedAt: c.updated_at as string,
@@ -2674,6 +3271,165 @@ async function executeDataToolViaDelegation(
         message: `Querying ${selectedAgent.agentName}...`,
         startedAt: new Date().toISOString(),
       });
+
+      // Raw Postgres SQL is already a complete execution plan. Sending it through
+      // the Anthropic-backed data agent adds an unrelated model-key dependency and
+      // can prevent a healthy database connection from being used. Execute these
+      // explicit statements directly through the same Datagran Postgres proxy.
+      const directPostgresSql =
+        selectedAgent.provider === "postgres"
+          ? extractDirectPostgresSql(query)
+          : null;
+      if (directPostgresSql) {
+        let storedDatagranApiKey = "";
+        if (selectedAgent.datagranApiKeyEnc) {
+          try {
+            storedDatagranApiKey = decryptLlmApiKey(
+              selectedAgent.datagranApiKeyEnc,
+            );
+          } catch (error) {
+            logEvent(context, "data_query_postgres_key_decrypt_error", {
+              agentId: selectedAgent.agentId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        const serverDatagranApiKey = String(
+          process.env.DATAGRAN_API_KEY || "",
+        ).trim();
+        const directApiKeys = [
+          storedDatagranApiKey,
+          serverDatagranApiKey,
+        ].filter((value, index, values) => value && values.indexOf(value) === index);
+        const serverKeyIndex = directApiKeys.indexOf(serverDatagranApiKey);
+
+        logEvent(context, "data_query_postgres_direct_start", {
+          agentId: selectedAgent.agentId,
+          agentName: selectedAgent.agentName,
+          sqlPreview: directPostgresSql.slice(0, 200),
+        });
+
+        const directResult = await executeDirectPostgresSql({
+          apiKeys: directApiKeys,
+          connectionId: selectedAgent.connectionId,
+          sql: directPostgresSql,
+          signal: context.abortSignal,
+        });
+
+        if (!directResult.ok) {
+          const directError =
+            directResult.error || "The Postgres query failed without an error message.";
+          logEvent(context, "data_query_postgres_direct_error", {
+            agentId: selectedAgent.agentId,
+            status: directResult.status,
+            error: directError.slice(0, 500),
+          });
+          context.onAgentActivity?.({
+            agentId: selectedAgent.agentId,
+            agentName: selectedAgent.agentName,
+            agentType: selectedAgent.agentType,
+            provider: selectedAgent.provider,
+            status: "error",
+            message: directError.slice(0, 200),
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+          });
+          return {
+            success: false,
+            error: `${selectedAgent.agentName} error: ${directError}`,
+            result: {
+              provider: selectedAgent.provider,
+              agentId: selectedAgent.agentId,
+              directSql: true,
+              retryable:
+                directResult.status === 0 || directResult.status >= 500,
+            },
+            agent: "data",
+            toolName,
+            executionTime: Date.now() - startTime,
+            delegatedTo: {
+              agentId: selectedAgent.agentId,
+              agentName: selectedAgent.agentName,
+              provider: selectedAgent.provider,
+            },
+          };
+        }
+
+        const usedServerKey =
+          serverDatagranApiKey.length > 0 &&
+          serverKeyIndex >= 0 &&
+          directResult.usedApiKeyIndex === serverKeyIndex &&
+          storedDatagranApiKey !== serverDatagranApiKey;
+        if (usedServerKey) {
+          const { error: refreshKeyError } = await supabase
+            .from("datagran_agent_configs")
+            .update({
+              datagran_api_key_enc: encryptLlmApiKey(serverDatagranApiKey),
+              datagran_api_key_hash: sha256Hex(serverDatagranApiKey),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("agent_id", selectedAgent.agentId)
+            .eq("user_id", integrationOwnerUserId);
+          if (refreshKeyError) {
+            logEvent(context, "data_query_postgres_key_refresh_error", {
+              agentId: selectedAgent.agentId,
+              error: refreshKeyError.message,
+            });
+          }
+        }
+
+        const directResponseText =
+          typeof directResult.data === "string"
+            ? directResult.data
+            : JSON.stringify(directResult.data, null, 2) ||
+              "Postgres query completed successfully.";
+        logEvent(context, "data_query_postgres_direct_complete", {
+          agentId: selectedAgent.agentId,
+          status: directResult.status,
+          responseLength: directResponseText.length,
+        });
+        context.onAgentActivity?.({
+          agentId: selectedAgent.agentId,
+          agentName: selectedAgent.agentName,
+          agentType: selectedAgent.agentType,
+          provider: selectedAgent.provider,
+          status: "complete",
+          message:
+            directResponseText.slice(0, 200) +
+            (directResponseText.length > 200 ? "..." : ""),
+          result: { text: directResponseText },
+          startedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+        });
+
+        return {
+          success: true,
+          result: {
+            agentResponse: directResponseText,
+            data: directResult.data,
+            directSql: true,
+            fromAgent: selectedAgent.agentName,
+            queriedAgent: {
+              agentId: selectedAgent.agentId,
+              agentName: selectedAgent.agentName,
+              provider: selectedAgent.provider,
+            },
+            availableAgents,
+            coverage: {
+              queriedCount: 1,
+              totalActiveConnections: agentConfigs.length,
+            },
+          },
+          agent: "data",
+          toolName,
+          executionTime: Date.now() - startTime,
+          delegatedTo: {
+            agentId: selectedAgent.agentId,
+            agentName: selectedAgent.agentName,
+            provider: selectedAgent.provider,
+          },
+        };
+      }
 
       // Call the Datagran agent via internal API
       const baseUrl =
@@ -3428,6 +4184,25 @@ async function executeDataToolViaDelegation(
       const integrationOwnerUserId =
         context.integrationOwnerUserId || context.userId;
       const provider = params.provider as string;
+      if (
+        !canUseWorkspaceIntegration({
+          provider,
+          actorUserId: context.userId,
+          ownerUserId: integrationOwnerUserId,
+        })
+      ) {
+        return {
+          success: true,
+          result: {
+            connected: false,
+            private: true,
+            error: privateIntegrationDenial(provider),
+          },
+          agent: "data",
+          toolName,
+          executionTime: Date.now() - startTime,
+        };
+      }
       const dbProviders = mapToolProviderToDbProviders(provider);
 
       const { data: rows, error } = await supabase
@@ -4538,6 +5313,23 @@ async function executeConnectorTool(
   // Hard guardrail: for generated sites under ~/.groovy/sites, keep all
   // file/system operations inside code_cli_run to avoid terminal verify loops.
   if (toolName === "terminal_exec") {
+    if (Array.isArray(params.env)) {
+      params = {
+        ...params,
+        env: Object.fromEntries(
+          params.env.flatMap((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+            const name = typeof (entry as { name?: unknown }).name === "string"
+              ? (entry as { name: string }).name.trim()
+              : "";
+            const value = (entry as { value?: unknown }).value;
+            return name && typeof value === "string"
+              ? [[name, value] as const]
+              : [];
+          }),
+        ),
+      };
+    }
     const commandText = String(params.command || "");
     const cwdText = String(params.cwd || "");
     const combined = `${commandText}\n${cwdText}`.toLowerCase();
@@ -4985,7 +5777,7 @@ async function executeAiAgentDelegate(
       const usageChargeType = usageChargeTypeForKeyMode(usingGroovyKey ? "groovy" : "user");
       insertBillingUsageEventBestEffort({
         workspaceId: context.billingWorkspaceId,
-        userId: context.userId,
+        userId: context.usageActorUserId || context.userId,
         turnId: billingTurnId,
         traceId: billingTraceId,
         source: "ai_agent_delegate",
@@ -4998,6 +5790,12 @@ async function executeAiAgentDelegate(
         meta: {
           agentId: agent.id,
           agentName: agent.name,
+          ...(context.usageActorUserId && context.usageActorUserId !== context.userId
+            ? {
+                usageActorUserId: context.usageActorUserId,
+                credentialOwnerUserId: context.userId,
+              }
+            : {}),
         },
       });
       await settleGroovyUsageDebitBestEffort({
@@ -5013,6 +5811,12 @@ async function executeAiAgentDelegate(
         meta: {
           agentId: agent.id,
           agentName: agent.name,
+          ...(context.usageActorUserId && context.usageActorUserId !== context.userId
+            ? {
+                usageActorUserId: context.usageActorUserId,
+                credentialOwnerUserId: context.userId,
+              }
+            : {}),
         },
       }).catch(() => {});
     }

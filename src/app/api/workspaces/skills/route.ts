@@ -35,7 +35,9 @@ type ActionBody = {
   description?: string;
   targets?: string[];
   overwrite?: boolean;
+  expectedCommitSha?: string;
   commitMessage?: string;
+  actionsManifest?: string;
 };
 
 function statusForError(message: string) {
@@ -116,7 +118,9 @@ export async function POST(req: Request) {
         description: body.description,
         targets: body.targets,
         overwrite: body.overwrite === true,
+        expectedCommitSha: body.expectedCommitSha,
         commitMessage: body.commitMessage,
+        actionsManifest: body.actionsManifest,
       });
       return NextResponse.json({
         ok: result.ok === true,

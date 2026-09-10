@@ -124,29 +124,57 @@ This lets you talk to Groovy from a WhatsApp group on **this Mac**, without any 
 WHATSAPP_GROUP_NAME="Groovy" GROOVY_APP_URL="https://your-app" node connector.mjs --relay wss://groovy-relay.fly.dev --whatsapp
 ```
 
-### Memory tuning
+### Browser power and resource controls
 
 The WhatsApp bridge runs Chromium in headless mode by default once a local
 WhatsApp Web session exists. First-time pairing or reset sessions open a visible
 browser window so the QR code can be scanned, unless headless mode is explicitly
-forced with `GROOVY_WHATSAPP_HEADLESS=1`. The bridge also disables GPU,
-audio/video capture, large renderer heaps, and post-auth image/media downloads,
-then restarts the WhatsApp Web browser during idle windows so long-running
-sessions do not keep growing memory indefinitely. Background recovery polls and
-messages from unrelated chats do not postpone cleanup. A bounded eight-hour
-maximum renderer age also guarantees a restart between active operations when a
-busy account never reaches the normal five-minute idle window. The connector
-also measures the WhatsApp Chrome process tree once per minute and fully
-restarts that browser between operations when it reaches 5 GB RSS.
+forced with `GROOVY_WHATSAPP_HEADLESS=1`.
+
+Groovy prefers an up-to-date installed Chrome or Edge because WhatsApp Web can
+raise its minimum supported browser faster than the connector's Puppeteer
+dependency. The current tested floor is Chromium 150; older cached browsers are
+rejected with an actionable health error. Puppeteer's expected protocol revision
+and the selected browser skew are logged for diagnostics. The launch policy
+keeps hardware acceleration on and restores Chromium's background
+timer/renderer throttling.
+
+Before startup, Groovy measures the persistent WhatsApp browser profile. A
+profile at or above 4 GB is renamed to a timestamped, recoverable
+`session-battery-backup-*` directory and a fresh profile is opened. This prevents
+pathological IndexedDB growth from being loaded forever; the user scans the QR
+once to relink. Groovy never silently deletes the archived profile.
+
+The event listener remains the primary inbound path. A recovery scan reads only
+the already-loaded message tail every minute by default; it never invokes
+WhatsApp's history loader. Page-wide request interception is off by default.
+
+The connector samples the full WhatsApp browser process tree once per minute. It
+restarts the browser between active operations at 2 GB RSS, or after three
+consecutive samples at 125% total CPU once the browser is at least five minutes
+old. Normal idle refresh and the eight-hour maximum renderer age remain in
+place. If CPU or memory pressure would cause a third resource restart in one
+hour, Groovy opens a circuit breaker and stops the WhatsApp browser to protect
+the Mac's battery instead of entering an infinite restart loop. Resource samples
+include aggregate CPU, RSS, largest child process, and RSS growth rate.
 
 Rollback/debug switches:
 
 - `GROOVY_WHATSAPP_HEADLESS=0` or `--whatsapp-headed` — run WhatsApp Web in a visible browser window
-- `GROOVY_WHATSAPP_BLOCK_IMAGES=0` — keep image/media requests enabled after login
-- `GROOVY_WHATSAPP_RECYCLE_MS=0` — disable idle page refresh
+- `GROOVY_WHATSAPP_BLOCK_IMAGES=1` — opt into post-auth image/media request blocking (enables page-wide request interception)
+- `WHATSAPP_INBOUND_POLL_INTERVAL_MS=<ms>` — tune the loaded-message recovery scan (default one minute; `0` disables it)
+- `GROOVY_WHATSAPP_RECYCLE_MS=0` — disable time-based page refresh (CPU and memory safeguards remain active)
 - `GROOVY_WHATSAPP_RECYCLE_IDLE_MS=<ms>` — tune how long the bridge must be idle before a refresh can happen
 - `GROOVY_WHATSAPP_RECYCLE_MAX_AGE_MS=<ms>` — tune the hard renderer lifetime, or set `0` to disable the hard limit
 - `GROOVY_WHATSAPP_RECYCLE_MEMORY_MB=<mb>` — tune the browser process-tree RSS limit, or set `0` to disable the memory guard
+- `GROOVY_WHATSAPP_RECYCLE_CPU_PERCENT=<percent>` — tune aggregate browser CPU pressure, or set `0` to disable the CPU guard
+- `GROOVY_WHATSAPP_RECYCLE_CPU_CHECKS=<count>` — tune the consecutive high-CPU samples required before restart
+- `GROOVY_WHATSAPP_RESOURCE_CIRCUIT_MAX_RECYCLES=<count>` — tune allowed resource restarts inside the circuit window
+- `GROOVY_WHATSAPP_RESOURCE_CIRCUIT_WINDOW_MS=<ms>` — tune the resource restart-loop window
+- `GROOVY_WHATSAPP_PROFILE_MAX_MB=<mb>` — tune oversized-profile rotation (default 4096 MB; `0` disables it)
+- `GROOVY_WHATSAPP_MIN_CHROME_MAJOR=<major>` — tune the tested WhatsApp Web browser floor
+- `GROOVY_WHATSAPP_CHROME_PATH=<path>` — use an explicit Chrome/Edge/Chromium executable
+- `GROOVY_WHATSAPP_ALLOW_OLD_BROWSER=1` — emergency-only opt-in for an explicit browser below the tested floor
 
 Useful before/after checks while the connector is running:
 

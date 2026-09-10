@@ -132,6 +132,21 @@ async function ensureActiveEpoch(args: {
     .select("id")
     .single();
   if (error) {
+    // Another request may have won the one-active-epoch race after our first
+    // read. Reuse its row instead of dropping branch-controller scope for this
+    // turn.
+    const { data: racedActive } = await supabase
+      .from("orchestrator_agent_epochs")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("agent_id", agentId)
+      .eq("status", "active")
+      .order("sequence", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (typeof racedActive?.id === "string" && racedActive.id) {
+      return racedActive.id;
+    }
     console.warn("[runtime-graph] ensureActiveEpoch create_failed", { userId, agentId, error: error.message });
     return null;
   }
@@ -179,6 +194,27 @@ async function ensureMainBranch(args: {
     .select("id,turn_count")
     .single();
   if (error) {
+    // The partial unique index allows only one main branch per epoch. If a
+    // concurrent resolver inserted it first, adopt that branch.
+    const { data: racedMain } = await supabase
+      .from("orchestrator_branches")
+      .select("id,turn_count")
+      .eq("user_id", userId)
+      .eq("agent_id", agentId)
+      .eq("epoch_id", epochId)
+      .is("parent_branch_id", null)
+      .order("created_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (typeof racedMain?.id === "string" && racedMain.id) {
+      const turnCount = Number(racedMain.turn_count);
+      return {
+        id: racedMain.id,
+        turnCount: Number.isFinite(turnCount)
+          ? Math.max(0, Math.floor(turnCount))
+          : 0,
+      };
+    }
     console.warn("[runtime-graph] ensureMainBranch create_failed", {
       userId,
       agentId,
@@ -218,7 +254,10 @@ export async function getActiveBranchCount(args: {
   return countActiveBranches(args);
 }
 
-const STALE_WORKER_BRANCH_MINUTES = 15;
+// A connector branch can legitimately spend more than 15 minutes inside a
+// bounded browser/code operation. Keep the stale lease above those tool
+// timeouts so a second fan-out request cannot abort work that is still alive.
+const STALE_WORKER_BRANCH_MINUTES = 45;
 
 export async function abortStaleWorkerBranches(args: {
   supabase: SupabaseClient;
@@ -477,20 +516,16 @@ export async function incrementBranchTurnCount(args: {
   userId: string;
   branchId: string;
 }) {
-  const { data: row } = await args.supabase
-    .from("orchestrator_branches")
-    .select("turn_count")
-    .eq("id", args.branchId)
-    .eq("user_id", args.userId)
-    .maybeSingle();
-  const current = Number((row as { turn_count?: unknown } | null)?.turn_count);
-  const next = (Number.isFinite(current) ? Math.max(0, Math.floor(current)) : 0) + 1;
-  await args.supabase
-    .from("orchestrator_branches")
-    .update({ turn_count: next, updated_at: new Date().toISOString() })
-    .eq("id", args.branchId)
-    .eq("user_id", args.userId);
-  return next;
+  const { data, error } = await args.supabase.rpc(
+    "increment_orchestrator_branch_turn_count",
+    {
+      p_user_id: args.userId,
+      p_branch_id: args.branchId,
+    },
+  );
+  if (error) throw new Error(error.message);
+  const next = Number(data);
+  return Number.isFinite(next) ? Math.max(0, Math.floor(next)) : 0;
 }
 
 export async function spawnWorkerBranches(args: {
@@ -510,51 +545,24 @@ export async function spawnWorkerBranches(args: {
     : [];
   if (requestedTasks.length === 0) return [];
 
-  const activeCount = await countActiveBranches({
-    supabase: args.supabase,
-    userId: args.userId,
-    agentId: args.agentId,
-    epochId: args.epochId,
-  });
   const maxBranches = Number(args.maxBranches);
-  const availableSlots =
-    Number.isFinite(maxBranches) && maxBranches > 0
-      ? Math.max(0, Math.floor(maxBranches) - activeCount)
-      : requestedTasks.length;
-  if (availableSlots <= 0) return [];
-
-  const limitedTasks = requestedTasks.slice(0, availableSlots);
-  const { count: totalBranchCount } = await args.supabase
-    .from("orchestrator_branches")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", args.userId)
-    .eq("agent_id", args.agentId)
-    .eq("epoch_id", args.epochId);
-  let nextOrdinal = Number.isFinite(Number(totalBranchCount))
-    ? Math.max(1, Number(totalBranchCount) + 1)
-    : 1;
-
-  const rows = limitedTasks.map((task) => {
-    const title = normalizeBranchTitle(task.title || null, `worker-${nextOrdinal}`);
-    nextOrdinal += 1;
-    return {
-      user_id: args.userId,
-      agent_id: args.agentId,
-      epoch_id: args.epochId,
-      parent_branch_id: args.parentBranchId,
-      name: title,
-      status: "active",
-      branch_kind: "worker",
-      turn_count: 0,
-      goal: task.goal.trim(),
-      fork_reason: "runtime_branch_parallel",
-    };
-  });
-
-  const { data, error } = await args.supabase
-    .from("orchestrator_branches")
-    .insert(rows)
-    .select("id,name,goal");
+  const { data, error } = await args.supabase.rpc(
+    "spawn_orchestrator_worker_branches",
+    {
+      p_user_id: args.userId,
+      p_agent_id: args.agentId,
+      p_epoch_id: args.epochId,
+      p_parent_branch_id: args.parentBranchId,
+      p_max_branches:
+        Number.isFinite(maxBranches) && maxBranches > 0
+          ? Math.floor(maxBranches)
+          : requestedTasks.length + 1,
+      p_tasks: requestedTasks.map((task) => ({
+        title: normalizeBranchTitle(task.title || null, ""),
+        goal: task.goal.trim(),
+      })),
+    },
+  );
   if (error) {
     console.warn("[runtime-graph] spawnWorkerBranches create_failed", {
       userId: args.userId,
@@ -566,11 +574,16 @@ export async function spawnWorkerBranches(args: {
     return [];
   }
 
-  return (data || [])
+  return ((data || []) as Array<{
+    branch_id?: unknown;
+    title?: unknown;
+    goal?: unknown;
+  }>)
     .map((row) => {
-      const branchId = typeof row.id === "string" ? row.id : "";
+      const branchId =
+        typeof row.branch_id === "string" ? row.branch_id : "";
       const title = normalizeBranchTitle(
-        typeof row.name === "string" ? row.name : null,
+        typeof row.title === "string" ? row.title : null,
         "worker"
       );
       const goal = typeof row.goal === "string" ? row.goal.trim() : "";

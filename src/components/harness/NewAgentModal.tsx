@@ -9,6 +9,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Folder, Loader2, X } from "lucide-react";
 import { WORKER_MODEL_PRESETS } from "@/lib/agents/modelPresets";
+import { isWorkspaceRequiredForAgentCreation } from "@/lib/agents/workspaceRequirement.mjs";
 import { reasoningEffortsForModel } from "@/lib/ai/modelCatalog";
 
 const SUGGESTED_NAMES = ["Builder", "Fixter", "Reviewer", "Scout", "Shipper", "Docsmith"];
@@ -22,6 +23,7 @@ export function NewAgentModal({
   claudeCliInstalled,
   codexCliInstalled,
   connectorOnline,
+  mobileUi,
   requiredWorkspaceRoot,
 }: {
   isOpen: boolean;
@@ -37,6 +39,7 @@ export function NewAgentModal({
   claudeCliInstalled: boolean | null;
   codexCliInstalled: boolean | null;
   connectorOnline: boolean;
+  mobileUi: boolean;
   /** When creating an executor from Plans, keep it on the plan's project. */
   requiredWorkspaceRoot?: string | null;
 }) {
@@ -50,13 +53,17 @@ export function NewAgentModal({
   const [error, setError] = useState<string | null>(null);
   const selectedCliInstalled =
     harness === "claude" ? claudeCliInstalled === true : codexCliInstalled === true;
+  const workspaceRequired = isWorkspaceRequiredForAgentCreation({
+    mobileUi,
+    requiredWorkspaceRoot,
+  });
   const workspaceMatchesRequirement =
     !requiredWorkspaceRoot ||
     (workspace?.rootPath || "").replace(/\/+$/, "") === requiredWorkspaceRoot.replace(/\/+$/, "");
   const canCreate =
     connectorOnline &&
     !!name.trim() &&
-    !!workspace &&
+    (!workspaceRequired || !!workspace) &&
     workspaceMatchesRequirement &&
     selectedCliInstalled &&
     !busy;
@@ -68,12 +75,14 @@ export function NewAgentModal({
       setModel("");
       setReasoningEffort("");
       setWorkspace(null);
+      setPickingWorkspace(false);
       setError(null);
       setBusy(false);
     }
   }, [isOpen, claudeCliInstalled, codexCliInstalled]);
 
   const pickWorkspace = useCallback(async () => {
+    if (mobileUi) return;
     setPickingWorkspace(true);
     setError(null);
     try {
@@ -84,7 +93,7 @@ export function NewAgentModal({
     } finally {
       setPickingWorkspace(false);
     }
-  }, [onPickWorkspace]);
+  }, [mobileUi, onPickWorkspace]);
 
   const create = useCallback(async () => {
     const trimmed = name.trim();
@@ -302,30 +311,54 @@ export function NewAgentModal({
               {/* Workspace */}
               <div>
                 <label className="block text-xs font-medium text-zinc-400 mb-1.5">
-                  Workspace
-                </label>
-                <button
-                  onClick={pickWorkspace}
-                  disabled={!connectorOnline || pickingWorkspace}
-                  className="w-full flex items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-left hover:border-white/20 transition-colors disabled:opacity-50"
-                >
-                  {pickingWorkspace ? (
-                    <Loader2 className="w-4 h-4 text-zinc-500 animate-spin" />
-                  ) : (
-                    <Folder className="w-4 h-4 text-zinc-500" />
-                  )}
-                  <span className="text-sm text-zinc-300 truncate">
-                    {workspace
-                      ? workspace.rootPath
-                      : connectorOnline
-                        ? "Choose a folder on your machine…"
-                        : "Connector offline — connect to pick a folder"}
+                  Workspace{" "}
+                  <span className={workspaceRequired ? "text-cyan-300/80" : "text-zinc-600"}>
+                    ({workspaceRequired ? "required" : "optional on mobile"})
                   </span>
-                </button>
+                </label>
+                {mobileUi ? (
+                  <div className="flex items-start gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2.5">
+                    <Folder className="mt-0.5 h-4 w-4 shrink-0 text-zinc-500" />
+                    <div className="text-xs leading-relaxed text-zinc-400">
+                      {requiredWorkspaceRoot ? (
+                        <>
+                          This plan needs <span className="text-zinc-200">{requiredWorkspaceRoot}</span>.
+                          Open Groovy on your computer to choose that folder.
+                        </>
+                      ) : (
+                        <>
+                          No folder needed. This agent will start in your computer&apos;s home
+                          directory. You can attach a project later from your computer.
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={pickWorkspace}
+                    disabled={!connectorOnline || pickingWorkspace}
+                    className="w-full flex items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-left hover:border-white/20 transition-colors disabled:opacity-50"
+                  >
+                    {pickingWorkspace ? (
+                      <Loader2 className="w-4 h-4 text-zinc-500 animate-spin" />
+                    ) : (
+                      <Folder className="w-4 h-4 text-zinc-500" />
+                    )}
+                    <span className="text-sm text-zinc-300 truncate">
+                      {workspace
+                        ? workspace.rootPath
+                        : connectorOnline
+                          ? "Choose a folder on your machine…"
+                          : "Connector offline — connect to pick a folder"}
+                    </span>
+                  </button>
+                )}
                 <p className="text-[10px] text-zinc-600 mt-1">
                   {requiredWorkspaceRoot
                     ? `This plan belongs to ${requiredWorkspaceRoot}. Choose that exact folder.`
-                    : "Required — this keeps the agent scoped to the project you intend it to work on."}
+                    : mobileUi
+                      ? "The connector uses its home directory when no workspace is selected."
+                      : "Required — this keeps the agent scoped to the project you intend it to work on."}
                 </p>
                 {workspace && !workspaceMatchesRequirement && (
                   <div className="mt-2 rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">

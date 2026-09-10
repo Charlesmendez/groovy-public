@@ -26,6 +26,8 @@ export const MODEL_CATALOG: CatalogGroup[] = [
     group: "Claude",
     models: [
       { id: "claude-fable-5", label: "Fable 5", hint: "most capable" },
+      { id: "claude-opus-5", label: "Opus 5", hint: "advanced reasoning" },
+      { id: "claude-opus-4-8", label: "Opus 4.8", hint: "agentic + long context" },
       { id: "claude-opus-4-7", label: "Opus 4.7", hint: "strong planner" },
       { id: "claude-opus-4-6", label: "Opus 4.6" },
       { id: "claude-sonnet-4-6", label: "Sonnet 4.6", hint: "balanced" },
@@ -71,7 +73,7 @@ export function reasoningEffortsForModel(
   const model = String(modelId || "").toLowerCase();
   if (model.startsWith("gpt-5.6")) return ["none", "low", "medium", "high", "xhigh", "max"];
   if (model.startsWith("gpt-5.5")) return ["none", "low", "medium", "high", "xhigh"];
-  if (/^claude-(fable-5|opus-4-7)/.test(model)) {
+  if (/^claude-(fable-5|opus-(5|4-(8|7)))/.test(model)) {
     return surface === "cli"
       ? ["low", "medium", "high", "xhigh", "max"]
       : ["low", "medium", "high", "max"];

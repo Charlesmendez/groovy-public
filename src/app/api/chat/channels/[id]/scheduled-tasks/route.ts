@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import {
   canManageChannelSchedules,
+  channelScheduleManualRunDeviceCandidates,
   channelScheduleSummary,
   parseChannelScheduleAction,
   publicChannelSchedule,
   type ChannelScheduledTask,
 } from "@/lib/chat/channelSchedules";
 import { isSameOriginMutation } from "@/lib/notifications/push";
+import { callConnectorRpcViaRelay } from "@/lib/relay/connectorRpc";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
@@ -26,6 +28,8 @@ type ChannelRow = {
 
 type JobRow = {
   id: string;
+  user_id: string;
+  device_id: string | null;
   name: string | null;
   kind: string | null;
   task: unknown;
@@ -116,6 +120,7 @@ function targetAgentName(job: JobRow): string | null {
 function publicJob(
   job: JobRow,
   canManageChannel: boolean,
+  userId: string,
 ): ChannelScheduledTask {
   const lastStatus =
     job.last_status === "success" ||
@@ -124,8 +129,16 @@ function publicJob(
       ? job.last_status
       : null;
   const rawName = job.name?.replace(/\s+/g, " ").trim() || "Scheduled task";
+  const deviceId =
+    canManageChannel &&
+    job.user_id === userId &&
+    typeof job.device_id === "string" &&
+    UUID_PATTERN.test(job.device_id)
+      ? job.device_id
+      : null;
   return {
     id: job.id,
+    deviceId,
     name:
       rawName.length > 120
         ? `${rawName.slice(0, 119).trimEnd()}…`
@@ -140,6 +153,7 @@ function publicJob(
     updatedAt: job.updated_at,
     targetAgentName: targetAgentName(job),
     canManage: canManageChannel,
+    canRun: Boolean(deviceId),
   };
 }
 
@@ -151,7 +165,7 @@ export async function GET(_req: Request, { params }: Params) {
   const { data, error } = await admin
     .from("scheduled_jobs")
     .select(
-      "id,name,kind,task,schedule,enabled,skip_next_run,last_run_at,last_status,updated_at,target_agent:agents!scheduled_jobs_target_agent_id_fkey(name)",
+      "id,user_id,device_id,name,kind,task,schedule,enabled,skip_next_run,last_run_at,last_status,updated_at,target_agent:agents!scheduled_jobs_target_agent_id_fkey(name)",
     )
     .eq("channel_id", id)
     .order("enabled", { ascending: false })
@@ -168,7 +182,7 @@ export async function GET(_req: Request, { params }: Params) {
   });
   return json({
     tasks: ((data || []) as unknown as JobRow[]).map((job) =>
-      publicJob(job, canManageChannel),
+      publicJob(job, canManageChannel, visible.userId),
     ),
     migrationPending: false,
   });
@@ -252,4 +266,126 @@ export async function PATCH(req: Request, { params }: Params) {
     );
   }
   return json({ ok: true });
+}
+
+export async function POST(req: Request, { params }: Params) {
+  if (!isSameOriginMutation(req)) {
+    return json({ error: "Cross-origin request denied" }, { status: 403 });
+  }
+  const { id } = await params;
+  const visible = await visibleChannel(id);
+  if (visible instanceof NextResponse) return visible;
+  const body = (await req.json().catch(() => null)) as Record<
+    string,
+    unknown
+  > | null;
+  const jobId = typeof body?.jobId === "string" ? body.jobId.trim() : "";
+  if (!UUID_PATTERN.test(jobId)) {
+    return json(
+      { error: "A scheduled task is required" },
+      { status: 400 },
+    );
+  }
+
+  const canManage = canManageChannelSchedules({
+    workspaceRole: visible.workspaceRole,
+    channelCreatedBy: visible.channel.created_by,
+    userId: visible.userId,
+  });
+  if (!canManage) {
+    return json(
+      {
+        error:
+          "Guests can view channel schedules, but only workspace members can run them",
+      },
+      { status: 403 },
+    );
+  }
+
+  const admin = createSupabaseAdminClient();
+  const { data: job, error: jobError } = await admin
+    .from("scheduled_jobs")
+    .select("id,user_id,device_id,kind,target_agent_id")
+    .eq("id", jobId)
+    .eq("channel_id", id)
+    .maybeSingle();
+  if (jobError && isMigrationPending(jobError)) {
+    return json(
+      { error: "Channel schedules are still being activated" },
+      { status: 503 },
+    );
+  }
+  if (jobError) return json({ error: jobError.message }, { status: 500 });
+  if (!job) {
+    return json({ error: "Scheduled task not found" }, { status: 404 });
+  }
+  if (job.user_id !== visible.userId) {
+    return json(
+      { error: "Only the task owner can run it manually" },
+      { status: 403 },
+    );
+  }
+
+  const assignedDeviceId =
+    typeof job.device_id === "string" ? job.device_id.trim() : "";
+  const canMoveToAnotherDevice =
+    job.kind === "orchestrator" && !job.target_agent_id;
+  let ownedDeviceIds: string[] = [];
+  if (canMoveToAnotherDevice) {
+    const { data: devices, error: devicesError } = await admin
+      .from("devices")
+      .select("id")
+      .eq("user_id", visible.userId)
+      .order("last_seen", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (devicesError) {
+      return json({ error: devicesError.message }, { status: 500 });
+    }
+    ownedDeviceIds = (devices || []).flatMap((device) =>
+      typeof device.id === "string" && device.id.trim()
+        ? [device.id.trim()]
+        : [],
+    );
+  }
+  const candidateDeviceIds = channelScheduleManualRunDeviceCandidates({
+    assignedDeviceId,
+    ownedDeviceIds,
+    canMoveToAnotherDevice,
+  });
+  if (candidateDeviceIds.length === 0) {
+    return json({ error: "no_connector_devices" }, { status: 409 });
+  }
+
+  let lastError = "device_not_online";
+  for (const deviceId of candidateDeviceIds) {
+    try {
+      const result = await callConnectorRpcViaRelay({
+        userId: visible.userId,
+        deviceId,
+        rpcType: "schedule_trigger",
+        payload: { job_id: jobId },
+        timeoutMs: 30_000,
+      });
+      if (result.ok !== true) {
+        lastError =
+          typeof result.error === "string"
+            ? result.error
+            : "scheduled_task_start_failed";
+        if (lastError === "device_not_online" && canMoveToAnotherDevice) {
+          continue;
+        }
+        break;
+      }
+      return json({ ok: true, accepted: true, jobId, deviceId });
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      if (lastError === "device_not_online" && canMoveToAnotherDevice) {
+        continue;
+      }
+      break;
+    }
+  }
+
+  return json({ error: lastError }, { status: 409 });
 }

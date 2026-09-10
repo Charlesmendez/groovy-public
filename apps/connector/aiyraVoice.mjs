@@ -6,6 +6,18 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { createAecProcessor, normalizeAecBackend } from "./aec.mjs";
 import { createRnnoiseProcessor } from "./rnnoise.mjs";
+import {
+  createPrivateVoiceCloseEvent,
+  createPrivateVoiceInputAudioEvent,
+  isPrivateVoiceAssistantFinishedEvent,
+  isPrivateVoiceAssistantStartedEvent,
+  isPrivateVoiceAssistantTranscriptEvent,
+  isPrivateVoiceAudioDeltaEvent,
+  isPrivateVoiceProtocol,
+  isPrivateVoiceSessionClosedEvent,
+  privateVoiceAudioTimeline,
+  privateVoiceDeviceSessionPath,
+} from "./privateVoiceProtocol.mjs";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const OPENWAKEWORD_WAKE_FRAME_LENGTH = 1280;
@@ -1659,7 +1671,8 @@ function isAudioDeltaEvent(msg) {
   return (
     type === "response.audio.delta" ||
     type === "response_audio_delta" ||
-    type === "response.audio.chunk"
+    type === "response.audio.chunk" ||
+    isPrivateVoiceAudioDeltaEvent(msg)
   );
 }
 
@@ -1799,7 +1812,8 @@ function isAssistantResponseStartedEvent(msg) {
     type === "response.started" ||
     type === "response.in_progress" ||
     type === "stage_registered" ||
-    type === "first_chunk"
+    type === "first_chunk" ||
+    isPrivateVoiceAssistantStartedEvent(msg)
   );
 }
 
@@ -1809,7 +1823,8 @@ function isAssistantResponseFinishedEvent(msg) {
     type === "response.done" ||
     type === "response.completed" ||
     type === "response.failed" ||
-    type === "response.cancelled"
+    type === "response.cancelled" ||
+    isPrivateVoiceAssistantFinishedEvent(msg)
   );
 }
 
@@ -1817,7 +1832,8 @@ function isAssistantTranscriptEvent(msg) {
   const type = trimmed(msg?.type);
   return (
     type === "response.output_audio_transcript.delta" ||
-    type === "response.audio_transcript.delta"
+    type === "response.audio_transcript.delta" ||
+    isPrivateVoiceAssistantTranscriptEvent(msg)
   );
 }
 
@@ -1860,6 +1876,7 @@ export async function startAiyraVoiceRuntime(opts) {
 
   const appUrl = trimmed(opts?.appUrl);
   const deviceToken = trimmed(opts?.deviceToken);
+  const configuredProtocol = trimmed(opts?.protocol) || "aiyra";
   const wakeWord = trimmed(opts?.wakeWord) || "hey groovy";
   const wakeSensitivity = clamp(toFiniteNumber(opts?.wakeSensitivity, 0.5), 0, 1);
   const idleTimeoutMs = clamp(toFiniteNumber(opts?.idleTimeoutMs, 12000), 2000, 120000);
@@ -2070,7 +2087,11 @@ export async function startAiyraVoiceRuntime(opts) {
     typeof opts?.resolveDeviceIndex === "function"
       ? opts.resolveDeviceIndex
       : () => initialDeviceIndex;
-  const wsBootstrapPath = trimmed(opts?.deviceSessionPath) || "/api/aiyra/device-session";
+  const wsBootstrapPath =
+    trimmed(opts?.deviceSessionPath) ||
+    (isPrivateVoiceProtocol(configuredProtocol)
+      ? privateVoiceDeviceSessionPath()
+      : "/api/aiyra/device-session");
   const materialQueryProgressPath =
     trimmed(opts?.materialQueryProgressPath) ||
     trimmed(process.env.AIYRA_MATERIAL_QUERY_PROGRESS_PATH) ||
@@ -2668,6 +2689,7 @@ export async function startAiyraVoiceRuntime(opts) {
     }
     emitMetric("bootstrap_ok", { status: res.status, latency_ms: latencyMs });
     const json = await res.json().catch(() => ({}));
+    const protocol = trimmed(json?.protocol) || configuredProtocol;
     const wsUrl = trimmed(json?.wsUrl);
     const conversationId = trimmed(json?.conversationId);
     const orchestratorSessionId =
@@ -2738,6 +2760,7 @@ export async function startAiyraVoiceRuntime(opts) {
       materialQueryEnabled,
       materialQueryTimeoutMs,
       ttsSpeed,
+      protocol,
     };
   };
 
@@ -3092,6 +3115,7 @@ export async function startAiyraVoiceRuntime(opts) {
     let sessionConversationId = "";
     let sessionOrchestratorSessionId = "";
     let sessionBindingMode = "";
+    let sessionProtocol = configuredProtocol;
     let sessionServerGainBias = adaptiveVoiceCaptureGainServerBias;
     const sessionState = { running: true, source, stop: null };
     activeSession = sessionState;
@@ -3160,7 +3184,7 @@ export async function startAiyraVoiceRuntime(opts) {
         ? voiceDenoisedSpeechRmsThreshold
         : undefined,
     });
-    emitHealth("recovering", "aiyra_voice_connecting", "Wake phrase detected. Connecting to Aiyra...", {
+    emitHealth("recovering", "aiyra_voice_connecting", "Wake phrase detected. Connecting to voice...", {
       wake_word: effectiveWakeWord,
       listening: false,
       active: true,
@@ -3180,6 +3204,7 @@ export async function startAiyraVoiceRuntime(opts) {
     });
 
     let ws = null;
+    let liveSessionClosedResolve = null;
     let micRecorder = null;
     let aecProcessor = null;
     let rnnoiseProcessor = null;
@@ -3193,6 +3218,7 @@ export async function startAiyraVoiceRuntime(opts) {
     let assistantResponseHadAudio = false;
     let idleTimer = null;
     let detectedServerAudioRate = VOICE_PLAYBACK_SAMPLE_RATE;
+    let privateOutputTimelineEndMs = null;
     const seenWsEventTypes = new Set();
     let sawAudioDelta = false;
     let userSpokeInSession = false;
@@ -3461,7 +3487,7 @@ export async function startAiyraVoiceRuntime(opts) {
     };
 
     const emitActiveSessionHealth = (reason = "aiyra_voice_active", detail = "") => {
-      emitHealth("healthy", reason, detail || "Connected to Aiyra voice session.", {
+      emitHealth("healthy", reason, detail || "Connected to voice session.", {
         wake_word: effectiveWakeWord,
         listening: false,
         active: true,
@@ -4436,6 +4462,20 @@ export async function startAiyraVoiceRuntime(opts) {
         try {
           if (ws && ws.readyState === ws.OPEN) {
             if (endReason === "completed") endReason = "session_stopped";
+            if (isPrivateVoiceProtocol(sessionProtocol)) {
+              await Promise.race([
+                new Promise((resolve) => {
+                  liveSessionClosedResolve = resolve;
+                  ws.send(
+                    JSON.stringify(
+                      createPrivateVoiceCloseEvent(`connector-close-${Date.now()}`)
+                    )
+                  );
+                }),
+                wait(10_500),
+              ]);
+              liveSessionClosedResolve = null;
+            }
             ws.close();
           }
         } catch {
@@ -4553,11 +4593,13 @@ export async function startAiyraVoiceRuntime(opts) {
         materialQueryEnabled: bootstrappedMaterialQueryEnabled,
         materialQueryTimeoutMs: bootstrappedMaterialQueryTimeoutMs,
         ttsSpeed: bootstrappedTtsSpeed,
+        protocol: bootstrappedProtocol,
       } =
         await bootstrapSession({ forceNewConversation });
       sessionConversationId = conversationId;
       sessionOrchestratorSessionId = orchestratorSessionId || "";
       sessionBindingMode = bindingMode || "";
+      sessionProtocol = bootstrappedProtocol || configuredProtocol;
       const resolvedBootstrappedIdleTimeoutMs = clamp(
         toFiniteNumber(bootstrappedIdleTimeoutMs, idleTimeoutMs),
         2000,
@@ -4781,10 +4823,14 @@ export async function startAiyraVoiceRuntime(opts) {
           if (!frame || frame.length === 0) continue;
           try {
             const upsampled = upsamplePcm16(frame, 16000, 24000);
-            ws.send(JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: pcm16ToBase64(upsampled),
-            }));
+            const audio = pcm16ToBase64(upsampled);
+            ws.send(
+              JSON.stringify(
+                isPrivateVoiceProtocol(sessionProtocol)
+                  ? createPrivateVoiceInputAudioEvent(audio)
+                  : { type: "input_audio_buffer.append", audio }
+              )
+            );
             replayedFrames += 1;
             replayedBytes += frame.byteLength;
           } catch {
@@ -4815,11 +4861,16 @@ export async function startAiyraVoiceRuntime(opts) {
         if (!msg || typeof msg !== "object") return;
         const nowMs = Date.now();
         const msgType = trimmed(msg.type);
+        if (isPrivateVoiceSessionClosedEvent(msg)) {
+          if (liveSessionClosedResolve) liveSessionClosedResolve();
+          return;
+        }
         const responseEventId = readAssistantResponseId(msg);
 
         if (isAudioDeltaEvent(msg)) {
           const delta = parseAudioDelta(msg);
           const deltaBuffer = delta ? Buffer.from(delta, "base64") : null;
+          const privateTimeline = privateVoiceAudioTimeline(msg);
           const responseId = responseEventId || activeAssistantResponseId;
           if (
             responseId &&
@@ -4849,7 +4900,7 @@ export async function startAiyraVoiceRuntime(opts) {
             sessionLowMicGainDetected = false;
             emitActiveSessionHealth(
               "aiyra_voice_active",
-              "Connected to Aiyra voice session."
+              "Connected to voice session."
             );
           }
           if (!sawAudioDelta) {
@@ -4954,6 +5005,31 @@ export async function startAiyraVoiceRuntime(opts) {
           }
 
           if (playbackChunk && speaker) {
+            if (
+              privateTimeline &&
+              Number.isFinite(privateOutputTimelineEndMs) &&
+              privateTimeline.startMs > privateOutputTimelineEndMs
+            ) {
+              const gapMs = Math.min(
+                30_000,
+                privateTimeline.startMs - privateOutputTimelineEndMs
+              );
+              const silenceBytes =
+                Math.round((gapMs * VOICE_PLAYBACK_SAMPLE_RATE) / 1000) *
+                VOICE_PLAYBACK_CHANNELS *
+                VOICE_PLAYBACK_BYTES_PER_SAMPLE;
+              if (silenceBytes > 0) {
+                queuePlaybackBuffer(Buffer.alloc(silenceBytes), nowMs, {
+                  kind: "assistant",
+                });
+              }
+            }
+            if (privateTimeline) {
+              privateOutputTimelineEndMs = Math.max(
+                Number(privateOutputTimelineEndMs) || 0,
+                privateTimeline.endMs
+              );
+            }
             queuePlaybackBuffer(playbackChunk, nowMs, { kind: "assistant" });
           } else if (!playbackChunk && deltaBuffer && speaker) {
             queuePlaybackBuffer(deltaBuffer, nowMs, { kind: "assistant" });
@@ -5161,7 +5237,7 @@ export async function startAiyraVoiceRuntime(opts) {
             sessionLowMicGainDetected = false;
             emitActiveSessionHealth(
               "aiyra_voice_active",
-              "Connected to Aiyra voice session."
+              "Connected to voice session."
             );
           }
         } else if (isAssistantResponseFinishedEvent(msg)) {
@@ -5192,7 +5268,7 @@ export async function startAiyraVoiceRuntime(opts) {
             sessionLowMicGainDetected = false;
             emitActiveSessionHealth(
               "aiyra_voice_active",
-              "Connected to Aiyra voice session."
+              "Connected to voice session."
             );
           }
           if (stopAfterSyntheticSpokenResponse && callEndedAwaitingMaterialQueryTerminal) {
@@ -5240,7 +5316,7 @@ export async function startAiyraVoiceRuntime(opts) {
             sessionLowMicGainDetected = false;
             emitActiveSessionHealth(
               "aiyra_voice_active",
-              "Connected to Aiyra voice session."
+              "Connected to voice session."
             );
           }
         }
@@ -5298,7 +5374,7 @@ export async function startAiyraVoiceRuntime(opts) {
         void stopSession();
       });
 
-      emitActiveSessionHealth("aiyra_voice_active", "Connected to Aiyra voice session.");
+      emitActiveSessionHealth("aiyra_voice_active", "Connected to voice session.");
 
       const audioLoop = (async () => {
         while (!stopRequested && audioLoopRunning && ws && ws.readyState === ws.OPEN) {
@@ -5331,6 +5407,7 @@ export async function startAiyraVoiceRuntime(opts) {
           let aecOutputFrame = frame;
           let aecOutputRms = rawRms;
           let aecBypassedOnStarvation = false;
+          let aecReferenceState = null;
           if (aecProcessor) {
             try {
               const aecResult = await aecProcessor.processCaptureFrame(frame);
@@ -5343,6 +5420,7 @@ export async function startAiyraVoiceRuntime(opts) {
                 trimmed(stats.referenceState) ||
                 trimmed(aecResult.referenceState) ||
                 null;
+              aecReferenceState = referenceState;
               aecOutputRms = Number.isFinite(Number(stats.returnedOutputRms))
                 ? Number(stats.returnedOutputRms)
                 : aecOutputFrame === frame
@@ -5470,7 +5548,13 @@ export async function startAiyraVoiceRuntime(opts) {
               aecOutputRms = rawRms;
             }
           }
-          if (assistantPlaybackActive) {
+          if (sessionMicMuted) continue;
+          const privateFullDuplexReady =
+            isPrivateVoiceProtocol(sessionProtocol) &&
+            aecProcessor &&
+            aecReferenceState === "valid" &&
+            !aecBypassedOnStarvation;
+          if (assistantPlaybackActive && !privateFullDuplexReady) {
             if (
               assistantPlaybackActive &&
               nowMs - lastHalfDuplexMetricAtMs >= activityMetricThrottleMs
@@ -5773,10 +5857,10 @@ export async function startAiyraVoiceRuntime(opts) {
             continue;
           }
           const upsampled = upsamplePcm16(processedFrame, 16000, 24000);
-          const payload = {
-            type: "input_audio_buffer.append",
-            audio: pcm16ToBase64(upsampled),
-          };
+          const audio = pcm16ToBase64(upsampled);
+          const payload = isPrivateVoiceProtocol(sessionProtocol)
+            ? createPrivateVoiceInputAudioEvent(audio)
+            : { type: "input_audio_buffer.append", audio };
           try {
             ws.send(JSON.stringify(payload));
           } catch (e) {
@@ -6554,7 +6638,7 @@ export async function startAiyraVoiceRuntime(opts) {
       await wakeLoopPromise.catch(() => {});
     }
     emitMetric("runtime_stopped");
-    emitHealth("disabled", "aiyra_voice_stopped", "Aiyra voice runtime stopped.", {
+    emitHealth("disabled", "aiyra_voice_stopped", "Voice runtime stopped.", {
       wake_word: effectiveWakeWord,
       listening: false,
       active: false,
@@ -6588,8 +6672,8 @@ export async function startAiyraVoiceRuntime(opts) {
         "healthy",
         "aiyra_voice_active",
         nextMuted
-          ? "Connected to Aiyra voice session (mic muted)."
-          : "Connected to Aiyra voice session.",
+          ? "Connected to voice session (mic muted)."
+          : "Connected to voice session.",
         {
           wake_word: effectiveWakeWord,
           listening: false,
@@ -6618,3 +6702,7 @@ export async function startAiyraVoiceRuntime(opts) {
     },
   };
 }
+
+// Provider-neutral entry point. Keep the legacy export during the rollback
+// window because installed connectors and local scripts may still import it.
+export const startVoiceRuntime = startAiyraVoiceRuntime;

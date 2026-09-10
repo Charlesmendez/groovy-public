@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import { estimateTokensFromCostUsd } from "@/lib/billing/usage";
+import { getModelPricingUsdPerMillion } from "@/lib/billing/pricing";
+import { resolveProviderCostUsd } from "@/lib/billing/usageCost";
 import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
@@ -507,6 +509,7 @@ export async function GET(req: Request) {
   let externalKeyTokens = 0;
   let noChargeTokens = 0;
   let estimatedCount = 0;
+  let derivedModelCostCount = 0;
   let modelCostUsdTotal = 0;
   let groovyFeeUsdTotal = 0;
   let totalChargeUsdTotal = 0;
@@ -518,30 +521,32 @@ export async function GET(req: Request) {
   let cacheWriteTokens = 0;
   let cacheSavingsUsd = 0;
 
-  // Model pricing lookup (mirrors pricing.ts PRICING_ALIASES)
-  const CACHE_PRICING: Array<{ match: RegExp; input: number; cacheRead: number; cacheWrite: number }> = [
-    { match: /^claude-opus-4[.-][67]/i, input: 5, cacheRead: 0.5, cacheWrite: 6.25 },
-    { match: /^claude-sonnet-4[.-][56]/i, input: 3, cacheRead: 0.3, cacheWrite: 3.75 },
-    { match: /^claude-haiku-4[.-]5/i, input: 0.8, cacheRead: 0.08, cacheWrite: 1 },
-    { match: /^gpt-5\.5-pro/i, input: 30, cacheRead: 30, cacheWrite: 30 },
-    { match: /^gpt-5\.5/i, input: 5, cacheRead: 0.5, cacheWrite: 5 },
-    { match: /^gpt-5\.4/i, input: 2.5, cacheRead: 0.25, cacheWrite: 2.5 },
-  ];
-  function getCachePricing(model: string | null) {
-    const m = model?.trim() || "";
-    for (const p of CACHE_PRICING) {
-      if (p.match.test(m)) return p;
-    }
-    return CACHE_PRICING[0]; // fallback to Opus (matches billing policy)
-  }
-
   const displayUsageByEventId = new Map<string, DisplayTokenUsage>();
+  const providerCostByEventId = new Map<
+    string,
+    { costUsd: number; derived: boolean }
+  >();
   const displayUsageFor = (event: UsageRow): DisplayTokenUsage => {
     const cached = displayUsageByEventId.get(event.id);
     if (cached) return cached;
     const usage = getDisplayTokenUsage(event);
     displayUsageByEventId.set(event.id, usage);
     return usage;
+  };
+  const providerCostFor = (event: UsageRow) => {
+    const cached = providerCostByEventId.get(event.id);
+    if (cached) return cached;
+    const usage = displayUsageFor(event);
+    const providerCost = resolveProviderCostUsd({
+      model: inferredModelForEvent(event),
+      inputTokens: usage.input,
+      outputTokens: usage.output,
+      totalTokens: usage.total,
+      storedModelCostUsd: event.model_cost_usd,
+      meta: event.meta,
+    });
+    providerCostByEventId.set(event.id, providerCost);
+    return providerCost;
   };
 
   for (const e of events) {
@@ -577,7 +582,9 @@ export async function GET(req: Request) {
       }
     }
     if (e.estimated || usage.estimated) estimatedCount++;
-    const modelCostUsd = finiteNumber(e.model_cost_usd) || 0;
+    const providerCost = providerCostFor(e);
+    const modelCostUsd = providerCost.costUsd;
+    if (providerCost.derived) derivedModelCostCount++;
     const groovyFeeUsd = finiteNumber(e.groovy_fee_usd) || 0;
     const totalChargeUsd = finiteNumber(e.total_charge_usd) || 0;
     modelCostUsdTotal += modelCostUsd;
@@ -598,9 +605,15 @@ export async function GET(req: Request) {
       cacheReadTokens += readTk;
       cacheWriteTokens += writeTk;
       if (readTk > 0 || writeTk > 0) {
-        const p = getCachePricing(inferredModelForEvent(e));
+        const p = getModelPricingUsdPerMillion(inferredModelForEvent(e))?.pricing;
+        if (!p) continue;
+        const cacheReadPrice = p.cacheRead ?? p.input;
+        const cacheWritePrice = p.cacheWrite ?? p.input;
         // Savings = what it would cost at full input price minus actual cache price
-        cacheSavingsUsd += (readTk * (p.input - p.cacheRead) - writeTk * (p.cacheWrite - p.input)) / 1_000_000;
+        cacheSavingsUsd +=
+          (readTk * (p.input - cacheReadPrice) -
+            writeTk * (cacheWritePrice - p.input)) /
+          1_000_000;
       }
     }
   }
@@ -696,6 +709,9 @@ export async function GET(req: Request) {
   }
   const byModel = Array.from(byModelMap.entries())
     .map(([model, data]) => ({ model, ...data }))
+    // Calls with no token or cost telemetry are counted in the summary, but
+    // they are not model usage and should not appear as misleading zero rows.
+    .filter((entry) => entry.calls > 0 && entry.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens || (b.calls + b.unmeteredCalls) - (a.calls + a.unmeteredCalls));
 
   // Top tools
@@ -775,7 +791,7 @@ export async function GET(req: Request) {
     } else {
       row.unmeteredCalls += 1;
     }
-    row.modelCostUsd += finiteNumber(e.model_cost_usd) || 0;
+    row.modelCostUsd += providerCostFor(e).costUsd;
     row.totalChargeUsd += finiteNumber(e.total_charge_usd) || 0;
   }
 
@@ -825,6 +841,7 @@ export async function GET(req: Request) {
       unmeteredLlmCalls,
       totalToolCalls: toolEvents.length,
       estimatedCount,
+      derivedModelCostCount,
       modelCostUsdTotal: Math.round((modelCostUsdTotal + Number.EPSILON) * 1_000_000) / 1_000_000,
       groovyFeeUsdTotal: Math.round((groovyFeeUsdTotal + Number.EPSILON) * 1_000_000) / 1_000_000,
       totalChargeUsdTotal: Math.round((totalChargeUsdTotal + Number.EPSILON) * 1_000_000) / 1_000_000,

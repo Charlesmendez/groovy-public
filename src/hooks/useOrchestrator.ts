@@ -2519,7 +2519,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
                     hasBlockingConnectorCallInRound = true;
                   }
                   
-                  // browser_task_run is now handled by the connector via Playwright MCP.
+                  // browser_task_run is now handled by the connector via the selected Playwright interface.
                   // No client-side interception — it goes through the generic connector
                   // execute path below (relay → connector → claude -p + Playwright).
 
@@ -2657,7 +2657,7 @@ export function useOrchestrator(options?: UseOrchestratorOptions | string) {
                 
                 case "browser-task": {
                   // Legacy __browser_task__ event — no longer used.
-                  // Browser tasks now go through __connector_execute__ → connector → Playwright MCP.
+                  // Browser tasks now go through __connector_execute__ → connector → selected Playwright interface.
                   console.log("[useOrchestrator] browser-task event (legacy, ignored):", event.task?.slice(0, 100));
                   break;
                 }

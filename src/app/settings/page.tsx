@@ -2,6 +2,12 @@ import Link from "next/link";
 
 const sections = [
   {
+    href: "/settings/webhooks",
+    title: "Webhooks",
+    description:
+      "Give your services a simple URL to post alerts and updates into a channel. Create, copy, and test in one place.",
+  },
+  {
     href: "/settings/channels",
     title: "Channels",
     description:
@@ -18,6 +24,18 @@ const sections = [
     title: "Minds",
     description:
       "Identity, model, tools, memory, worker roster, skills, Markdown instructions, and data access.",
+  },
+  {
+    href: "/settings/providers",
+    title: "Model Providers",
+    description:
+      "Add or replace encrypted API keys for Anthropic, OpenAI, Gemini, Grok, and other model providers.",
+  },
+  {
+    href: "/settings/secrets",
+    title: "Secrets",
+    description:
+      "Declare workspace secrets, configure encrypted values on each Connector, and grant them to specific Minds, workers, and skills.",
   },
   {
     href: "/settings/skills",

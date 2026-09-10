@@ -56,14 +56,45 @@ import {
 } from "./browser.mjs";
 
 import { startWhatsAppBridge } from "./whatsapp.mjs";
-import { startAiyraVoiceRuntime } from "./aiyraVoice.mjs";
+import { startVoiceRuntime } from "./aiyraVoice.mjs";
+import {
+  isPrivateVoiceProtocol,
+  normalizePrivateVoiceProvider,
+  privateVoiceDeviceSessionPath,
+} from "./privateVoiceProtocol.mjs";
+import {
+  getScheduleSyncFingerprint,
+  shouldDeferScheduledWhatsAppJob,
+  shouldPostScheduledWhatsAppStatus,
+} from "./schedulerDelivery.mjs";
+import {
+  isWhatsAppBatteryProtectionStop,
+  shouldCountWhatsAppFailureTowardAutoRestart,
+} from "./whatsappHealthPolicy.mjs";
+import { isDetachedWhatsAppErrorMessage } from "./platform/whatsapp/errors.mjs";
 
 const DEFAULT_OPENWAKEWORD_THRESHOLD = 0.27;
 const DEFAULT_OPENWAKEWORD_ALLOW_APPROXIMATE = false;
 const AIYRA_RUNTIME_RECOVERY_BASE_DELAY_MS = 2000;
 const AIYRA_RUNTIME_RECOVERY_MAX_DELAY_MS = 30000;
-import { runBrowserTaskViaPlaywright, isPlaywrightAvailable } from "./browserTask.mjs";
-import { credentialGetMeta, credentialRequest } from "./credentials.mjs";
+import {
+  isPlaywrightAvailable,
+  resolveBrowserTaskRuntimeSettings,
+  runBrowserTaskViaPlaywright,
+} from "./browserTask.mjs";
+import { runScheduledBrowserTask } from "./scheduledBrowserTask.mjs";
+import {
+  credentialGetMeta,
+  credentialRequest,
+  workspaceSecretDelete,
+  workspaceSecretGetMeta,
+  workspaceSecretRequest,
+} from "./credentials.mjs";
+import {
+  executeSkillAction,
+  loadSkillActionsManifest,
+  normalizeSkillActionsManifest,
+} from "./skillActions.mjs";
 import {
   linkdbInit,
   linkdbUpsertLinks,
@@ -84,7 +115,14 @@ import {
   promptForPairingCode as promptForPairingCodePrompt,
 } from "./platform/prompt/index.mjs";
 import { installWindowsStartupArtifacts } from "./platform/startup/index.mjs";
-import { runHeadlessClaude } from "./platform/claude/runHeadless.mjs";
+import { buildPersistentConnectorArgs } from "./platform/startup/args.mjs";
+import {
+  classifyHeadlessRunError,
+  extractHeadlessRunError,
+  extractHeadlessSessionId,
+  runHeadlessClaude,
+  runHeadlessClaudeWithResumeRecovery,
+} from "./platform/claude/runHeadless.mjs";
 import { runHeadlessCodex, resolveCodexBin, extractCodexResult } from "./platform/codex/runHeadlessCodex.mjs";
 import {
   siteDevStart,
@@ -1985,8 +2023,8 @@ const pendingClaudeRuns = new Map(); // requestId -> { abortController, agentId,
 let browserTaskRunQueue = Promise.resolve(); // serialize browser_task_run executions
 const recentBrowserTaskSuccessBySignature = new Map(); // signature -> { tsMs, duplicateHits, result }
 const BROWSER_TASK_SUCCESS_CACHE_TTL_MS = 5 * 60 * 1000;
-const browserTaskClaudeSessionByProfile = new Map(); // sessionKey -> { sessionId, tsMs }
-const BROWSER_TASK_CLAUDE_SESSION_TTL_MS = 20 * 60 * 1000;
+const browserTaskSessionByProfile = new Map(); // sessionKey -> { sessionId, tsMs }
+const BROWSER_TASK_SESSION_TTL_MS = 20 * 60 * 1000;
 let activeRelayWs = null; // current relay websocket (changes on reconnect)
 let whatsappBridge = null; // { sendText, ... } from startWhatsAppBridge (optional)
 let whatsappBridgeOpts = null; // startup options for restarting the bridge on frame detach
@@ -2021,10 +2059,11 @@ const WHATSAPP_HEALTH_AUTO_RESTART_COOLDOWN_MS = 5 * 60 * 1000;
 // not injected). Track consecutive same-class scheduler failures separately and
 // escalate to a full process restart after this many.
 const WHATSAPP_SCHEDULER_WEDGED_RESTART_THRESHOLD = 5;
-// whatsapp.mjs can legitimately take up to 90s to mark the client ready via DOM fallback
-// on cold boots or after browser/session recovery. Give it extra headroom before we
-// classify startup as failed and trigger restart/retry logic.
-const WHATSAPP_BRIDGE_READY_TIMEOUT_MS = 2 * 60 * 1000;
+// A newly linked account may need several minutes to finish its first history
+// sync before whatsapp-web.js can expose and bind the chat store. Keep this
+// startup allowance longer than the steady-state resource sampling interval;
+// health and resource guards continue running while startup is pending.
+const WHATSAPP_BRIDGE_READY_TIMEOUT_MS = 5 * 60 * 1000;
 let requestConnectorProcessRestart = null;
 let whatsappFailureTimesMs = [];
 let whatsappAutoRestartCount = 0;
@@ -2037,6 +2076,7 @@ let lastWhatsappSchedulerWedgedAtMs = 0;
 const WHATSAPP_SCHEDULER_WEDGED_WINDOW_MS = 10 * 60 * 1000;
 let lastConnectorHealthDigest = "";
 let aiyraVoiceRuntime = null;
+let activeVoiceProvider = "aiyra";
 let whatsappHealthState = {
   status: "unknown",
   reason: null,
@@ -2090,6 +2130,7 @@ let schedulerWhatsAppRuntimeConfig = {
   groupName: "",
   appUrl: "",
 };
+let schedulerBrowserTaskRuntime = resolveBrowserTaskRuntimeSettings();
 
 function resolveWhatsAppRuntimeConfig(cfg = {}) {
   const whatsappFlag = hasFlag("--whatsapp") || hasFlag("--whatsapp-web");
@@ -2109,6 +2150,19 @@ function resolveWhatsAppRuntimeConfig(cfg = {}) {
       normalizeCliString(cfg?.whatsapp_app_url) ||
       "",
   };
+}
+
+function resolveConfiguredBrowserTaskRuntime(cfg = {}) {
+  return resolveBrowserTaskRuntimeSettings({
+    provider: cfg?.browser_task_provider,
+    model: cfg?.browser_task_model,
+    reasoning_effort: cfg?.browser_task_reasoning_effort,
+    playwright_driver: cfg?.browser_task_playwright_driver,
+  });
+}
+
+function applySchedulerBrowserTaskRuntimeConfig(cfg = {}) {
+  schedulerBrowserTaskRuntime = resolveConfiguredBrowserTaskRuntime(cfg);
 }
 
 function applySchedulerWhatsAppRuntimeConfig(nextConfig = {}) {
@@ -2277,7 +2331,14 @@ function normalizeBrowserTaskText(v) {
   return String(v || "").trim().replace(/\s+/g, " ").slice(0, 4000);
 }
 
-function buildBrowserTaskSignature({ task, startUrl, profileName }) {
+function buildBrowserTaskSignature({
+  task,
+  startUrl,
+  profileName,
+  provider,
+  model,
+  playwrightDriver,
+}) {
   const normalizedTask = normalizeBrowserTaskText(task);
   const normalizedStartUrl = String(startUrl || "").trim();
   const normalizedProfile = String(profileName || "default").trim() || "default";
@@ -2285,6 +2346,9 @@ function buildBrowserTaskSignature({ task, startUrl, profileName }) {
     task: normalizedTask,
     startUrl: normalizedStartUrl,
     profileName: normalizedProfile,
+    provider: String(provider || "").trim(),
+    model: String(model || "").trim(),
+    playwrightDriver: String(playwrightDriver || "").trim(),
   });
 }
 
@@ -2306,18 +2370,24 @@ function parseHostFromUrl(value) {
   }
 }
 
-function buildBrowserTaskSessionKey({ profileName, startUrl }) {
+function buildBrowserTaskSessionKey({
+  profileName,
+  startUrl,
+  provider,
+  model,
+  playwrightDriver,
+}) {
   const profile = String(profileName || "default").trim() || "default";
   const host = parseHostFromUrl(startUrl || "");
-  return `${profile}::${host || "*"}`;
+  return `${String(playwrightDriver || "default")}::${String(provider || "default")}::${String(model || "default")}::${profile}::${host || "*"}`;
 }
 
-function pruneBrowserTaskClaudeSessions(nowMs = Date.now()) {
-  for (const [key, cached] of browserTaskClaudeSessionByProfile.entries()) {
+function pruneBrowserTaskSessions(nowMs = Date.now()) {
+  for (const [key, cached] of browserTaskSessionByProfile.entries()) {
     const tsMs = Number(cached?.tsMs || 0);
     const sessionId = String(cached?.sessionId || "").trim();
-    if (!sessionId || !Number.isFinite(tsMs) || nowMs - tsMs > BROWSER_TASK_CLAUDE_SESSION_TTL_MS) {
-      browserTaskClaudeSessionByProfile.delete(key);
+    if (!sessionId || !Number.isFinite(tsMs) || nowMs - tsMs > BROWSER_TASK_SESSION_TTL_MS) {
+      browserTaskSessionByProfile.delete(key);
     }
   }
 }
@@ -2489,6 +2559,7 @@ let scheduleTickInterval = null;
 let scheduleSyncPending = false;
 let scheduleSyncPendingStartedAtMs = 0;
 let lastScheduleSyncAtMs = 0;
+let lastScheduleSyncFingerprint = "";
 let pendingScheduleTickForWhatsAppHealthy = false;
 let deferredConnectorRestartTimer = null;
 let deferredConnectorRestartReason = "";
@@ -2913,16 +2984,6 @@ function getDayOfWeekLocal(d) {
   }
 }
 
-function isSameLocalCalendarDate(a, b) {
-  const first = new Date(a);
-  const second = new Date(b);
-  return (
-    first.getFullYear() === second.getFullYear() &&
-    first.getMonth() === second.getMonth() &&
-    first.getDate() === second.getDate()
-  );
-}
-
 function isDueNow(job, now = new Date()) {
   if (!job || job.enabled === false) return { due: false };
   const schedule = job.schedule;
@@ -2943,7 +3004,6 @@ function isDueNow(job, now = new Date()) {
     const minute = Number(schedule.minute);
     const candidate = toLocalDateAtTime(now, hour, minute);
     if (now.getTime() < candidate.getTime()) return { due: false };
-    if (lastRun && isSameLocalCalendarDate(lastRun, candidate)) return { due: false };
     if (lastRun && lastRun.getTime() >= candidate.getTime()) return { due: false };
     return { due: true, dueAt: candidate };
   }
@@ -2959,7 +3019,6 @@ function isDueNow(job, now = new Date()) {
     candidateBase.setDate(candidateBase.getDate() - diff);
     const candidate = toLocalDateAtTime(candidateBase, hour, minute);
     if (now.getTime() < candidate.getTime()) return { due: false };
-    if (lastRun && isSameLocalCalendarDate(lastRun, candidate)) return { due: false };
     if (lastRun && lastRun.getTime() >= candidate.getTime()) return { due: false };
     return { due: true, dueAt: candidate };
   }
@@ -2987,8 +3046,8 @@ function sendToRelay(msg) {
   }
 }
 
-const relayResultBacklog = new Map(); // requestId -> { msg, queuedAtMs }
-const RELAY_RESULT_BACKLOG_TTL_MS = 20 * 60 * 1000;
+const relayResultBacklog = new Map(); // requestId -> { msg, queuedAtMs, awaitAck }
+const RELAY_RESULT_BACKLOG_TTL_MS = 24 * 60 * 60 * 1000;
 const RELAY_RESULT_BACKLOG_MAX = 100;
 
 function pruneRelayResultBacklog(nowMs = Date.now()) {
@@ -3008,41 +3067,46 @@ function queueRelayResult(msg) {
   const requestId = String(msg?.request_id || "").trim();
   if (!requestId) return;
   pruneRelayResultBacklog();
-  relayResultBacklog.set(requestId, { msg, queuedAtMs: Date.now() });
+  relayResultBacklog.set(requestId, {
+    msg,
+    queuedAtMs: Date.now(),
+    awaitAck:
+      msg?.type === "claude_run_result" &&
+      msg?.relay_ack_required === true,
+  });
 }
 
 function flushRelayResultBacklog() {
   pruneRelayResultBacklog();
   for (const [requestId, entry] of Array.from(relayResultBacklog.entries())) {
-    if (sendToRelay(entry.msg)) {
+    if (sendToRelay(entry.msg) && entry.awaitAck !== true) {
       relayResultBacklog.delete(requestId);
     }
   }
 }
 
 function sendRelayResult(msg) {
+  const awaitAck =
+    msg?.type === "claude_run_result" &&
+    msg?.relay_ack_required === true;
+  if (awaitAck) {
+    // Queue first so a synchronous close/error cannot create a gap between
+    // sending the terminal result and retaining it for reconnect replay.
+    queueRelayResult(msg);
+    return sendToRelay(msg);
+  }
   if (sendToRelay(msg)) return true;
   queueRelayResult(msg);
   return false;
 }
 
-function isDetachedWhatsAppErrorMessage(message) {
-  const raw = typeof message === "string" ? message : String(message || "");
-  const lower = raw.trim().toLowerCase();
-  if (!lower) return false;
-  return (
-    lower.includes("bridge_needs_restart") ||
-    lower.includes("detached frame") ||
-    lower.includes("execution context was destroyed") ||
-    lower.includes("target closed") ||
-    lower.includes("session closed") ||
-    lower.includes("browser has disconnected") ||
-    lower.includes("protocol error") ||
-    (lower.includes("cannot read properties of undefined") &&
-      (lower.includes("'getchat'") || lower.includes("'getchats'") ||
-       lower.includes("'sendmessage'") || lower.includes("'findchat'") ||
-       lower.includes("'getcontact'") || lower.includes("'modelclass'")))
-  );
+function acknowledgeRelayResult(requestId) {
+  const normalizedRequestId = String(requestId || "").trim();
+  if (!normalizedRequestId) return false;
+  const entry = relayResultBacklog.get(normalizedRequestId);
+  if (!entry || entry.awaitAck !== true) return false;
+  relayResultBacklog.delete(normalizedRequestId);
+  return true;
 }
 
 function isRetryableWhatsAppStartupErrorMessage(message) {
@@ -3160,6 +3224,11 @@ function connectorHealthForDigest(health) {
     delete copy.aiyra_voice.last_healthy_at;
     delete copy.aiyra_voice.last_failure_at;
   }
+  if (copy.voice && typeof copy.voice === "object") {
+    delete copy.voice.updated_at;
+    delete copy.voice.last_healthy_at;
+    delete copy.voice.last_failure_at;
+  }
 
   return copy;
 }
@@ -3170,6 +3239,7 @@ function sendConnectorHealthUpdate(force = false) {
     health: {
       whatsapp: { ...whatsappHealthState },
       aiyra_voice: { ...aiyraVoiceHealthState },
+      voice: { ...aiyraVoiceHealthState, provider: activeVoiceProvider },
     },
   };
   const digest = JSON.stringify(connectorHealthForDigest(payload.health));
@@ -3435,7 +3505,13 @@ function noteWhatsAppDegraded(source, reason, detail = "") {
   const nowMs = Date.now();
   const sourceKey = typeof source === "string" && source.trim() ? source.trim() : "degraded";
   const schedulerScoped = isSchedulerScopedWhatsAppHealthSource(sourceKey);
-  const countTowardsAutoRestart = !schedulerScoped;
+  const errorReason = typeof reason === "string" && reason.trim() ? reason.trim() : "whatsapp_unhealthy";
+  const batteryProtectionStop = isWhatsAppBatteryProtectionStop(sourceKey, errorReason);
+  const countTowardsAutoRestart = shouldCountWhatsAppFailureTowardAutoRestart({
+    schedulerScoped,
+    source: sourceKey,
+    reason: errorReason,
+  });
   if (countTowardsAutoRestart) {
     whatsappFailureTimesMs.push(nowMs);
   }
@@ -3443,8 +3519,8 @@ function noteWhatsAppDegraded(source, reason, detail = "") {
   const recentFailures = countTowardsAutoRestart ? failures.length : 0;
   const previousConsecutive = Number(whatsappHealthState.consecutive_failures || 0);
   const nextConsecutive = Math.max(1, previousConsecutive + 1);
-  const errorReason = typeof reason === "string" && reason.trim() ? reason.trim() : "whatsapp_unhealthy";
-  const restartableFailure = isAutoRestartableWhatsAppFailure(errorReason, detail);
+  const restartableFailure =
+    !batteryProtectionStop && isAutoRestartableWhatsAppFailure(errorReason, detail);
   const canAutoRestart =
     countTowardsAutoRestart &&
     restartableFailure &&
@@ -3927,8 +4003,14 @@ function parseMarkdownFrontmatter(text) {
     if (!match) continue;
     const key = match[1].trim();
     let value = match[2].trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
+    if (value.startsWith('"') && value.endsWith('"')) {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = value.slice(1, -1);
+      }
+    } else if (value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1).replace(/''/g, "'");
     }
     if (value.startsWith("[") && value.endsWith("]")) {
       data[key] = value
@@ -4027,6 +4109,14 @@ async function scanSkillsRepo(localPath, commitSha) {
           // ignore unreadable support files
         }
       }
+      let groovyActions = null;
+      try {
+        groovyActions = await loadSkillActionsManifest(skillDir);
+      } catch {
+        if (fs.existsSync(path.join(skillDir, "groovy-actions.json"))) {
+          riskFlags.add("invalid_actions_manifest");
+        }
+      }
       artifacts.push({
         artifactType: "skill",
         slug,
@@ -4045,6 +4135,7 @@ async function scanSkillsRepo(localPath, commitSha) {
           fileCount: skillFiles.length,
           storesBody: true,
           bodyStorage: "bounded_server_snapshot",
+          ...(groovyActions ? { groovyActions } : {}),
         },
         riskFlags: Array.from(riskFlags),
       });
@@ -4231,6 +4322,16 @@ async function skillsRepoPush(params) {
 async function skillsArtifactCreate(params) {
   const ensured = await ensureSkillsRepoLocal(params);
   if (!ensured.ok) return ensured;
+  const expectedCommitSha = String(params.expected_commit_sha || params.expectedCommitSha || "").trim();
+  if (expectedCommitSha && ensured.commitSha && expectedCommitSha !== ensured.commitSha) {
+    return {
+      ok: false,
+      error: "artifact_changed_on_remote",
+      localPath: ensured.localPath,
+      expectedCommitSha,
+      currentCommitSha: ensured.commitSha,
+    };
+  }
   const artifactType = String(params.artifact_type || params.artifactType || "").trim();
   if (artifactType !== "skill" && artifactType !== "instruction_doc") {
     return { ok: false, error: "invalid_artifact_type" };
@@ -4240,34 +4341,94 @@ async function skillsArtifactCreate(params) {
   if (artifactType === "skill" && path.basename(relativePath) !== "SKILL.md") {
     return { ok: false, error: "skill_artifacts_must_use_SKILL_md" };
   }
+  const rawCompanionFiles = Array.isArray(params.companion_files)
+    ? params.companion_files
+    : Array.isArray(params.companionFiles)
+      ? params.companionFiles
+      : [];
+  if (rawCompanionFiles.length > 1) {
+    return { ok: false, error: "too_many_companion_files" };
+  }
+  const companionFiles = [];
+  for (const rawCompanion of rawCompanionFiles) {
+    if (artifactType !== "skill" || !rawCompanion || typeof rawCompanion !== "object") {
+      return { ok: false, error: "invalid_companion_file" };
+    }
+    const companionPath = safeRelativePath(
+      rawCompanion.relative_path || rawCompanion.relativePath || "",
+    );
+    if (
+      path.dirname(companionPath) !== path.dirname(relativePath) ||
+      path.basename(companionPath) !== "groovy-actions.json"
+    ) {
+      return { ok: false, error: "invalid_skill_companion_path" };
+    }
+    let content;
+    try {
+      content = `${JSON.stringify(
+        normalizeSkillActionsManifest(JSON.parse(String(rawCompanion.content || ""))),
+        null,
+        2,
+      )}\n`;
+    } catch (error) {
+      return {
+        ok: false,
+        error: "invalid_actions_manifest",
+        diagnostics: {
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+    companionFiles.push({ relativePath: companionPath, content });
+  }
   const fullPath = safeJoinUnder(ensured.localPath, relativePath);
-  await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+  const preservePrimary = params.preserve_primary === true || params.preservePrimary === true;
+  if (preservePrimary && !fs.existsSync(fullPath)) {
+    return { ok: false, error: "primary_skill_missing" };
+  }
+  const filesToWrite = [
+    ...(preservePrimary
+      ? []
+      : [{ relativePath, fullPath, content: String(params.content || "") }]),
+    ...companionFiles.map((file) => ({
+      ...file,
+      fullPath: safeJoinUnder(ensured.localPath, file.relativePath),
+    })),
+  ];
   const overwrite =
     params.overwrite === true ||
     params.overwrite === "true" ||
     params.mode === "upsert" ||
     params.mode === "overwrite";
-  if (fs.existsSync(fullPath) && !overwrite) {
-    const collision = {
-      localPath: ensured.localPath,
-      relativePath,
-      fullPath,
-      artifactType,
-      overwrite,
-      ref: ensured.ref,
-    };
-    warn("skills_artifact_create collision", collision);
-    return {
-      ok: false,
-      error: "artifact_already_exists",
-      localPath: ensured.localPath,
-      relativePath,
-      artifactType,
-      diagnostics: collision,
-    };
+  for (const file of filesToWrite) {
+    if (!fs.existsSync(file.fullPath) || overwrite) continue;
+    const existingContent = await fsp.readFile(file.fullPath, "utf8").catch(() => null);
+    if (existingContent !== file.content) {
+      const collision = {
+        localPath: ensured.localPath,
+        relativePath: file.relativePath,
+        fullPath: file.fullPath,
+        artifactType,
+        overwrite,
+        ref: ensured.ref,
+      };
+      warn("skills_artifact_create collision", collision);
+      return {
+        ok: false,
+        error: "artifact_already_exists",
+        localPath: ensured.localPath,
+        relativePath,
+        artifactType,
+        diagnostics: collision,
+      };
+    }
   }
-  await fsp.writeFile(fullPath, String(params.content || ""), "utf8");
-  const status = await runGit(["status", "--short", "--", relativePath], {
+  await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+  for (const file of filesToWrite) {
+    await fsp.writeFile(file.fullPath, file.content, "utf8");
+  }
+  const writtenPaths = filesToWrite.map((file) => file.relativePath);
+  const status = await runGit(["status", "--short", "--", ...writtenPaths], {
     cwd: ensured.localPath,
     timeoutMs: 30_000,
   });
@@ -4276,21 +4437,42 @@ async function skillsArtifactCreate(params) {
   }
   const gitStatus = status.stdout || "";
   if (!gitStatus.trim()) {
-    const artifacts = await scanSkillsRepo(ensured.localPath, ensured.commitSha);
+    // This may be an idempotent retry after a previous commit succeeded but
+    // its push failed. Always retry the bounded branch push before reporting
+    // success so Git remains the source of truth.
+    const push = await runGit(["push", "-u", "origin", ensured.ref || "main"], {
+      cwd: ensured.localPath,
+      timeoutMs: 2 * 60 * 1000,
+    });
+    if (!push.ok) {
+      return {
+        ...push,
+        ok: false,
+        localPath: ensured.localPath,
+        relativePath,
+        error: push.error || "git_push_failed",
+      };
+    }
+    const rev = await runGit(["rev-parse", "HEAD"], {
+      cwd: ensured.localPath,
+      timeoutMs: 30_000,
+    });
+    const commitSha = rev.ok ? String(rev.stdout || "").trim() : ensured.commitSha;
+    const artifacts = await scanSkillsRepo(ensured.localPath, commitSha);
     return {
       ok: true,
       localPath: ensured.localPath,
-      commitSha: ensured.commitSha,
+      commitSha,
       relativePath,
       exactFilename: path.basename(relativePath),
       gitStatus,
       unchanged: true,
-      pushed: false,
+      pushed: true,
       artifacts: artifacts.filter((artifact) => artifact.relativePath === relativePath),
     };
   }
 
-  const add = await runGit(["add", "--", relativePath], {
+  const add = await runGit(["add", "--", ...writtenPaths], {
     cwd: ensured.localPath,
     timeoutMs: 30_000,
   });
@@ -4335,6 +4517,7 @@ async function skillsArtifactCreate(params) {
     localPath: ensured.localPath,
     commitSha,
     relativePath,
+    companionFiles: companionFiles.map((file) => file.relativePath),
     exactFilename: path.basename(relativePath),
     gitStatus,
     pushed: true,
@@ -4479,6 +4662,8 @@ async function executeSkillsConnectorRpc(type, params) {
   if (type === "skills_repo_sync" || type === "skills_catalog_scan") return await skillsRepoSync(params);
   if (type === "skills_repo_push") return await skillsRepoPush(params);
   if (type === "skills_artifact_create") return await skillsArtifactCreate(params);
+  if (type === "skills_artifact_bundle_create") return await skillsArtifactCreate(params);
+  if (type === "skills_artifact_companion_upsert") return await skillsArtifactCreate(params);
   if (type === "skills_artifact_materialize") return await skillsArtifactMaterialize(params);
   if (type === "skills_assigned_context_read") return await skillsAssignedContextRead(params);
   return { ok: false, error: `unsupported_skills_rpc:${type}` };
@@ -5065,50 +5250,59 @@ async function runScheduledJobImpl(job, jobId) {
         }
 
         const executeBatchRows = async (rows) => {
-          const toolResults = [];
-          for (let i = 0; i < rows.length; i++) {
-            const row = rows[i] && typeof rows[i] === "object" ? rows[i] : {};
-            const branchId = String(row.branchId || "").trim();
-            const toolCallId = String(row.toolCallId || "").trim();
-            const toolName = String(row.toolName || "").trim();
-            const nestedType = String(row.connectorType || "").trim();
-            const nestedParams =
-              row.connectorParams && typeof row.connectorParams === "object"
-                ? row.connectorParams
-                : {};
+          const results = new Array(rows.length);
+          let nextIndex = 0;
+          const workerCount = Math.min(4, Math.max(1, rows.length));
+          await Promise.all(Array.from({ length: workerCount }, async () => {
+            while (nextIndex < rows.length) {
+              const i = nextIndex++;
+              const row = rows[i] && typeof rows[i] === "object" ? rows[i] : {};
+              const branchId = String(row.branchId || "").trim();
+              const toolCallId = String(row.toolCallId || "").trim();
+              const toolName = String(row.toolName || "").trim();
+              const nestedType = String(row.connectorType || "").trim();
+              const nestedParams =
+                row.connectorParams && typeof row.connectorParams === "object"
+                  ? row.connectorParams
+                  : {};
 
-            if (!branchId || !toolCallId || !toolName || !nestedType) {
-              toolResults.push({
+              if (!branchId || !toolCallId || !toolName || !nestedType) {
+                results[i] = {
+                  branchId,
+                  toolCallId: toolCallId || `parallel-branch-missing-${Date.now()}-${i}`,
+                  toolName: toolName || "unknown_connector_tool",
+                  result: JSON.stringify({ ok: false, error: "invalid_parallel_branch_execute" }),
+                };
+                continue;
+              }
+
+              let nestedResult;
+              try {
+                nestedResult = await executeConnectorType(nestedType, nestedParams);
+              } catch (err) {
+                nestedResult = {
+                  ok: false,
+                  error: err instanceof Error ? err.message : String(err || "connector_execute_failed"),
+                };
+              }
+              results[i] = {
                 branchId,
-                toolCallId: toolCallId || `parallel-branch-missing-${Date.now()}-${i}`,
-                toolName: toolName || "unknown_connector_tool",
-                result: JSON.stringify({ ok: false, error: "invalid_parallel_branch_execute" }),
-              });
-              continue;
-            }
-
-            let nestedResult;
-            try {
-              nestedResult = await executeConnectorType(nestedType, nestedParams);
-            } catch (err) {
-              nestedResult = {
-                ok: false,
-                error: err instanceof Error ? err.message : String(err || "connector_execute_failed"),
+                toolCallId,
+                toolName,
+                result: compactParallelToolResult(toolName, nestedResult),
               };
             }
-            toolResults.push({
-              branchId,
-              toolCallId,
-              toolName,
-              result: compactParallelToolResult(toolName, nestedResult),
-            });
-          }
-          return toolResults;
+          }));
+          return results;
         };
 
         let state = p.state && typeof p.state === "object" ? p.state : null;
         let rows = Array.isArray(p.connectorExecutes) ? p.connectorExecutes : [];
-        const MAX_BRANCH_BATCH_ROUNDS = 20;
+        const configuredBatchRounds = Number(state?.branchController?.maxTurnsPerBranch);
+        const MAX_BRANCH_BATCH_ROUNDS =
+          Number.isFinite(configuredBatchRounds) && configuredBatchRounds > 0
+            ? Math.max(1, Math.min(64, Math.floor(configuredBatchRounds)))
+            : 20;
         if (rows.length === 0) {
           return { ok: false, error: "missing_parallel_branch_executes" };
         }
@@ -5151,48 +5345,14 @@ async function runScheduledJobImpl(job, jobId) {
         return { ok: false, error: "parallel_branch_batch_round_limit" };
       }
 
-      // ===== Browser Tasks (Playwright MCP only) =====
+      // ===== Browser Tasks (Playwright CLI with MCP fallback) =====
       // NOTE: scheduled jobs execute connector tools directly (not via relay WS),
       // so we must support browser tooling here too.
       if (t === "browser_task_run") {
-        const task = String(p.task || "").trim();
-        const startUrl =
-          typeof p.start_url === "string"
-            ? p.start_url
-            : typeof p.startUrl === "string"
-              ? p.startUrl
-              : undefined;
-        const profileName = typeof p.profile_name === "string" ? p.profile_name : "default";
-        const apiKey = typeof p.api_key === "string" ? p.api_key.trim() : "";
-        const cliToken = typeof p.cli_token === "string" ? p.cli_token.trim() : "";
-        const requestedTimeoutMs = Number(p.timeout_ms);
-        const envBrowserTimeoutMs = Number(
-          process.env.GROOVY_BROWSER_TASK_TIMEOUT_MS || process.env.GROOVY_PLAYWRIGHT_TIMEOUT_MS || ""
-        );
-        const timeoutMs =
-          Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
-            ? requestedTimeoutMs
-            : Number.isFinite(envBrowserTimeoutMs) && envBrowserTimeoutMs > 0
-              ? envBrowserTimeoutMs
-              : 12 * 60 * 1000;
-
-        const usePlaywright = await isPlaywrightAvailable();
-        if (!usePlaywright) {
-          return {
-            ok: false,
-            error: "playwright_mcp_unavailable",
-            message:
-              "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
-          };
-        }
-
-        return await runBrowserTaskViaPlaywright({
-          task,
-          start_url: startUrl,
-          api_key: apiKey,
-          cli_token: cliToken,
-          timeout_ms: timeoutMs,
-          profile_name: profileName,
+        return await runScheduledBrowserTask(p, {
+          browserTaskRuntime: schedulerBrowserTaskRuntime,
+          isPlaywrightAvailable,
+          runBrowserTaskViaPlaywright,
         });
       }
 
@@ -5206,6 +5366,18 @@ async function runScheduledJobImpl(job, jobId) {
         const domain = String(p.domain || "").trim();
         const reason = typeof p.reason === "string" ? p.reason : undefined;
         return await credentialRequest({ domain, reason });
+      }
+
+      if (t === "workspace_secret_get") return await workspaceSecretGetMeta({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key });
+      if (t === "workspace_secret_request") return await workspaceSecretRequest({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key, name: p.name, reason: p.reason });
+      if (t === "workspace_secret_delete") return await workspaceSecretDelete({ workspaceId: p.workspace_id, secretId: p.secret_id, key: p.key });
+      if (t === "skill_action_execute") {
+        const ensured = await ensureSkillsRepoLocal({ repo_url: p.repo_url, ref: p.ref });
+        if (!ensured.ok) return ensured;
+        const relativePath = String(p.relative_path || "").replace(/\\/g, "/");
+        if (!relativePath || relativePath.split("/").includes("..") || path.basename(relativePath) !== "SKILL.md") return { ok: false, error: "invalid_skill_path" };
+        const skillDir = path.dirname(path.join(ensured.localPath, relativePath));
+        return await executeSkillAction({ skillDir, actionName: String(p.action || ""), args: p.args || {}, workspaceId: p.workspace_id, secretBindings: p.secret_bindings });
       }
 
       // ===== Browser Automation Operations (legacy low-level) =====
@@ -6726,21 +6898,24 @@ async function runScheduledJobImpl(job, jobId) {
     }
   }
 
-  // If WhatsApp bridge is running, post a short scheduled-job status back to the Groovy group.
-  // Keep this to ONE LINE (visibility without spamming the group).
+  // Only an explicitly WhatsApp-bound schedule may post delivery telemetry to
+  // WhatsApp. Ordinary Team Chat schedules report in their originating
+  // channel and must never leak scheduler status into the Groovy group.
   try {
-    const shouldPost =
-      process.env.GROOVY_WHATSAPP_SCHEDULE_POST !== "0" &&
-      process.env.WHATSAPP_SCHEDULE_POST !== "0";
-    // Skip status alerts for heartbeat jobs (they have their own delivery logic).
     const taskObj = job?.task;
     const isHeartbeat = taskObj && typeof taskObj === "object" && taskObj.type === "heartbeat_v1";
     if (
-      shouldPost &&
-      kind === "orchestrator" &&
-      whatsappBridge?.sendText &&
-      !isHeartbeat &&
-      !didSendWhatsApp
+      shouldPostScheduledWhatsAppStatus({
+        statusPostingEnabled:
+          process.env.GROOVY_WHATSAPP_SCHEDULE_POST !== "0" &&
+          process.env.WHATSAPP_SCHEDULE_POST !== "0",
+        kind,
+        hasWhatsAppSender: typeof whatsappBridge?.sendText === "function",
+        isHeartbeat,
+        didSendWhatsApp,
+        explicitlyRequiresWhatsAppDelivery:
+          explicitScheduledWhatsAppRequirement,
+      })
     ) {
       const jobName = String(job?.name || "Scheduled task");
       const headline = status === "success" ? "✅" : status === "skipped" ? "⏭️" : "❌";
@@ -6846,16 +7021,16 @@ async function tickSchedules() {
     if (retryState) {
       const waitForWhatsAppHealthy =
         retryState && typeof retryState === "object" && retryState.waitForWhatsAppHealthy === true;
-      const whatsappUnavailableWhileWaitingForHealthy =
-        waitForWhatsAppHealthy &&
-        (!schedulerWhatsAppRuntimeConfig.enabled ||
-          !schedulerWhatsAppRuntimeConfig.groupName ||
-          !schedulerWhatsAppRuntimeConfig.appUrl);
-      if (
-        waitForWhatsAppHealthy &&
-        !whatsappUnavailableWhileWaitingForHealthy &&
-        !isWhatsAppBridgeReadyForScheduledDelivery()
-      ) {
+      const runtimeConfigured = Boolean(
+        schedulerWhatsAppRuntimeConfig.enabled &&
+          schedulerWhatsAppRuntimeConfig.groupName &&
+          schedulerWhatsAppRuntimeConfig.appUrl
+      );
+      if (shouldDeferScheduledWhatsAppJob({
+        requiresWhatsApp: waitForWhatsAppHealthy,
+        runtimeConfigured,
+        bridgeReady: isWhatsAppBridgeReadyForScheduledDelivery(),
+      })) {
         continue;
       }
       const nowMs = now.getTime();
@@ -6878,13 +7053,16 @@ async function tickSchedules() {
     const dueInfo = isDueNow(job, now);
     if (!dueInfo?.due) continue;
 
-    if (
-      scheduledJobWantsWhatsAppDelivery(job) &&
+    const runtimeConfigured = Boolean(
       schedulerWhatsAppRuntimeConfig.enabled &&
-      schedulerWhatsAppRuntimeConfig.groupName &&
-      schedulerWhatsAppRuntimeConfig.appUrl &&
-      !isWhatsAppBridgeReadyForScheduledDelivery()
-    ) {
+        schedulerWhatsAppRuntimeConfig.groupName &&
+        schedulerWhatsAppRuntimeConfig.appUrl
+    );
+    if (shouldDeferScheduledWhatsAppJob({
+      requiresWhatsApp: scheduledJobWantsWhatsAppDelivery(job),
+      runtimeConfigured,
+      bridgeReady: isWhatsAppBridgeReadyForScheduledDelivery(),
+    })) {
       scheduleRetryState.set(jobId, {
         attempt: 0,
         nextAttemptAtMs: now.getTime(),
@@ -7519,6 +7697,12 @@ function getLaunchAgentPlist(relayUrl) {
   const whatsappEnabled = extraArgs.whatsappEnabled === true;
   const whatsappGroupName = normalizeCliString(extraArgs.whatsappGroupName || "");
   const whatsappAppUrl = normalizeCliString(extraArgs.whatsappAppUrl || "");
+  const appUrl = normalizeCliString(extraArgs.appUrl || whatsappAppUrl);
+  const persistentArgs = buildPersistentConnectorArgs({
+    appUrl,
+    whatsappEnabled,
+    whatsappGroupName,
+  });
 
   const programArgs = [
     nodeExe,
@@ -7526,9 +7710,7 @@ function getLaunchAgentPlist(relayUrl) {
     "--kill-others",
     "--relay",
     relayUrl,
-    ...(whatsappEnabled ? ["--whatsapp"] : []),
-    ...(whatsappEnabled && whatsappGroupName ? ["--whatsapp-group", whatsappGroupName] : []),
-    ...(whatsappEnabled && whatsappAppUrl ? ["--app-url", whatsappAppUrl] : []),
+    ...persistentArgs,
   ];
 
   const programArgsXml = programArgs
@@ -7709,7 +7891,22 @@ function buildRestartArgs() {
       i += 1; // skip value token
       continue;
     }
-    if (arg === "--aiyra-voice") continue;
+    if (arg === "--aiyra-voice" || arg === "--voice") continue;
+    if (
+      arg.startsWith("--voice-provider=") ||
+      arg.startsWith("--voice-app-url=") ||
+      arg.startsWith("--voice-wake-word=")
+    ) {
+      continue;
+    }
+    if (
+      arg === "--voice-provider" ||
+      arg === "--voice-app-url" ||
+      arg === "--voice-wake-word"
+    ) {
+      i += 1;
+      continue;
+    }
     if (
       arg.startsWith("--aiyra-wake-word=") ||
       arg.startsWith("--aiyra-app-url=") ||
@@ -7763,6 +7960,7 @@ async function main() {
   }
 
   let cfg = await readConfig();
+  applySchedulerBrowserTaskRuntimeConfig(cfg);
 
   const relayUrl =
     argValue("--relay") ||
@@ -7820,8 +8018,15 @@ async function main() {
     appUrl: whatsappAppUrl,
   });
 
-  const aiyraVoiceFlag = hasFlag("--aiyra-voice");
+  const aiyraVoiceFlag = hasFlag("--aiyra-voice") || hasFlag("--voice");
   const resolveAiyraRuntimeConfig = () => {
+    const requestedVoiceProvider = (
+      normalizeCliString(argValue("--voice-provider")) ||
+      normalizeCliString(process.env.GROOVY_VOICE_PROVIDER) ||
+      normalizeCliString(cfg.voice_provider) ||
+      "aiyra"
+    ).toLowerCase();
+    const voiceProvider = normalizePrivateVoiceProvider(requestedVoiceProvider) || "aiyra";
     const wakeSensitivity = normalizeClampedNumber(
       argValue("--aiyra-wake-sensitivity") ||
         process.env.AIYRA_WAKE_SENSITIVITY ||
@@ -7884,16 +8089,25 @@ async function main() {
         : normalizeAiyraMicName(cfg.aiyra_mic_name);
 
     return {
+      provider: voiceProvider,
       enabled:
-        cfg.aiyra_voice_enabled === true ||
-        (aiyraVoiceFlag && cfg.aiyra_voice_enabled !== false),
+        typeof cfg.voice_enabled === "boolean"
+          ? cfg.voice_enabled
+          : cfg.aiyra_voice_enabled === true ||
+            (aiyraVoiceFlag && cfg.aiyra_voice_enabled !== false),
       appUrl:
+        normalizeCliString(argValue("--voice-app-url")) ||
+        normalizeCliString(process.env.GROOVY_VOICE_APP_URL) ||
+        normalizeCliString(cfg.voice_app_url) ||
         normalizeCliString(argValue("--aiyra-app-url")) ||
         normalizeCliString(process.env.AIYRA_APP_URL) ||
         normalizeCliString(cfg.aiyra_app_url) ||
         whatsappAppUrl ||
         "",
       wakeWord:
+        normalizeCliString(argValue("--voice-wake-word")) ||
+        normalizeCliString(process.env.GROOVY_VOICE_WAKE_WORD) ||
+        normalizeCliString(cfg.voice_wake_word) ||
         normalizeCliString(argValue("--aiyra-wake-word")) ||
         normalizeCliString(process.env.AIYRA_WAKE_WORD) ||
         normalizeCliString(cfg.aiyra_wake_word) ||
@@ -7967,6 +8181,7 @@ async function main() {
     };
   };
   let {
+    provider: aiyraVoiceProvider,
     enabled: aiyraVoiceEnabled,
     appUrl: aiyraAppUrl,
     wakeWord: aiyraWakeWord,
@@ -7990,14 +8205,18 @@ async function main() {
     resolvedDeviceName: aiyraResolvedDeviceName,
     micSelectionFallbackReason: aiyraMicSelectionFallbackReason,
   } = resolveAiyraRuntimeConfig();
+  activeVoiceProvider = aiyraVoiceProvider;
   const connectorAppUrl =
     normalizeAppBaseUrl(argValue("--app-url")) ||
     normalizeAppBaseUrl(process.env.GROOVY_APP_URL) ||
     normalizeAppBaseUrl(whatsappAppUrl) ||
     normalizeAppBaseUrl(aiyraAppUrl) ||
     normalizeAppBaseUrl(cfg.whatsapp_app_url) ||
+    normalizeAppBaseUrl(cfg.voice_app_url) ||
     normalizeAppBaseUrl(cfg.aiyra_app_url);
   const applyResolvedAiyraRuntimeConfig = (nextAiyraConfig) => {
+    aiyraVoiceProvider = nextAiyraConfig.provider;
+    activeVoiceProvider = aiyraVoiceProvider;
     aiyraVoiceEnabled = nextAiyraConfig.enabled;
     aiyraAppUrl = nextAiyraConfig.appUrl;
     aiyraWakeWord = nextAiyraConfig.wakeWord;
@@ -8890,7 +9109,12 @@ async function main() {
             : {}),
         };
       };
-      const runtime = await startAiyraVoiceRuntime({
+      const runtime = await startVoiceRuntime({
+        protocol: aiyraVoiceProvider,
+        deviceSessionPath:
+          isPrivateVoiceProtocol(aiyraVoiceProvider)
+            ? privateVoiceDeviceSessionPath()
+            : "/api/aiyra/device-session",
         appUrl: aiyraAppUrl,
         deviceToken,
         wakeWord: aiyraWakeWord,
@@ -8971,6 +9195,7 @@ async function main() {
       aiyraVoiceRuntime = runtime;
       aiyraActiveRuntimeDeviceName = aiyraResolvedDeviceName || "";
       log("Aiyra voice runtime object created", {
+        provider: aiyraVoiceProvider,
         wakeWord: aiyraWakeWord,
         wakeEngine: aiyraWakeEngine,
         resolvedDeviceName: aiyraResolvedDeviceName || null,
@@ -9166,7 +9391,6 @@ async function main() {
           },
         })
       );
-      flushRelayResultBacklog();
 
       // App-level ping watchdog: more reliable than WS ping/pong in some environments.
       pingOutstanding = false;
@@ -9226,6 +9450,31 @@ async function main() {
       }
       lastAnyMessageAt = Date.now();
       const messageType = String(msg?.type || "");
+
+      if (messageType === "relay_result_ack") {
+        const requestId = String(msg?.request_id || "").trim();
+        if (acknowledgeRelayResult(requestId)) {
+          log("relay acknowledged retained claude result", { requestId });
+        }
+        return;
+      }
+
+      if (messageType === "claude_run" && msg?.require_start_ack === true) {
+        const requestId = String(msg?.request_id || "").trim();
+        if (requestId && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "claude_run_start_ack",
+                request_id: requestId,
+              })
+            );
+          } catch {
+            // The relay will withhold acceptance and cancel on ACK timeout.
+          }
+        }
+      }
+
       const shouldAcquireGlobalPrioritySlot = shouldAcquireGlobalConnectorPrioritySlot(messageType);
       const releasePrioritySlot = shouldAcquireGlobalPrioritySlot
         ? await acquireConnectorOpSlot("high", `relay:${messageType || "unknown"}`)
@@ -9433,6 +9682,9 @@ async function main() {
 
           await saveDeviceTokenSecure(msg.device_token);
         }
+        // Replay retained results only after the relay has authenticated this
+        // socket; pre-auth result messages are intentionally rejected.
+        flushRelayResultBacklog();
         const nextCfg = {
           ...cfg,
           relay_url: relayUrl,
@@ -9570,6 +9822,7 @@ async function main() {
               appUrl: whatsappAppUrl,
               codeCwd: codeCwd && isDirectory(codeCwd) ? codeCwd : undefined,
               codeRuntime: buildWhatsAppCodeRuntime(),
+              browserTaskRuntime: resolveConfiguredBrowserTaskRuntime(cfg),
               onHealth: (healthEvent) => {
                 const status =
                   healthEvent && typeof healthEvent === "object" && typeof healthEvent.status === "string"
@@ -9620,6 +9873,7 @@ async function main() {
                     appUrl: whatsappAppUrl,
                     codeCwd: codeCwd && isDirectory(codeCwd) ? codeCwd : undefined,
                     codeRuntime: buildWhatsAppCodeRuntime(),
+                    browserTaskRuntime: resolveConfiguredBrowserTaskRuntime(cfg),
                   };
                   await waitForWhatsAppBridgeReadyOrThrow(whatsappBridge);
                   noteWhatsAppHealthy(
@@ -9698,6 +9952,7 @@ async function main() {
                       resetSession: retryWithSessionReset,
                       codeCwd: codeCwd && isDirectory(codeCwd) ? codeCwd : undefined,
                       codeRuntime: buildWhatsAppCodeRuntime(),
+                      browserTaskRuntime: resolveConfiguredBrowserTaskRuntime(cfg),
                       onHealth: (healthEvent) => {
                         const status =
                           healthEvent && typeof healthEvent === "object" && typeof healthEvent.status === "string"
@@ -9746,6 +10001,7 @@ async function main() {
                         appUrl: whatsappAppUrl,
                         codeCwd: codeCwd && isDirectory(codeCwd) ? codeCwd : undefined,
                         codeRuntime: buildWhatsAppCodeRuntime(),
+                        browserTaskRuntime: resolveConfiguredBrowserTaskRuntime(cfg),
                       };
                       await waitForWhatsAppBridgeReadyOrThrow(whatsappBridge);
                       warn("WhatsApp bridge recovered successfully on retry");
@@ -9795,6 +10051,7 @@ async function main() {
         if (!noAutoStart) {
           if (process.platform === "darwin") {
             await installLaunchAgent(relayUrl, {
+              appUrl: connectorAppUrl,
               whatsappEnabled: whatsappEnabled && !!whatsappGroupName && !!whatsappAppUrl,
               whatsappGroupName,
               whatsappAppUrl,
@@ -9805,11 +10062,11 @@ async function main() {
               nodeExe: process.execPath,
               connectorScript: process.argv[1],
               relayUrl,
-              extraArgs: [
-                ...(whatsappEnabled ? ["--whatsapp"] : []),
-                ...(whatsappEnabled && whatsappGroupName ? ["--whatsapp-group", whatsappGroupName] : []),
-                ...(whatsappEnabled && whatsappAppUrl ? ["--app-url", whatsappAppUrl] : []),
-              ],
+              extraArgs: buildPersistentConnectorArgs({
+                appUrl: connectorAppUrl,
+                whatsappEnabled,
+                whatsappGroupName,
+              }),
               log: (message, meta) => log(message, meta || {}),
             });
             windowsStartupResult = startupResult;
@@ -9912,6 +10169,8 @@ async function main() {
           return;
         }
         const jobs = Array.isArray(msg.jobs) ? msg.jobs : [];
+        const scheduleSyncFingerprint = getScheduleSyncFingerprint(jobs);
+        const scheduleChanged = scheduleSyncFingerprint !== lastScheduleSyncFingerprint;
         scheduledJobs.clear();
         const syncedJobIds = new Set();
         for (const j of jobs) {
@@ -9927,7 +10186,10 @@ async function main() {
         }
         scheduleSyncPending = false;
         lastScheduleSyncAtMs = Date.now();
-        log("schedule_sync updated jobs:", scheduledJobs.size);
+        lastScheduleSyncFingerprint = scheduleSyncFingerprint;
+        if (scheduleChanged) {
+          log("schedule_sync updated jobs:", scheduledJobs.size);
+        }
         // If a job is already due, fire quickly right after sync (don't wait up to 15s).
         tickSchedules().catch(() => {});
         return;
@@ -10204,8 +10466,46 @@ async function main() {
           if (typeof raw.whatsapp_app_url === "string") {
             safeUpdates.whatsapp_app_url = raw.whatsapp_app_url.trim();
           }
+          if (typeof raw.browser_task_provider === "string") {
+            const provider = raw.browser_task_provider.trim().toLowerCase();
+            if (provider === "claude" || provider === "codex") {
+              safeUpdates.browser_task_provider = provider;
+            }
+          }
+          if (typeof raw.browser_task_model === "string") {
+            const model = raw.browser_task_model.trim().slice(0, 160);
+            if (model) safeUpdates.browser_task_model = model;
+          }
+          if (typeof raw.browser_task_reasoning_effort === "string") {
+            const effort = raw.browser_task_reasoning_effort.trim().toLowerCase();
+            if (["low", "medium", "high", "xhigh", "max"].includes(effort)) {
+              safeUpdates.browser_task_reasoning_effort = effort;
+            }
+          }
+          if (typeof raw.browser_task_playwright_driver === "string") {
+            const driver = raw.browser_task_playwright_driver.trim().toLowerCase();
+            if (driver === "cli" || driver === "mcp") {
+              safeUpdates.browser_task_playwright_driver = driver;
+            }
+          }
           if (typeof raw.aiyra_voice_enabled === "boolean") {
             safeUpdates.aiyra_voice_enabled = raw.aiyra_voice_enabled;
+          }
+          if (typeof raw.voice_enabled === "boolean") {
+            safeUpdates.voice_enabled = raw.voice_enabled;
+          }
+          if (typeof raw.voice_provider === "string") {
+            const provider = raw.voice_provider.trim().toLowerCase();
+            if (provider === "aiyra" || normalizePrivateVoiceProvider(provider)) {
+              safeUpdates.voice_provider = provider;
+            }
+          }
+          if (typeof raw.voice_app_url === "string") {
+            safeUpdates.voice_app_url = raw.voice_app_url.trim();
+          }
+          if (typeof raw.voice_wake_word === "string" || raw.voice_wake_word === null) {
+            safeUpdates.voice_wake_word =
+              typeof raw.voice_wake_word === "string" ? raw.voice_wake_word.trim() : "";
           }
           if (
             typeof raw.aiyra_wake_word === "string" ||
@@ -10365,12 +10665,14 @@ async function main() {
             cfg = nextCfg;
             log("config updated via dashboard", safeKeys);
             applySchedulerWhatsAppRuntimeConfig(resolveWhatsAppRuntimeConfig(cfg));
+            applySchedulerBrowserTaskRuntimeConfig(cfg);
 
             const hasAiyraConfigUpdate = safeKeys.some((key) =>
-              key.startsWith("aiyra_")
+              key.startsWith("aiyra_") || key.startsWith("voice_")
             );
             if (hasAiyraConfigUpdate) {
               const prevAiyraConfigDigest = JSON.stringify({
+                provider: aiyraVoiceProvider,
                 enabled: aiyraVoiceEnabled,
                 appUrl: aiyraAppUrl,
                 wakeWord: aiyraWakeWord,
@@ -10391,6 +10693,7 @@ async function main() {
               });
               const nextAiyraConfig = resolveAiyraRuntimeConfig();
               const nextAiyraConfigDigest = JSON.stringify({
+                provider: nextAiyraConfig.provider,
                 enabled: nextAiyraConfig.enabled,
                 appUrl: nextAiyraConfig.appUrl,
                 wakeWord: nextAiyraConfig.wakeWord,
@@ -10410,30 +10713,7 @@ async function main() {
                 micName: nextAiyraConfig.micName || "",
               });
 
-              aiyraVoiceEnabled = nextAiyraConfig.enabled;
-              aiyraAppUrl = nextAiyraConfig.appUrl;
-              aiyraWakeWord = nextAiyraConfig.wakeWord;
-              aiyraWakeSensitivity = nextAiyraConfig.wakeSensitivity;
-              aiyraIdleTimeoutMs = nextAiyraConfig.idleTimeoutMs;
-              aiyraKeywordPath = nextAiyraConfig.keywordPath;
-              aiyraWakeEngine = nextAiyraConfig.wakeEngine;
-              aiyraAecEnabled = nextAiyraConfig.aecEnabled;
-              aiyraAecBackend = nextAiyraConfig.aecBackend;
-              aiyraOpenWakewordThreshold = nextAiyraConfig.openWakewordThreshold;
-              aiyraOpenWakewordModelPath = nextAiyraConfig.openWakewordModelPath;
-              aiyraOpenWakewordPython = nextAiyraConfig.openWakewordPython;
-              aiyraOpenWakewordScriptPath = nextAiyraConfig.openWakewordScriptPath;
-              aiyraOpenWakewordAllowApproximate =
-                nextAiyraConfig.openWakewordAllowApproximate;
-              aiyraDeviceIndex = nextAiyraConfig.deviceIndex;
-              aiyraMicMode = nextAiyraConfig.micMode;
-              aiyraMicName = nextAiyraConfig.micName;
-              aiyraPersistedMicMode = nextAiyraConfig.persistedMicMode;
-              aiyraPersistedMicName = nextAiyraConfig.persistedMicName;
-              aiyraMicSelectionSource = nextAiyraConfig.micSelectionSource;
-              aiyraResolvedDeviceName = nextAiyraConfig.resolvedDeviceName;
-              aiyraMicSelectionFallbackReason =
-                nextAiyraConfig.micSelectionFallbackReason;
+              applyResolvedAiyraRuntimeConfig(nextAiyraConfig);
 
               if (prevAiyraConfigDigest !== nextAiyraConfigDigest) {
                 const settled = await waitForAiyraRuntimeStartToSettle();
@@ -11025,6 +11305,7 @@ async function main() {
       // Supports streaming via --output-format stream-json and explicit conversation resume via --resume
       if (msg.type === "claude_run") {
         const requestId = String(msg.request_id || "");
+        const relayResultAckRequired = msg.result_ack_required === true;
         const prompt = String(msg.prompt || "").trim();
         const cwdRaw = typeof msg.cwd === "string" && msg.cwd.trim() ? msg.cwd.trim() : os.homedir();
         const apiKey = typeof msg.api_key === "string" ? msg.api_key.trim() : "";
@@ -11035,7 +11316,10 @@ async function main() {
           typeof msg.allowed_tools === "string" ? msg.allowed_tools.trim() : "Read,Edit,Bash";
         const timeoutMs = Number.isFinite(Number(msg.timeout_ms)) ? Number(msg.timeout_ms) : 20 * 60 * 1000;
         const sessionId = typeof msg.session_id === "string" ? msg.session_id.trim() : "";
-        const planMode = msg.plan_mode === true;
+        const legacyPlanMode = msg.plan_mode === true;
+        const planMode =
+          legacyPlanMode && msg.plan_response !== false;
+        const readOnlyMode = msg.read_only === true || legacyPlanMode;
         const requestedModel = typeof msg.model === "string" ? msg.model.trim() : "";
         const billingBillable =
           msg.billing_billable === true ? true : msg.billing_billable === false ? false : undefined;
@@ -11078,12 +11362,15 @@ async function main() {
         let ok = true;
         let result = null;
         let errorText = null;
+        let errorCode = null;
         let timedOut = false;
         let aborted = false;
         let partial = false;
         let exitCode = null;
         let exitSignal = null;
         let hadResultEvent = false;
+        let sessionRecoveryAttempted = false;
+        let sessionRecovered = false;
 
         // Determine auth method: cli_token (OAuth) takes priority over api_key.
         // Codex can also use the connector machine's cached `codex login`
@@ -11123,18 +11410,15 @@ async function main() {
             commandsCount: Array.isArray(discovery.commands) ? discovery.commands.length : 0,
             durationMs: discovery.durationMs,
           });
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "claude_run_result",
-                request_id: requestId,
-                ok: discovery.ok,
-                result: compatResultText,
-                error: discovery.errorText,
-                duration_ms: discovery.durationMs,
-              })
-            );
-          }
+          sendRelayResult({
+            type: "claude_run_result",
+            request_id: requestId,
+            ok: discovery.ok,
+            result: compatResultText,
+            error: discovery.errorText,
+            duration_ms: discovery.durationMs,
+            ...(relayResultAckRequired ? { relay_ack_required: true } : {}),
+          });
           return;
         } else if (!prompt) {
           ok = false;
@@ -11169,6 +11453,15 @@ async function main() {
 
             const requestedCwdExpanded = expandTilde(cwdRaw || homeDir);
             let safeCwd = isDirectory(requestedCwdExpanded) ? requestedCwdExpanded : "";
+
+            // Named workers must never silently switch to another directory.
+            // Check before the legacy site fallback: a stale configured site
+            // path is not permission to create a new empty project.
+            if (!safeCwd && agentId && String(cwdRaw || "").trim()) {
+              throw new Error(
+                "worker_workspace_unavailable: the configured workspace folder is missing or inaccessible",
+              );
+            }
 
             // If cwd is invalid, but this looks like a Groovy site task, force it into
             // the canonical local sites directory under the current user's home.
@@ -11392,9 +11685,14 @@ async function main() {
             // Hard guardrail for generated sites:
             // - keep a full toolset for scaffold + edits
             // - enforce an organized one-pass workflow to avoid verification loops
-            const allowedTools = isSiteWorkspace ? "Read,Edit,Bash,Write" : requestedAllowedTools;
+            const allowedTools = readOnlyMode
+              ? "Read,Grep,Glob"
+              : isSiteWorkspace
+                ? "Read,Edit,Bash,Write"
+                : requestedAllowedTools;
             const promptGuard =
               isSiteWorkspace &&
+              !readOnlyMode &&
               !prompt.includes("STRICT SITE MODE:")
                 ? `\n\nSTRICT SITE MODE:\n` +
                   `- Workspace: ${safeCwd}\n` +
@@ -11405,7 +11703,21 @@ async function main() {
                   `- Avoid repeated ls/find/cat/read verification loops\n` +
                   `- After edits, return completion summary; do not keep re-checking files`
                 : "";
-            const effectivePrompt = `${prompt}${promptGuard}`;
+            const externalAccess =
+              readOnlyMode && msg.external_access === "vercel_read"
+                ? "vercel_read"
+                : "none";
+            const externalAccessPrompt =
+              externalAccess === "vercel_read"
+                ? `\n\nVERCEL READ-ONLY ACCESS:\n` +
+                  `- This run may inspect Vercel through the machine's existing Vercel CLI login.\n` +
+                  `- Use the current workspace's normal Vercel CLI context. Prefer linked-workspace commands such as \`vercel project inspect\` without a project name.\n` +
+                  `- If a deployment-specific command requires a team scope, derive the owner from \`vercel project inspect\` output for this run and pass that value. If the workspace is not linked, discover available projects from actual CLI output. Never guess or embed a project name, team, scope, project id, or organization id in Groovy configuration.\n` +
+                  `- Only inspect projects, deployments, and logs. Do not link, deploy, promote, roll back, remove, change domains, or modify environment variables or project settings. Do not inspect or print auth tokens.`
+                : "";
+            const effectivePrompt =
+              `${prompt}${promptGuard}` +
+              externalAccessPrompt;
             if (safeCwd !== requestedCwdExpanded) {
               warn("claude_run requested cwd is invalid; resolved to safe cwd", {
                 requestedCwd: cwdRaw,
@@ -11425,6 +11737,7 @@ async function main() {
               claudeBin,
               allowedTools,
               planMode,
+              readOnlyMode,
               sessionId: sessionId ? sessionId.slice(0, 8) + "..." : null,
             });
 
@@ -11562,12 +11875,14 @@ async function main() {
                     typeof msg?.reasoning_effort === "string" ? msg.reasoning_effort : undefined,
                   sessionId: sessionId || undefined,
                   apiKey: apiKey || undefined,
+                  externalAccess,
                   planMode,
+                  readOnly: readOnlyMode,
                   abortSignal: claudeRunAbort.signal,
                   ...sharedStreamCallbacks,
                 });
               } else {
-                spawnResult = await runHeadlessClaude({
+                spawnResult = await runHeadlessClaudeWithResumeRecovery({
                   prompt: effectivePrompt,
                   cwd: safeCwd,
                   timeoutMs,
@@ -11577,10 +11892,18 @@ async function main() {
                     typeof msg?.reasoning_effort === "string" ? msg.reasoning_effort : undefined,
                   allowedTools: allowedTools || undefined,
                   planMode,
+                  readOnly: readOnlyMode,
                   sessionId: sessionId || undefined,
                   cliToken: useCliToken ? cliToken : undefined,
                   apiKey: useCliToken ? undefined : apiKey,
+                  externalAccess,
                   abortSignal: claudeRunAbort.signal,
+                  onResumeRecovery: (initialError) => {
+                    log("claude_run discarded unavailable resume session", {
+                      requestId,
+                      errorCode: initialError?.code || "claude_cli_failed",
+                    });
+                  },
                   ...sharedStreamCallbacks,
                 });
               }
@@ -11627,6 +11950,10 @@ async function main() {
             exitSignal = typeof spawnResult.signal === "string" ? spawnResult.signal : null;
             timedOut = spawnResult.timedOut === true;
             aborted = spawnResult.aborted === true;
+            sessionRecoveryAttempted =
+              spawnResult?.resumeRecovery?.attempted === true;
+            sessionRecovered =
+              spawnResult?.resumeRecovery?.recovered === true;
             
             // Extract diffs from tool use events (file edits)
             const diffs = [];
@@ -12056,7 +12383,25 @@ async function main() {
               }
             }
 
-            if (sessionId) {
+            if (codeProvider !== "codex") {
+              const emittedSessionId = extractHeadlessSessionId(spawnResult);
+              if (emittedSessionId) {
+                if (!result || typeof result !== "object") result = {};
+                if (
+                  typeof result.session_id !== "string" ||
+                  !result.session_id.trim()
+                ) {
+                  result.session_id = emittedSessionId;
+                }
+              }
+            }
+
+            if (
+              sessionId &&
+              !sessionRecoveryAttempted &&
+              exitCode === 0 &&
+              result?.is_error !== true
+            ) {
               if (!result || typeof result !== "object") result = {};
               if (typeof result.session_id !== "string" || !result.session_id.trim()) {
                 result.session_id = sessionId;
@@ -12100,7 +12445,13 @@ async function main() {
                 typeof result.result === "string" && result.result.trim()
                   ? result.result.trim()
                   : "";
-              if (!errorText) errorText = resultText || "claude_run_error";
+              const normalizedError = resultText
+                ? classifyHeadlessRunError(resultText, codeProvider)
+                : extractHeadlessRunError(spawnResult, {
+                    provider: codeProvider,
+                  });
+              if (!errorText) errorText = normalizedError.message;
+              if (!errorCode) errorCode = normalizedError.code;
             }
 
             if (!timedOut && !aborted && exitCode !== null && exitCode !== 0) {
@@ -12162,17 +12513,24 @@ async function main() {
                 } else {
                   ok = false;
                   if (!errorText) {
-                    const stderrText = String(spawnResult.stderr || "").trim();
-                    // Never dump raw stdout into errorText — it can be the entire
-                    // stream-json output (hundreds of KB of JSON) which gets shown
-                    // as a huge red wall of text in the UI.
-                    // Only use stderr (usually short and human-readable).
-                    errorText = stderrText || `${codeProvider} exited with code ${exitCode}`;
+                    const normalizedError = extractHeadlessRunError(
+                      spawnResult,
+                      { provider: codeProvider },
+                    );
+                    errorText = normalizedError.message;
+                    errorCode = normalizedError.code;
                   }
                 }
               } else {
                 log("claude_run: non-zero exit code but valid result — treating as success", { exitCode });
               }
+            }
+
+            if (errorText && !errorCode) {
+              errorCode = classifyHeadlessRunError(
+                errorText,
+                codeProvider,
+              ).code;
             }
 
             // Extra safety for site mode: if this was a write/scaffold intent but no in-workspace
@@ -12210,6 +12568,8 @@ async function main() {
               });
             }
 
+            sessionRecovered = sessionRecoveryAttempted && ok;
+
             log("claude_run finished", {
               durationMs: Date.now() - startedAt,
               exitCode,
@@ -12220,11 +12580,14 @@ async function main() {
               aborted,
               partial,
               errorText: errorText || null,
+              errorCode: errorCode || null,
               resultLen: result?.result?.length,
               resultPreview: typeof result?.result === "string" ? result.result.slice(0, 200) : null,
               hasResultEvent: hadResultEvent,
               latestAssistantTextLen: latestAssistantText?.length || 0,
               sessionId: result?.session_id ? result.session_id.slice(0, 8) + "..." : null,
+              sessionRecoveryAttempted,
+              sessionRecovered,
               streamEventsCount: streamEvents.length,
               eventTypeCounts: streamEvents.reduce((acc, e) => { acc[e.type] = (acc[e.type] || 0) + 1; return acc; }, {}),
               diffsFound: filteredDiffs.length,
@@ -12234,6 +12597,10 @@ async function main() {
             ok = false;
             const err = e && typeof e === "object" ? e : null;
             errorText = err && "message" in err ? String(err.message) : "claude_run_failed";
+            errorCode = classifyHeadlessRunError(
+              errorText,
+              codeProvider,
+            ).code;
             timedOut = /timed out/i.test(errorText);
             aborted = errorText === "claude_run_aborted";
             warn("claude_run error", { error: errorText });
@@ -12277,6 +12644,7 @@ async function main() {
         sendRelayResult({
           type: "claude_run_result",
           request_id: requestId,
+          ...(relayResultAckRequired ? { relay_ack_required: true } : {}),
           ok,
           result: resultText,
           session_id: result?.session_id || null,
@@ -12293,12 +12661,15 @@ async function main() {
           ...(billingAuthMethod ? { billing_auth_method: billingAuthMethod } : {}),
           diffs: resultDiffs,
           error: errorText,
+          error_code: errorCode,
           timed_out: timedOut,
           aborted,
           partial,
           exit_code: exitCode,
           signal: exitSignal,
           has_result_event: hadResultEvent,
+          session_recovery_attempted: sessionRecoveryAttempted,
+          session_recovered: sessionRecovered,
           duration_ms: Math.max(0, Date.now() - startedAt),
         });
         return;
@@ -13288,8 +13659,8 @@ async function main() {
       }
 
       // ===== Browser Task Runner =====
-      // Prefer Playwright MCP (claude -p + playwright) for reliable DOM-based automation.
-      // Browser task runs use Playwright MCP only.
+      // Use the selected Playwright transport. MCP is the measured default;
+      // CLI is an optional Codex transport with MCP startup fallback.
       if (msg.type === "browser_task_cancel") {
         const requestId = String(msg.request_id || "");
         const targetRequestId = String(msg.target_request_id || "").trim();
@@ -13372,6 +13743,7 @@ async function main() {
             : Number.isFinite(envBrowserTimeoutMs) && envBrowserTimeoutMs > 0
               ? envBrowserTimeoutMs
               : 12 * 60 * 1000;
+        const browserTaskRuntime = resolveConfiguredBrowserTaskRuntime(cfg);
 
         if (!requestId) {
           if (ws.readyState === WebSocket.OPEN) {
@@ -13391,18 +13763,24 @@ async function main() {
           task,
           startUrl: startUrl || "",
           profileName,
+          provider: browserTaskRuntime.provider,
+          model: browserTaskRuntime.model,
+          playwrightDriver: browserTaskRuntime.playwrightDriver,
         });
         const browserTaskSessionKey = buildBrowserTaskSessionKey({
           profileName,
           startUrl: startUrl || "",
+          provider: browserTaskRuntime.provider,
+          model: browserTaskRuntime.model,
+          playwrightDriver: browserTaskRuntime.playwrightDriver,
         });
         const nowMs = Date.now();
         pruneBrowserTaskSuccessCache(nowMs);
-        pruneBrowserTaskClaudeSessions(nowMs);
-        const cachedClaudeSession = browserTaskClaudeSessionByProfile.get(browserTaskSessionKey);
+        pruneBrowserTaskSessions(nowMs);
+        const cachedBrowserSession = browserTaskSessionByProfile.get(browserTaskSessionKey);
         const continueSessionId =
-          cachedClaudeSession && typeof cachedClaudeSession.sessionId === "string"
-            ? cachedClaudeSession.sessionId.trim()
+          cachedBrowserSession && typeof cachedBrowserSession.sessionId === "string"
+            ? cachedBrowserSession.sessionId.trim()
             : "";
         const cachedSuccess = recentBrowserTaskSuccessBySignature.get(browserTaskSignature);
         if (cachedSuccess) {
@@ -13417,14 +13795,20 @@ async function main() {
             cachedResult.meta &&
             typeof cachedResult.meta === "object" &&
             cachedResult.meta.authFallbackUsed === true;
-          const cachedBillingChargeType = cachedUsedAuthFallback
+          const cachedProvider = String(cachedResult?.meta?.provider || "").trim();
+          const cachedIsCodex = cachedProvider === "codex";
+          const cachedBillingChargeType = cachedIsCodex || cachedUsedAuthFallback
             ? "external_key_fee"
             : billingChargeType;
-          const cachedBillingAuthOrigin = cachedUsedAuthFallback
-            ? "user"
+          const cachedBillingAuthOrigin = cachedIsCodex
+            ? "local"
+            : cachedUsedAuthFallback
+              ? "user"
             : billingAuthOrigin;
-          const cachedBillingAuthMethod = cachedUsedAuthFallback
-            ? "local_claude_login"
+          const cachedBillingAuthMethod = cachedIsCodex
+            ? "local_codex_login"
+            : cachedUsedAuthFallback
+              ? "local_claude_login"
             : billingAuthMethod;
           log("browser_task_run duplicate detected; reusing cached success", {
             duplicateHits,
@@ -13466,13 +13850,18 @@ async function main() {
         const runOne = async () => {
           let result;
           try {
-            const usePlaywright = await isPlaywrightAvailable();
+            const usePlaywright = await isPlaywrightAvailable(browserTaskRuntime);
             if (usePlaywright) {
-              log("browser_task_run using Playwright MCP", {
+              log("browser_task_run using Playwright", {
+                provider: browserTaskRuntime.provider,
+                model: browserTaskRuntime.model,
+                reasoningEffort: browserTaskRuntime.reasoningEffort,
+                playwrightDriver: browserTaskRuntime.playwrightDriver,
                 hasContinueSession: !!continueSessionId,
                 continueSessionPreview: continueSessionId ? continueSessionId.slice(0, 8) : null,
               });
               result = await runBrowserTaskViaPlaywright({
+                ...browserTaskRuntime,
                 task,
                 start_url: startUrl,
                 api_key: apiKey,
@@ -13495,6 +13884,7 @@ async function main() {
                   error: result.error,
                 });
                 result = await runBrowserTaskViaPlaywright({
+                  ...browserTaskRuntime,
                   task,
                   start_url: startUrl,
                   api_key: apiKey,
@@ -13505,7 +13895,7 @@ async function main() {
                 });
               }
             } else {
-              log("browser_task_run blocked because Playwright MCP is unavailable", {
+              log("browser_task_run blocked because Playwright is unavailable", {
                 usePlaywright,
                 hasApiKey: !!apiKey,
                 hasCliToken: !!cliToken,
@@ -13514,7 +13904,7 @@ async function main() {
                 ok: false,
                 error: "playwright_mcp_unavailable",
                 message:
-                  "Browser automation requires Playwright MCP. Configure Claude with the @playwright/mcp server and retry.",
+                  `Browser automation requires ${browserTaskRuntime.provider === "codex" ? "Codex CLI plus Playwright" : "Claude Code plus Playwright MCP"}. Install the selected browser runtime and retry.`,
               };
             }
             return result;
@@ -13538,14 +13928,20 @@ async function main() {
           result.meta &&
           typeof result.meta === "object" &&
           result.meta.authFallbackUsed === true;
-        const effectiveBillingChargeType = usedAuthFallback
+        const resultProvider = String(result?.meta?.provider || browserTaskRuntime.provider || "").trim();
+        const resultIsCodex = resultProvider === "codex";
+        const effectiveBillingChargeType = resultIsCodex || usedAuthFallback
           ? "external_key_fee"
           : billingChargeType;
-        const effectiveBillingAuthOrigin = usedAuthFallback
-          ? "user"
+        const effectiveBillingAuthOrigin = resultIsCodex
+          ? "local"
+          : usedAuthFallback
+            ? "user"
           : billingAuthOrigin;
-        const effectiveBillingAuthMethod = usedAuthFallback
-          ? "local_claude_login"
+        const effectiveBillingAuthMethod = resultIsCodex
+          ? "local_codex_login"
+          : usedAuthFallback
+            ? "local_claude_login"
           : billingAuthMethod;
 
         if (
@@ -13561,14 +13957,14 @@ async function main() {
             result,
           });
           if (typeof result.sessionId === "string" && result.sessionId.trim()) {
-            browserTaskClaudeSessionByProfile.set(browserTaskSessionKey, {
+            browserTaskSessionByProfile.set(browserTaskSessionKey, {
               sessionId: result.sessionId.trim(),
               tsMs: Date.now(),
             });
           }
         } else if (continueSessionId) {
           // Avoid repeatedly trying a stale session id on follow-up runs.
-          browserTaskClaudeSessionByProfile.delete(browserTaskSessionKey);
+          browserTaskSessionByProfile.delete(browserTaskSessionKey);
         }
 
         sendRelayResult({
@@ -13602,6 +13998,32 @@ async function main() {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "browser_credential_request_result", request_id: requestId, ...result }));
         }
+        return;
+      }
+
+      if (["workspace_secret_get", "workspace_secret_request", "workspace_secret_delete"].includes(msg.type)) {
+        const requestId = String(msg.request_id || "");
+        const identity = { workspaceId: msg.workspace_id, secretId: msg.secret_id, key: msg.key, name: msg.name, reason: msg.reason };
+        const result = msg.type === "workspace_secret_request"
+          ? await workspaceSecretRequest(identity)
+          : msg.type === "workspace_secret_delete"
+            ? await workspaceSecretDelete(identity)
+            : await workspaceSecretGetMeta(identity);
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: `${msg.type}_result`, request_id: requestId, ...result }));
+        return;
+      }
+
+      if (msg.type === "skill_action_execute") {
+        const requestId = String(msg.request_id || "");
+        const ensured = await ensureSkillsRepoLocal({ repo_url: msg.repo_url, ref: msg.ref });
+        let result = ensured;
+        if (ensured.ok) {
+          const relativePath = String(msg.relative_path || "").replace(/\\/g, "/");
+          result = !relativePath || relativePath.split("/").includes("..") || path.basename(relativePath) !== "SKILL.md"
+            ? { ok: false, error: "invalid_skill_path" }
+            : await executeSkillAction({ skillDir: path.dirname(path.join(ensured.localPath, relativePath)), actionName: String(msg.action || ""), args: msg.args || {}, workspaceId: msg.workspace_id, secretBindings: msg.secret_bindings });
+        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "skill_action_execute_result", request_id: requestId, ...result }));
         return;
       }
 

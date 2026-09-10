@@ -4,6 +4,7 @@ import { createSupabaseAdminClient } from "@/lib/supabase/admin";
 import { decryptLlmApiKey, encryptLlmApiKey, sha256Hex } from "@/lib/crypto/llmKey";
 import { createDatagranLinkToken, resolveDatagranLinkOrigin } from "@/lib/datagran/linkToken";
 import { getOrCreateWorkspaceForUser } from "@/lib/workspaces";
+import { recipientTrackingRolloutEnabledForUser } from "@/lib/email/recipientTrackingRollout";
 
 const DATAGRAN_API_KEY = process.env.DATAGRAN_API_KEY;
 
@@ -13,10 +14,12 @@ const GMAIL_REQUIRED_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/gmail.labels",
 ];
+const GMAIL_SMTP_SCOPE = "https://mail.google.com/";
 
 type PostBody = {
   agentId?: unknown;
   provider?: unknown; // For new connections
+  recipientTracking?: unknown;
 };
 
 function toStringOrEmpty(value: unknown) {
@@ -25,10 +28,15 @@ function toStringOrEmpty(value: unknown) {
   return String(value);
 }
 
-function providerScopes(provider: string): string[] | undefined {
+function providerScopes(
+  provider: string,
+  recipientTracking: boolean,
+): string[] | undefined {
   const p = toStringOrEmpty(provider).toLowerCase();
   if (p !== "gmail") return undefined;
-  return GMAIL_REQUIRED_SCOPES;
+  return recipientTracking
+    ? [...GMAIL_REQUIRED_SCOPES, GMAIL_SMTP_SCOPE]
+    : GMAIL_REQUIRED_SCOPES;
 }
 
 export async function POST(req: Request) {
@@ -53,6 +61,22 @@ export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as PostBody | null;
   if (!body) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+  }
+  if (
+    body.recipientTracking === true &&
+    !recipientTrackingRolloutEnabledForUser(
+      ownerUserId,
+      undefined,
+      user.email || "",
+    )
+  ) {
+    return NextResponse.json(
+      {
+        error:
+          "Individual group read receipts are not enabled for this account yet.",
+      },
+      { status: 403 },
+    );
   }
 
   const agentId = toStringOrEmpty(body.agentId);
@@ -117,7 +141,10 @@ export async function POST(req: Request) {
   }
 
   // Call Datagran API to create link token
-  const scopes = providerScopes(providerToUse);
+  const scopes = providerScopes(
+    providerToUse,
+    body.recipientTracking === true,
+  );
   const result = await createDatagranLinkToken({
     apiKeys,
     endUserExternalId,

@@ -86,6 +86,9 @@ export function WorkerGrid({
   const activeFocusedPaneId = visiblePanes.some((pane) => pane.id === focusedPaneId)
     ? focusedPaneId
     : null;
+  const renderedPanes = activeFocusedPaneId
+    ? visiblePanes.filter((pane) => pane.id === activeFocusedPaneId)
+    : visiblePanes;
 
   useEffect(() => {
     onFocusedAgentChange(activeFocusedPaneId !== null);
@@ -103,7 +106,7 @@ export function WorkerGrid({
   }, [focusedPaneId]);
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 max-w-full flex-col overflow-x-clip">
+    <div className="relative flex h-full min-h-0 min-w-0 max-w-full flex-col overflow-x-clip">
       {/* Workspace controls — roster visibility and pane density live together. */}
       {!activeFocusedPaneId && (
       <div className="relative z-40 shrink-0 px-3 pt-3">
@@ -314,15 +317,29 @@ export function WorkerGrid({
         </div>
       ) : (
         <div
-          className="worker-grid-responsive touch-scroll-y grid w-full min-h-0 min-w-0 flex-1 gap-3 p-3 auto-rows-fr"
-          style={{
-            gridTemplateColumns: `repeat(${Math.min(cols, Math.max(visiblePanes.length, 1))}, minmax(0, 1fr))`,
-            gridAutoRows: visiblePanes.length > cols ? "minmax(360px, 1fr)" : "minmax(0, 1fr)",
-          }}
+          className={
+            activeFocusedPaneId
+              ? "relative min-h-0 min-w-0 w-full flex-1 overflow-hidden"
+              : "worker-grid-responsive touch-scroll-y grid w-full min-h-0 min-w-0 flex-1 gap-3 p-3 auto-rows-fr"
+          }
+          style={
+            activeFocusedPaneId
+              ? undefined
+              : {
+                  gridTemplateColumns: `repeat(${Math.min(cols, Math.max(visiblePanes.length, 1))}, minmax(0, 1fr))`,
+                  gridAutoRows:
+                    visiblePanes.length > cols
+                      ? "minmax(360px, 1fr)"
+                      : "minmax(0, 1fr)",
+                }
+          }
         >
           <AnimatePresence mode="popLayout">
-            {visiblePanes.map((pane, index) => {
+            {renderedPanes.map((pane) => {
               const agent = agentById.get(pane.agentId)!;
+              const paneIndex = visiblePanes.findIndex(
+                (visiblePane) => visiblePane.id === pane.id
+              );
               return (
                 <WorkerTile
                   key={pane.id}
@@ -343,8 +360,8 @@ export function WorkerGrid({
                     const next = activeFocusedPaneId === pane.id ? null : pane.id;
                     setFocusedPaneId(next);
                   }}
-                  canMoveLeft={index > 0}
-                  canMoveRight={index < visiblePanes.length - 1}
+                  canMoveLeft={paneIndex > 0}
+                  canMoveRight={paneIndex < visiblePanes.length - 1}
                 />
               );
             })}

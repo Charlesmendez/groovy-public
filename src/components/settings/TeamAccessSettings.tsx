@@ -18,6 +18,12 @@ type Channel = {
   visibility: "workspace" | "private";
 };
 
+type ChannelMembership = {
+  channel_id: string;
+  member_type: "user" | "agent" | "orchestrator";
+  user_id?: string | null;
+};
+
 type Invite = {
   id: string;
   email: string;
@@ -32,10 +38,27 @@ export function TeamAccessSettings() {
   );
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelMemberships, setChannelMemberships] = useState<
+    ChannelMembership[]
+  >([]);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [email, setEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<"member" | "guest">("member");
   const [channelIds, setChannelIds] = useState<string[]>([]);
+  const [editingInviteId, setEditingInviteId] = useState<string | null>(null);
+  const [editingInviteRole, setEditingInviteRole] = useState<
+    "member" | "guest"
+  >("member");
+  const [editingInviteChannelIds, setEditingInviteChannelIds] = useState<
+    string[]
+  >([]);
+  const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
+  const [editingMemberRole, setEditingMemberRole] = useState<
+    "member" | "guest"
+  >("member");
+  const [editingMemberChannelIds, setEditingMemberChannelIds] = useState<
+    string[]
+  >([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<{
@@ -69,6 +92,9 @@ export function TeamAccessSettings() {
         ? channelsPayload.channels
         : []
       ).filter((channel: Channel) => channel.kind === "channel"),
+    );
+    setChannelMemberships(
+      Array.isArray(channelsPayload.members) ? channelsPayload.members : [],
     );
     if (workspacePayload.workspace?.role === "admin") {
       const invitesRes = await fetch("/api/workspaces/invites", {
@@ -222,6 +248,125 @@ export function TeamAccessSettings() {
     }
   };
 
+  const beginEditingInvite = (invite: Invite) => {
+    setError(null);
+    setNotice(null);
+    setEditingMemberId(null);
+    setEditingInviteId(invite.id);
+    setEditingInviteRole(invite.role);
+    setEditingInviteChannelIds(
+      Array.isArray(invite.channels)
+        ? invite.channels.map((channel) => channel.id)
+        : [],
+    );
+  };
+
+  const updateInviteAccess = async (invite: Invite) => {
+    if (
+      editingInviteRole === "guest" &&
+      editingInviteChannelIds.length === 0
+    ) {
+      setError("Choose at least one channel for a channel guest.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/workspaces/invites", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "update_access",
+          inviteId: invite.id,
+          role: editingInviteRole,
+          channelIds: editingInviteChannelIds,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || "Could not update invitation access");
+      }
+      setEditingInviteId(null);
+      setNotice({
+        tone: "success",
+        message: `Access updated for ${invite.email}. The existing invitation link now uses the new access.`,
+      });
+      await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not update invitation access",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const beginEditingMember = (member: WorkspaceMember) => {
+    setError(null);
+    setNotice(null);
+    setEditingInviteId(null);
+    setEditingMemberId(member.user_id);
+    setEditingMemberRole(member.role === "guest" ? "guest" : "member");
+    setEditingMemberChannelIds(
+      channelMemberships
+        .filter(
+          (channelMember) =>
+            channelMember.member_type === "user" &&
+            channelMember.user_id === member.user_id &&
+            channels.some(
+              (channel) => channel.id === channelMember.channel_id,
+            ),
+        )
+        .map((channelMember) => channelMember.channel_id),
+    );
+  };
+
+  const updateMemberAccess = async (member: WorkspaceMember) => {
+    if (
+      editingMemberRole === "guest" &&
+      editingMemberChannelIds.length === 0
+    ) {
+      setError("Choose at least one channel for a channel guest.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/workspaces/members", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "update_access",
+          userId: member.user_id,
+          role: editingMemberRole,
+          channelIds: editingMemberChannelIds,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || "Could not update member access");
+      }
+      setEditingMemberId(null);
+      setNotice({
+        tone: "success",
+        message: `Access updated for ${member.email || "this user"}.`,
+      });
+      await load();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not update member access",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
       <div className="max-w-2xl">
@@ -349,7 +494,7 @@ export function TeamAccessSettings() {
         </section>
       ) : (
         <div className="mt-7 rounded-xl border border-white/10 p-4 text-sm text-zinc-500">
-          Only workspace administrators can invite or remove people.
+          Only workspace administrators can invite or manage people.
         </div>
       )}
 
@@ -360,7 +505,7 @@ export function TeamAccessSettings() {
             {members.map((member) => (
               <div
                 key={member.user_id}
-                className="flex items-center gap-3 rounded-lg border border-white/10 px-3 py-2"
+                className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 px-3 py-2"
               >
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm text-zinc-300">
@@ -373,14 +518,134 @@ export function TeamAccessSettings() {
                   </div>
                 </div>
                 {role === "admin" && member.role !== "admin" ? (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void removeMember(member.user_id)}
-                    className="text-xs text-red-300/80"
-                  >
-                    Remove
-                  </button>
+                  <div className="flex shrink-0 items-center gap-3">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        editingMemberId === member.user_id
+                          ? setEditingMemberId(null)
+                          : beginEditingMember(member)
+                      }
+                      className="text-xs text-zinc-300 disabled:opacity-40"
+                    >
+                      {editingMemberId === member.user_id
+                        ? "Close"
+                        : "Change access"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void removeMember(member.user_id)}
+                      className="text-xs text-red-300/80 disabled:opacity-40"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ) : null}
+                {role === "admin" &&
+                member.role !== "admin" &&
+                editingMemberId === member.user_id ? (
+                  <div className="basis-full border-t border-white/10 pt-3">
+                    <div className="grid gap-3 sm:grid-cols-[220px_1fr] sm:items-start">
+                      <div>
+                        <div className="mb-2 text-[10px] font-medium uppercase tracking-widest text-zinc-600">
+                          Access level
+                        </div>
+                        <CustomSelect
+                          value={editingMemberRole}
+                          onChange={(nextValue) =>
+                            setEditingMemberRole(
+                              nextValue === "guest" ? "guest" : "member",
+                            )
+                          }
+                          options={[
+                            {
+                              value: "member",
+                              label: "Full workspace member",
+                            },
+                            { value: "guest", label: "Channel guest" },
+                          ]}
+                          ariaLabel={`Access for ${member.email || member.user_id}`}
+                          disabled={busy}
+                          size="sm"
+                        />
+                      </div>
+                      <div>
+                        <div className="mb-2 text-[10px] font-medium uppercase tracking-widest text-zinc-600">
+                          Explicit channels
+                          {editingMemberRole === "guest"
+                            ? " · required"
+                            : " · optional"}
+                        </div>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {channels.map((channel) => (
+                            <label
+                              key={channel.id}
+                              className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-zinc-300"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={editingMemberChannelIds.includes(
+                                  channel.id,
+                                )}
+                                disabled={busy}
+                                onChange={() =>
+                                  setEditingMemberChannelIds((current) =>
+                                    current.includes(channel.id)
+                                      ? current.filter(
+                                          (id) => id !== channel.id,
+                                        )
+                                      : [...current, channel.id],
+                                  )
+                                }
+                              />
+                              {channel.visibility === "private" ? (
+                                <Lock
+                                  className="h-3.5 w-3.5 shrink-0 text-zinc-500"
+                                  aria-label="Private channel"
+                                />
+                              ) : (
+                                <span className="shrink-0 text-zinc-600">#</span>
+                              )}
+                              <span className="truncate">{channel.name}</span>
+                            </label>
+                          ))}
+                          {channels.length === 0 ? (
+                            <p className="text-xs text-zinc-600">
+                              Create a Chat channel before assigning guest
+                              access.
+                            </p>
+                          ) : null}
+                        </div>
+                        {editingMemberRole === "member" ? (
+                          <p className="mt-2 text-[10px] leading-relaxed text-zinc-600">
+                            Full members already see workspace-visible channels.
+                            Select channels here to preserve explicit access,
+                            including private channels.
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="mt-3 flex items-center gap-3">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void updateMemberAccess(member)}
+                        className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-200 disabled:opacity-40"
+                      >
+                        {busy ? "Saving…" : "Save access"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => setEditingMemberId(null)}
+                        className="px-2 py-2 text-xs text-zinc-500 disabled:opacity-40"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
               </div>
             ))}
@@ -419,6 +684,20 @@ export function TeamAccessSettings() {
                       <button
                         type="button"
                         disabled={busy}
+                        onClick={() =>
+                          editingInviteId === invite.id
+                            ? setEditingInviteId(null)
+                            : beginEditingInvite(invite)
+                        }
+                        className="text-xs text-zinc-300 disabled:opacity-40"
+                      >
+                        {editingInviteId === invite.id
+                          ? "Close"
+                          : "Change access"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
                         onClick={() => void resendInvite(invite)}
                         className="text-xs text-cyan-300 disabled:opacity-40"
                       >
@@ -435,6 +714,101 @@ export function TeamAccessSettings() {
                     </div>
                   ) : null}
                 </div>
+                {role === "admin" && editingInviteId === invite.id ? (
+                  <div className="mt-3 border-t border-white/10 pt-3">
+                    <div className="grid gap-3 sm:grid-cols-[220px_1fr] sm:items-start">
+                      <div>
+                        <div className="mb-2 text-[10px] font-medium uppercase tracking-widest text-zinc-600">
+                          Access level
+                        </div>
+                        <CustomSelect
+                          value={editingInviteRole}
+                          onChange={(nextValue) =>
+                            setEditingInviteRole(
+                              nextValue === "guest" ? "guest" : "member",
+                            )
+                          }
+                          options={[
+                            {
+                              value: "member",
+                              label: "Full workspace member",
+                            },
+                            { value: "guest", label: "Channel guest" },
+                          ]}
+                          ariaLabel={`Access for ${invite.email}`}
+                          disabled={busy}
+                          size="sm"
+                        />
+                      </div>
+                      <div>
+                        <div className="mb-2 text-[10px] font-medium uppercase tracking-widest text-zinc-600">
+                          Channels
+                          {editingInviteRole === "guest"
+                            ? " · required"
+                            : " · optional"}
+                        </div>
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          {channels.map((channel) => (
+                            <label
+                              key={channel.id}
+                              className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs text-zinc-300"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={editingInviteChannelIds.includes(
+                                  channel.id,
+                                )}
+                                disabled={busy}
+                                onChange={() =>
+                                  setEditingInviteChannelIds((current) =>
+                                    current.includes(channel.id)
+                                      ? current.filter(
+                                          (id) => id !== channel.id,
+                                        )
+                                      : [...current, channel.id],
+                                  )
+                                }
+                              />
+                              {channel.visibility === "private" ? (
+                                <Lock
+                                  className="h-3.5 w-3.5 shrink-0 text-zinc-500"
+                                  aria-label="Private channel"
+                                />
+                              ) : (
+                                <span className="shrink-0 text-zinc-600">#</span>
+                              )}
+                              <span className="truncate">{channel.name}</span>
+                            </label>
+                          ))}
+                          {channels.length === 0 ? (
+                            <p className="text-xs text-zinc-600">
+                              Create a Chat channel before assigning guest
+                              access.
+                            </p>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-3 flex items-center gap-3">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void updateInviteAccess(invite)}
+                        className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-200 disabled:opacity-40"
+                      >
+                        {busy ? "Saving…" : "Save access"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => setEditingInviteId(null)}
+                        className="px-2 py-2 text-xs text-zinc-500 disabled:opacity-40"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ))}
             {invites.length === 0 ? (

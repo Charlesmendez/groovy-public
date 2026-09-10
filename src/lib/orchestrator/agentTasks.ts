@@ -29,6 +29,22 @@ import {
   prepareCodeRun,
   type CodeRunBilling,
 } from "@/lib/claude/prepareCodeRun";
+import {
+  CODE_AGENT_RELAY_TIMEOUT_MS,
+  CODE_AGENT_RUN_TIMEOUT_MS,
+  CODE_AGENT_TIMEOUT_CONTINUE_PROMPT,
+  CODE_AGENT_TIMEOUT_CONTINUATIONS,
+  appendTimeoutContinuationNotice,
+  isCodeAgentTimeoutResult,
+  shouldContinueTimedOutCodeAgent,
+  timeoutContinuationCount,
+} from "@/lib/orchestrator/agentTaskTimeout";
+import {
+  isAgentTaskReadOnly,
+  nextAgentTaskHarnessSessionId,
+  resolveAgentTaskResumeSessionId,
+  verifiedAgentTaskSessionId,
+} from "@/lib/orchestrator/agentTaskExecutionPolicy";
 import { recordCodeAgentUsage } from "@/lib/billing/recordCodeAgentUsage";
 import {
   workerHarnessFromProvider,
@@ -36,13 +52,16 @@ import {
   type WorkerAgentRosterEntry,
 } from "@/lib/agents/types";
 import { sendTeamChatPush } from "@/lib/notifications/webPush";
+import { resolveAgentTaskContinuationTarget } from "@/lib/orchestrator/agentTaskContinuationPolicy";
 
 // Device considered online when the connector heartbeat is this recent.
 const DEVICE_ONLINE_THRESHOLD_MS = 3 * 60 * 1000;
 
-// Scheduled/headless runs must stay under the route budget (maxDuration 800s).
-export const AGENT_TASK_MAX_TIMEOUT_MS = 700_000;
-export const AGENT_TASK_DEFAULT_TIMEOUT_MS = 600_000;
+// Durable channel/dashboard tasks run on the relay and survive the originating
+// serverless request. Scheduled synchronous runs keep their separate route cap.
+export const AGENT_TASK_MAX_TIMEOUT_MS = CODE_AGENT_RUN_TIMEOUT_MS;
+export const AGENT_TASK_DEFAULT_TIMEOUT_MS = CODE_AGENT_RUN_TIMEOUT_MS;
+const SCHEDULED_AGENT_TASK_MAX_TIMEOUT_MS = 700_000;
 
 export type AgentTaskStatus =
   | "queued"
@@ -291,6 +310,8 @@ export async function createAgentTask(args: {
   requireApproval?: boolean;
   /** Read-only plan mode: the worker drafts a plan instead of making changes. */
   planMode?: boolean;
+  /** Enforced read-only execution without changing the task's response shape. */
+  readOnly?: boolean;
   /** Additional lifecycle metadata (planning session, consultation depth, etc.). */
   resultMeta?: Record<string, unknown>;
   source?: "orchestrator" | "schedule" | "api";
@@ -300,6 +321,32 @@ export async function createAgentTask(args: {
   turnId?: string | null;
 }): Promise<AgentTaskRow> {
   const admin = createSupabaseAdminClient();
+  const orchestratorSessionId = asString(args.orchestratorSessionId);
+  const [{ data: ownedAgent }, { data: ownedSession }] = await Promise.all([
+    admin
+      .from("agents")
+      .select("id")
+      .eq("id", args.agentId)
+      .eq("user_id", args.userId)
+      .eq("type", "claude-code")
+      .maybeSingle(),
+    orchestratorSessionId
+      ? admin
+          .from("orchestrator_sessions")
+          .select("id")
+          .eq("id", orchestratorSessionId)
+          .eq("user_id", args.userId)
+          .maybeSingle()
+      : Promise.resolve({ data: null }),
+  ]);
+  if (!ownedAgent?.id) {
+    throw new Error("Agent task denied: worker agent ownership is invalid.");
+  }
+  if (orchestratorSessionId && !ownedSession?.id) {
+    throw new Error(
+      "Agent task denied: orchestrator session ownership is invalid.",
+    );
+  }
   await assertTeamChatAgentMembership(admin, {
     requestedChannel: args.requestedChannel,
     agentId: args.agentId,
@@ -313,12 +360,14 @@ export async function createAgentTask(args: {
       prompt: args.prompt,
       title: args.title || summarizeTitle(args.prompt),
       context: args.context || null,
-      orchestrator_session_id: args.orchestratorSessionId || null,
+      orchestrator_session_id: orchestratorSessionId,
       requested_channel: args.requestedChannel || null,
       notify: args.notify || {},
       approval: args.requireApproval ? { required: true } : {},
       result_meta: {
         ...(args.resultMeta || {}),
+        access_mode:
+          args.readOnly || args.planMode ? "read_only" : "read_write",
         ...(args.planMode ? { plan_mode: true } : {}),
       },
       status,
@@ -355,12 +404,15 @@ async function updateAgentTask(
   patch: Record<string, unknown>
 ): Promise<AgentTaskRow | null> {
   const admin = createSupabaseAdminClient();
-  const { data } = await admin
+  const { data, error } = await admin
     .from("agent_tasks")
     .update({ ...patch, updated_at: new Date().toISOString() })
     .eq("id", taskId)
     .select("*")
     .maybeSingle();
+  if (error) {
+    throw new Error(`agent_task_update_failed:${error.message}`);
+  }
   return (data as AgentTaskRow | null) || null;
 }
 
@@ -492,8 +544,7 @@ async function failClaimedAgentTask(args: {
   consumedTransferIds?: string[];
 }): Promise<RunAgentTaskResult> {
   const admin = createSupabaseAdminClient();
-  await restoreTransfers(admin, args.consumedTransferIds || []).catch(() => {});
-  const { data: updated } = await admin
+  const { data: updated, error: updateError } = await admin
     .from("agent_tasks")
     .update({
       status: "failed",
@@ -507,24 +558,208 @@ async function failClaimedAgentTask(args: {
     .maybeSingle();
   if (!updated) {
     const current = await getAgentTask(args.task.user_id, args.task.id);
-    if (current?.status === "canceled") {
+    if (
+      current &&
+      (current.status === "done" ||
+        current.status === "failed" ||
+        current.status === "canceled")
+    ) {
       await kickNextQueuedTaskForAgent(current).catch(() => {});
       return {
         task: current,
-        ok: false,
-        resultText: "",
-        error: current.error || "stopped_by_team_member",
+        ok: current.status === "done",
+        resultText: current.result_text || "",
+        error:
+          current.error ||
+          (current.status === "canceled" ? "stopped_by_team_member" : null),
       };
     }
+    if (updateError) {
+      throw new Error(updateError.message);
+    }
+    throw new Error("agent_task_failure_transition_lost");
   }
+  await restoreTransfers(admin, args.consumedTransferIds || []).catch(() => {});
   const finalTask =
-    (updated as AgentTaskRow | null) ||
-    { ...args.task, status: "failed" as const, error: args.error };
+    updated as AgentTaskRow;
   await appendTaskEventToOrchestratorSession(admin, finalTask, "failed").catch(() => {});
   await appendTaskEventToTeamChat(admin, finalTask, "failed").catch(() => {});
+  await scheduleOrchestratorTaskContinuation(finalTask);
   await notifyTaskFinished(finalTask).catch(() => {});
   await kickNextQueuedTaskForAgent(finalTask).catch(() => {});
   return { task: finalTask, ok: false, resultText: "", error: args.error };
+}
+
+async function continueTimedOutAgentTask(args: {
+  task: AgentTaskRow;
+  rpcResult: Record<string, unknown>;
+  resultSessionId: string | null;
+  userEmail?: string | null;
+  consumedTransferIds?: string[];
+}): Promise<RunAgentTaskResult | null> {
+  const { task, rpcResult } = args;
+  const taskMeta =
+    (task.result_meta as Record<string, unknown> | null) || {};
+  const continuationSessionId =
+    args.resultSessionId || asString(task.harness_session_id);
+  if (
+    !shouldContinueTimedOutCodeAgent({
+      result: rpcResult,
+      resultMeta: taskMeta,
+      sessionId: continuationSessionId,
+    })
+  ) {
+    return null;
+  }
+
+  const priorRequestId = asString(taskMeta.relay_request_id);
+  if (!priorRequestId || !continuationSessionId) return null;
+
+  const admin = createSupabaseAdminClient();
+  const { data: config } = await admin
+    .from("claude_code_agent_configs")
+    .select("device_id")
+    .eq("agent_id", task.agent_id)
+    .eq("user_id", task.user_id)
+    .maybeSingle();
+  const deviceId = asString(
+    (config as { device_id?: unknown } | null)?.device_id,
+  );
+  if (!deviceId) return null;
+
+  const scheduledModel = asString(taskMeta.scheduled_model);
+  const scheduledReasoningEffort = asString(
+    taskMeta.scheduled_reasoning_effort,
+  );
+  const prepared = await prepareCodeRun({
+    supabase: admin,
+    userId: task.user_id,
+    userEmail: args.userEmail || null,
+    agentId: task.agent_id,
+    prompt: CODE_AGENT_TIMEOUT_CONTINUE_PROMPT,
+    sessionId: continuationSessionId,
+    timeoutMs: AGENT_TASK_DEFAULT_TIMEOUT_MS,
+    planMode: isAgentTaskReadOnly(taskMeta),
+    planResponse: taskMeta.plan_mode === true,
+    readOnly: isAgentTaskReadOnly(taskMeta),
+    externalAccess:
+      isAgentTaskReadOnly(taskMeta) &&
+      taskMeta.external_access === "vercel_read"
+        ? "vercel_read"
+        : "none",
+    allowedTools: isAgentTaskReadOnly(taskMeta) ? "Read,Grep,Glob" : null,
+    model: scheduledModel,
+    reasoningEffort: scheduledReasoningEffort,
+    billingSource: "agent_task",
+  });
+  if (!prepared.ok) return null;
+
+  const continuationCount = timeoutContinuationCount(taskMeta) + 1;
+  const continuationBilling: PersistedTaskRunBilling = {
+    requestId: prepared.requestId,
+    billable: prepared.billing.billable,
+    chargeType: prepared.billing.chargeType,
+    provider: prepared.billing.provider,
+    codeCliProvider: prepared.billing.codeCliProvider,
+    authMethod: prepared.billing.authMethod,
+    authOrigin: prepared.billing.authOrigin,
+  };
+  const errorText = asString(rpcResult.error);
+  const nextMeta = {
+    ...taskMeta,
+    relay_request_id: prepared.requestId,
+    task_run_billing: continuationBilling,
+    live_status: "continuing_after_timeout",
+    live_text: appendTimeoutContinuationNotice(
+      taskMeta.live_text,
+      continuationCount,
+    ),
+    progress_updated_at: new Date().toISOString(),
+    timeout_continuation_count: continuationCount,
+    timeout_last_at: new Date().toISOString(),
+    timeout_last_error: errorText?.slice(0, 1_000) || "worker_timeout",
+    timeout_previous_request_id: priorRequestId,
+    timeout_partial_result: rpcResult.partial === true || undefined,
+    consumed_transfer_ids: args.consumedTransferIds || [],
+    sessionId: continuationSessionId,
+  };
+
+  const { data: continued } = await admin
+    .from("agent_tasks")
+    .update({
+      result_meta: nextMeta,
+      harness_session_id: continuationSessionId,
+      error: null,
+      finished_at: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", task.id)
+    .eq("user_id", task.user_id)
+    .eq("status", "running")
+    .contains("result_meta", { relay_request_id: priorRequestId })
+    .select("*")
+    .maybeSingle();
+
+  if (!continued) {
+    const current = await getAgentTask(task.user_id, task.id);
+    if (
+      current?.status === "running" &&
+      asString(current.result_meta?.relay_request_id) !== priorRequestId
+    ) {
+      return {
+        task: current,
+        ok: true,
+        resultText: "",
+        error: null,
+        accepted: true,
+      };
+    }
+    return null;
+  }
+
+  const continuedTask = continued as AgentTaskRow;
+  await admin
+    .from("claude_code_cli_messages")
+    .insert({
+      user_id: task.user_id,
+      claude_code_agent_id: task.agent_id,
+      role: "user",
+      content: `[Automatic timeout recovery ${continuationCount}/${CODE_AGENT_TIMEOUT_CONTINUATIONS}]\n${CODE_AGENT_TIMEOUT_CONTINUE_PROMPT}`,
+    })
+    .then(() => {});
+  try {
+    const completionUrl = new URL(
+      "/api/agents/tasks/complete",
+      getAppUrl(),
+    ).toString();
+    await startConnectorRpcViaRelay({
+      userId: task.user_id,
+      deviceId,
+      rpcType: "claude_run",
+      payload: prepared.payload,
+      timeoutMs: CODE_AGENT_RELAY_TIMEOUT_MS,
+      requestId: prepared.requestId,
+      taskId: task.id,
+      taskMeta: nextMeta,
+      completionUrl,
+    });
+  } catch (error) {
+    return failClaimedAgentTask({
+      task: continuedTask,
+      error: `timeout_continuation_dispatch_failed:${
+        error instanceof Error ? error.message : String(error)
+      }`.slice(0, 2_000),
+      consumedTransferIds: args.consumedTransferIds,
+    });
+  }
+
+  return {
+    task: continuedTask,
+    ok: true,
+    resultText: "",
+    error: null,
+    accepted: true,
+  };
 }
 
 async function finalizeAgentTaskConnectorResult(args: {
@@ -533,6 +768,7 @@ async function finalizeAgentTaskConnectorResult(args: {
   userEmail?: string | null;
   billing: PersistedTaskRunBilling;
   consumedTransferIds?: string[];
+  allowTimeoutContinuation?: boolean;
 }): Promise<RunAgentTaskResult> {
   const admin = createSupabaseAdminClient();
   const { task, rpcResult, billing } = args;
@@ -545,6 +781,14 @@ async function finalizeAgentTaskConnectorResult(args: {
         : "";
   const errorText = asString(rpcResult.error);
   const resultSessionId = asString(rpcResult.session_id);
+  const errorCode = asString(rpcResult.error_code);
+  const sessionRecoveryAttempted =
+    rpcResult.session_recovery_attempted === true;
+  const sessionRecovered = rpcResult.session_recovered === true;
+  const verifiedSessionId = verifiedAgentTaskSessionId({
+    ok,
+    reportedSessionId: resultSessionId,
+  });
   const durationMs = Number.isFinite(Number(rpcResult.duration_ms))
     ? Number(rpcResult.duration_ms)
     : null;
@@ -575,14 +819,14 @@ async function finalizeAgentTaskConnectorResult(args: {
   const persistedDiffs = streamDiffs.length > 0 ? streamDiffs : textDiffs;
   const content = cleanContent || composedContent;
 
-  if (resultSessionId) {
+  if (verifiedSessionId) {
     await admin
       .from("claude_code_cli_threads")
       .upsert(
         {
           user_id: task.user_id,
           claude_code_agent_id: task.agent_id,
-          claude_session_id: resultSessionId,
+          claude_session_id: verifiedSessionId,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "user_id,claude_code_agent_id" }
@@ -614,6 +858,10 @@ async function finalizeAgentTaskConnectorResult(args: {
 
   await recordCodeAgentUsage({
     userId: task.user_id,
+    usageActorUserId:
+      typeof task.result_meta?.usage_actor_user_id === "string"
+        ? task.result_meta.usage_actor_user_id
+        : null,
     userEmail: args.userEmail || null,
     agentId: task.agent_id,
     requestId: billing.requestId,
@@ -641,8 +889,23 @@ async function finalizeAgentTaskConnectorResult(args: {
     );
   });
 
+  if (
+    args.allowTimeoutContinuation === true &&
+    !ok &&
+    isCodeAgentTimeoutResult(rpcResult)
+  ) {
+    const continued = await continueTimedOutAgentTask({
+      task,
+      rpcResult,
+      resultSessionId,
+      userEmail: args.userEmail || null,
+      consumedTransferIds: args.consumedTransferIds,
+    });
+    if (continued) return continued;
+  }
+
   const finalStatus: AgentTaskStatus = ok ? "done" : "failed";
-  const { data: updated } = await admin
+  const { data: updated, error: updateError } = await admin
     .from("agent_tasks")
     .update({
       status: finalStatus,
@@ -660,9 +923,17 @@ async function finalizeAgentTaskConnectorResult(args: {
         costUsd,
         partial: rpcResult.partial === true || undefined,
         timedOut: rpcResult.timed_out === true || undefined,
+        errorCode: errorCode || undefined,
+        sessionRecoveryAttempted: sessionRecoveryAttempted || undefined,
+        sessionRecovered: sessionRecovered || undefined,
       },
       error: ok ? null : errorText || "run_failed",
-      harness_session_id: resultSessionId || task.harness_session_id || null,
+      harness_session_id: nextAgentTaskHarnessSessionId({
+        ok,
+        reportedSessionId: resultSessionId,
+        previousSessionId: task.harness_session_id,
+        sessionRecoveryAttempted,
+      }),
       finished_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
@@ -673,28 +944,32 @@ async function finalizeAgentTaskConnectorResult(args: {
 
   if (!updated) {
     const current = await getAgentTask(task.user_id, task.id);
-    if (current?.status === "canceled") {
+    if (
+      current &&
+      (current.status === "done" ||
+        current.status === "failed" ||
+        current.status === "canceled")
+    ) {
       if (!ok) {
         await restoreTransfers(admin, args.consumedTransferIds || []).catch(() => {});
       }
       await kickNextQueuedTaskForAgent(current).catch(() => {});
       return {
         task: current,
-        ok: false,
-        resultText: "",
-        error: current.error || "stopped_by_team_member",
+        ok: current.status === "done",
+        resultText: current.result_text || "",
+        error:
+          current.error ||
+          (current.status === "canceled" ? "stopped_by_team_member" : null),
       };
     }
+    if (updateError) {
+      throw new Error(updateError.message);
+    }
+    throw new Error("agent_task_completion_transition_lost");
   }
 
-  const finalTask =
-    (updated as AgentTaskRow | null) ||
-    ({
-      ...task,
-      status: finalStatus,
-      result_text: content,
-      error: ok ? null : errorText || "run_failed",
-    } as AgentTaskRow);
+  const finalTask = updated as AgentTaskRow;
 
   if (!ok) {
     await restoreTransfers(admin, args.consumedTransferIds || []).catch(() => {});
@@ -705,6 +980,7 @@ async function finalizeAgentTaskConnectorResult(args: {
     finalStatus
   ).catch(() => {});
   await appendTaskEventToTeamChat(admin, finalTask, finalStatus).catch(() => {});
+  await scheduleOrchestratorTaskContinuation(finalTask);
   await notifyTaskFinished(finalTask).catch(() => {});
   await kickNextQueuedTaskForAgent(finalTask).catch(() => {});
 
@@ -739,6 +1015,10 @@ export async function runAgentTask(args: {
     .eq("status", "queued")
     .select("*")
     .maybeSingle();
+
+  if (claimError && claimError.code !== "23505") {
+    throw new Error(`agent_task_claim_failed:${claimError.message}`);
+  }
 
   if (!claimed) {
     const existing = await getAgentTask(args.userId, args.taskId);
@@ -795,18 +1075,9 @@ export async function runAgentTask(args: {
     return fail("worker_agent_not_configured");
   }
 
-  // Resolve resume session: prefer the task's own harness session, else the
-  // worker's persistent thread.
-  let sessionId = asString(task.harness_session_id);
-  if (!sessionId) {
-    const { data: thread } = await admin
-      .from("claude_code_cli_threads")
-      .select("claude_session_id")
-      .eq("user_id", task.user_id)
-      .eq("claude_code_agent_id", task.agent_id)
-      .maybeSingle();
-    sessionId = asString((thread as { claude_session_id?: unknown } | null)?.claude_session_id);
-  }
+  // Independent background tasks start a fresh harness conversation. Only a
+  // continuation of this exact task may resume its task-owned session.
+  const sessionId = resolveAgentTaskResumeSessionId(task.harness_session_id);
 
   // Fold in any pending context transfers targeted at this agent.
   const consumedTransfers = await consumePendingTransfers(
@@ -844,7 +1115,11 @@ export async function runAgentTask(args: {
   const taskMeta = (task.result_meta as Record<string, unknown> | null) || {};
   const isConsultationMode = taskMeta.consultation_mode === true;
   const isPlanMode = taskMeta.plan_mode === true;
-  const isReadOnlyMode = isPlanMode || isConsultationMode;
+  const isReadOnlyMode = isAgentTaskReadOnly(taskMeta);
+  const externalAccess =
+    isReadOnlyMode && taskMeta.external_access === "vercel_read"
+      ? "vercel_read"
+      : "none";
   const scheduledModel = asString(taskMeta.scheduled_model);
   const scheduledReasoningEffort = asString(taskMeta.scheduled_reasoning_effort);
 
@@ -875,10 +1150,16 @@ Use concrete evidence. Do not invent files or behavior. Do NOT edit, write, comm
       ? consultationPrompt!
       : isPlanMode
       ? `${promptWithContext}\n\nProduce a concrete, step-by-step implementation plan (markdown, with a short title on the first line). Do NOT make any changes — plan only.`
+      : isReadOnlyMode
+      ? `${promptWithContext}\n\nThis is an enforced read-only task. Inspect and explain, but do not edit, write, install, commit, or otherwise mutate the workspace.`
       : promptWithContext,
     sessionId,
     timeoutMs,
     planMode: isReadOnlyMode,
+    planResponse: isPlanMode,
+    readOnly: isReadOnlyMode,
+    externalAccess,
+    allowedTools: isReadOnlyMode ? "Read,Grep,Glob" : null,
     model: scheduledModel,
     reasoningEffort: scheduledReasoningEffort,
     billingSource: "agent_task",
@@ -902,15 +1183,27 @@ Use concrete evidence. Do not invent files or behavior. Do NOT edit, write, comm
     relay_request_id: prepared.requestId,
     live_status: "running",
     live_text: "",
+    live_text_truncated: false,
     live_tools: [],
+    live_events: [],
+    live_event_count: 0,
+    live_events_truncated: false,
     progress_updated_at: new Date().toISOString(),
     task_run_billing: persistedBilling,
     consumed_transfer_ids: consumedTransferIds,
   };
-  const runningTask =
-    (await updateAgentTask(task.id, {
+  let runningTask: AgentTaskRow;
+  try {
+    const persistedTask = await updateAgentTask(task.id, {
       result_meta: liveTaskMeta,
-    })) || { ...task, result_meta: liveTaskMeta };
+    });
+    if (!persistedTask) {
+      return fail("agent_task_metadata_persist_failed");
+    }
+    runningTask = persistedTask;
+  } catch {
+    return fail("agent_task_metadata_persist_failed");
+  }
 
   const canceledBeforeDispatch = await getAgentTask(task.user_id, task.id);
   if (canceledBeforeDispatch?.status === "canceled") {
@@ -945,7 +1238,10 @@ Use concrete evidence. Do not invent files or behavior. Do NOT edit, write, comm
         deviceId,
         rpcType: "claude_run",
         payload: prepared.payload,
-        timeoutMs: timeoutMs + 30_000,
+        timeoutMs: Math.min(
+          CODE_AGENT_RELAY_TIMEOUT_MS,
+          timeoutMs + 2 * 60 * 1000,
+        ),
         requestId: prepared.requestId,
         taskId: task.id,
         taskMeta: liveTaskMeta,
@@ -1022,6 +1318,7 @@ Use concrete evidence. Do not invent files or behavior. Do NOT edit, write, comm
     userEmail: args.userEmail || null,
     billing: persistedBilling,
     consumedTransferIds,
+    allowTimeoutContinuation: false,
   });
 }
 
@@ -1069,6 +1366,7 @@ export async function completeAgentTaskFromConnector(args: {
     userEmail: args.userEmail || null,
     billing,
     consumedTransferIds,
+    allowTimeoutContinuation: true,
   });
 }
 
@@ -1085,7 +1383,10 @@ async function kickNextQueuedTaskForAgent(finishedTask: AgentTaskRow): Promise<v
     .limit(1)
     .maybeSingle();
   if (!next?.id || !next.user_id) return;
-  kickAgentTask({ taskId: String(next.id), userId: String(next.user_id) });
+  await kickAgentTask({
+    taskId: String(next.id),
+    userId: String(next.user_id),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,15 +1406,27 @@ async function appendTaskEventToOrchestratorSession(
     .eq("id", task.agent_id)
     .maybeSingle();
   const agentName = asString((agent as { name?: unknown } | null)?.name) || "worker agent";
+  const taskMeta =
+    (task.result_meta as Record<string, unknown> | null) || {};
+  const timedOut =
+    taskMeta.timedOut === true ||
+    /\b(?:timed out|time limit|relay_timeout)\b/i.test(task.error || "");
+  const continuationCount = timeoutContinuationCount(taskMeta);
 
   const summary =
     status === "done"
       ? `✅ ${agentName} finished "${task.title || "task"}".`
       : `❌ ${agentName} failed "${task.title || "task"}"${task.error ? `: ${task.error}` : ""}.`;
   const resultPreview = (task.result_text || "").trim();
-  const content = resultPreview
+  const baseContent = resultPreview
     ? `${summary}\n\n${resultPreview.length > 1500 ? `${resultPreview.slice(0, 1500)}\n...[truncated]` : resultPreview}`
     : summary;
+  const content = timedOut
+    ? `${baseContent}
+
+[WORKER TIMEOUT EVENT — ORCHESTRATOR DECISION REQUIRED]
+The worker exhausted ${continuationCount > 0 ? `${continuationCount} automatic same-session continuation attempt${continuationCount === 1 ? "" : "s"}` : "automatic recovery because a same-session continuation could not be started"}. On the next orchestration turn, inspect the partial result and explicitly decide whether to resume/retry, narrow the scope, reassign the work, or report the usable partial result. Do not claim this task completed.`
+    : baseContent;
 
   await admin.from("orchestrator_messages").insert({
     user_id: task.user_id,
@@ -1127,7 +1440,11 @@ async function appendTaskEventToOrchestratorSession(
       agentId: task.agent_id,
       agentName,
       status,
-      diffCount: (task.result_meta as { diffCount?: number } | null)?.diffCount || 0,
+      diffCount:
+        (task.result_meta as { diffCount?: number } | null)?.diffCount || 0,
+      timedOut: timedOut || undefined,
+      requiresOrchestratorDecision: timedOut || undefined,
+      timeoutContinuationCount: timedOut ? continuationCount : undefined,
     },
   });
 
@@ -1148,6 +1465,10 @@ async function appendTaskEventToTeamChat(
   if (!task.requested_channel?.startsWith(prefix)) return;
   const channelId = task.requested_channel.slice(prefix.length).trim();
   if (!channelId) return;
+  const continuationTarget = resolveAgentTaskContinuationTarget(task);
+  const orchestratorFollowupPending =
+    continuationTarget?.kind === "team_chat" &&
+    continuationTarget.channelId === channelId;
 
   // Service-role writes still honor the channel roster: a removed worker may
   // not continue speaking as a channel member after its task completes.
@@ -1186,6 +1507,19 @@ async function appendTaskEventToTeamChat(
     unbounded.length > 40_000
       ? `${unbounded.slice(0, 39_980)}\n...[truncated]`
       : unbounded;
+  const requestedThreadRootId = asString(
+    (task.result_meta as Record<string, unknown> | null)
+      ?.thread_root_message_id,
+  );
+  const { data: threadRoot } = requestedThreadRootId
+    ? await admin
+        .from("chat_messages")
+        .select("id")
+        .eq("id", requestedThreadRootId)
+        .eq("channel_id", channelId)
+        .is("thread_root_message_id", null)
+        .maybeSingle()
+    : { data: null };
 
   const { data: message, error } = await admin
     .from("chat_messages")
@@ -1194,6 +1528,8 @@ async function appendTaskEventToTeamChat(
       author_type: "agent",
       author_agent_id: task.agent_id,
       content,
+      reply_to_message_id: threadRoot?.id || null,
+      thread_root_message_id: threadRoot?.id || null,
       metadata: {
         kind: "agent_task_result",
         task_id: task.id,
@@ -1201,6 +1537,8 @@ async function appendTaskEventToTeamChat(
         agent_name: agentName,
         title: task.title || "Task",
         trace_id: task.trace_id,
+        orchestrator_followup_pending:
+          orchestratorFollowupPending || undefined,
         diff_count:
           (task.result_meta as { diffCount?: number } | null)?.diffCount || 0,
       },
@@ -1215,6 +1553,7 @@ async function appendTaskEventToTeamChat(
     authorType: "agent",
     authorLabel: agentName,
     content,
+    threadRootMessageId: threadRoot?.id || null,
   }).catch((cause) => {
     console.warn("[team-chat] agent completion push delivery failed", {
       channelId,
@@ -1222,6 +1561,26 @@ async function appendTaskEventToTeamChat(
       error: cause instanceof Error ? cause.message : "Unknown push error",
     });
   });
+}
+
+async function scheduleOrchestratorTaskContinuation(
+  task: AgentTaskRow,
+): Promise<void> {
+  try {
+    if (!resolveAgentTaskContinuationTarget(task)) return;
+    const { scheduleOrchestratorAfterAgentTask } = await import(
+      "@/lib/orchestrator/agentTaskContinuation"
+    );
+    scheduleOrchestratorAfterAgentTask(task.id, task.user_id);
+  } catch (error) {
+    // Completion delivery is durable even if the controller continuation
+    // cannot be scheduled. Keep the task terminal and make the failure visible
+    // in server logs so a later retry can safely resume it.
+    console.error("[agentTasks] could not schedule orchestrator continuation", {
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 /**
@@ -1383,7 +1742,11 @@ export async function rejectAgentTask(args: {
     .eq("status", "awaiting_approval")
     .select("*")
     .maybeSingle();
-  return (data as AgentTaskRow | null) || null;
+  const task = (data as AgentTaskRow | null) || null;
+  if (task) {
+    await scheduleOrchestratorTaskContinuation(task);
+  }
+  return task;
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,10 +1805,16 @@ export async function executeAgentTaskCommand(args: {
     if (!approved) {
       return { handled: true, reply: "That task is no longer awaiting approval." };
     }
-    kickAgentTask({ taskId: task.id, userId: args.userId });
+    const started = await kickAgentTask({
+      taskId: task.id,
+      userId: args.userId,
+    });
     return {
       handled: true,
-      reply: `Approved — "${task.title || "task"}" is running. I'll message you when it finishes.`,
+      reply:
+        started.status === "failed"
+          ? `Approved, but "${task.title || "task"}" could not start: ${started.error || "unknown error"}.`
+          : `Approved — "${task.title || "task"}" is queued. I'll message you when it finishes.`,
     };
   }
 
@@ -1609,7 +1978,7 @@ export async function runScheduledWorkerJob(args: {
 
   const timeoutMs = Math.min(
     Math.max(30_000, Math.trunc(args.workerTimeoutMs || AGENT_TASK_DEFAULT_TIMEOUT_MS)),
-    AGENT_TASK_MAX_TIMEOUT_MS
+    SCHEDULED_AGENT_TASK_MAX_TIMEOUT_MS
   );
 
   const outcome: RunAgentTaskResult =
@@ -1865,68 +2234,79 @@ async function restoreTransfers(admin: SupabaseClient, ids: string[]): Promise<v
 export const AGENT_TASK_RUN_SCOPE = "agent_task_run";
 
 /**
- * Fire-and-forget execution kick.
+ * Deliver a task to the durable run endpoint and read back its durable state.
  *
- * The task always executes inside the durable run endpoint's OWN invocation
- * (it 202s immediately and runs the task in its `after()` with maxDuration
- * 800). Never run the task inline here — the kicking route (task create,
- * approvals, webhooks) has no such budget and the platform would kill the
- * run mid-flight, stranding the task in `running`.
+ * This does not wait for the worker itself. The endpoint normally waits for
+ * relay acceptance, but a lost HTTP response is inherently ambiguous. In that
+ * case return the persisted task instead of throwing and encouraging a retry
+ * that could duplicate already-running work; the reconciler re-drives tasks
+ * that are still queued.
  */
-export function kickAgentTask(args: {
+export async function kickAgentTask(args: {
   taskId: string;
   userId: string;
   userEmail?: string | null;
   /** Prefer the origin of the request that created/approved the task. */
   baseUrl?: string | null;
-}): void {
-  const fire = async () => {
+}): Promise<AgentTaskRow> {
+  const baseUrl =
+    (args.baseUrl || "").trim() ||
+    getAppUrl();
+  const headers = buildInternalRouteAuthHeaders({
+    userId: args.userId,
+    scope: AGENT_TASK_RUN_SCOPE,
+  });
+  let deliveryError: string | null = null;
+
+  if (!headers["x-groovy-internal-auth"]) {
+    deliveryError = "agent_task_kick_auth_unavailable";
+  } else {
     try {
-      const baseUrl =
-        (args.baseUrl || "").trim() ||
-        getAppUrl();
-      const headers = buildInternalRouteAuthHeaders({
-        userId: args.userId,
-        scope: AGENT_TASK_RUN_SCOPE,
-      });
-      if (!headers["x-groovy-internal-auth"]) {
-        console.warn(
-          "[agentTasks] kick skipped: internal auth unavailable (RELAY_JWT_SECRET unset) — task will be picked up by the reconciler"
-        );
-        return;
-      }
-      // The endpoint responds 202 immediately; awaiting it only waits for
-      // delivery, not for the run.
-      const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/agents/tasks/run`, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...headers },
-        body: JSON.stringify({ taskId: args.taskId, userEmail: args.userEmail || null }),
-      });
-      if (!res.ok) {
-        console.warn(`[agentTasks] kick delivery failed: HTTP ${res.status}`);
+      // The endpoint waits for relay acceptance, not for the worker to finish.
+      const res = await fetch(
+        `${baseUrl.replace(/\/+$/, "")}/api/agents/tasks/run`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", ...headers },
+          body: JSON.stringify({
+            taskId: args.taskId,
+            userEmail: args.userEmail || null,
+          }),
+        }
+      );
+      const payload = (await res.json().catch(() => null)) as {
+        ok?: unknown;
+        error?: unknown;
+      } | null;
+      if (!res.ok || payload?.ok !== true) {
+        const detail =
+          typeof payload?.error === "string" && payload.error.trim()
+            ? payload.error.trim()
+            : `HTTP ${res.status}`;
+        deliveryError = `agent_task_kick_failed:${detail}`;
       }
     } catch (error) {
-      console.warn(
-        "[agentTasks] detached kick failed:",
+      // A lost response is ambiguous: the run endpoint may already have
+      // handed the task to the connector. Never surface a create/approve
+      // failure that encourages the caller to duplicate durable work.
+      deliveryError = `agent_task_kick_unconfirmed:${
         error instanceof Error ? error.message : String(error)
-      );
+      }`;
     }
-  };
+  }
 
-  // Prefer after() so the kick survives the response flush; fall back to an
-  // immediate detached fire in non-request contexts.
-  import("next/server")
-    .then((mod) => {
-      const after = (mod as { after?: (fn: () => void | Promise<void>) => void }).after;
-      if (typeof after === "function") {
-        after(fire);
-      } else {
-        void fire();
-      }
-    })
-    .catch(() => {
-      void fire();
+  const task = await getAgentTask(args.userId, args.taskId);
+  if (!task) {
+    throw new Error("agent_task_kick_state_unavailable");
+  }
+  if (deliveryError) {
+    console.warn("[agentTasks] task kick was not confirmed", {
+      taskId: args.taskId,
+      status: task.status,
+      error: deliveryError,
     });
+  }
+  return task;
 }
 
 /**
@@ -1947,17 +2327,29 @@ export async function reconcileStaleAgentTasks(userId?: string): Promise<{
   {
     let query = admin
       .from("agent_tasks")
-      .update({
-        status: "failed",
-        error: "runner_lost",
-        finished_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      .select("*")
       .eq("status", "running")
       .lt("updated_at", staleRunningCutoff);
     if (userId) query = query.eq("user_id", userId);
-    const { data } = await query.select("id");
-    failed = (data || []).length;
+    const { data } = await query.limit(50);
+    for (const row of data || []) {
+      const task = row as AgentTaskRow;
+      const consumedTransferIds = Array.isArray(
+        task.result_meta?.consumed_transfer_ids,
+      )
+        ? task.result_meta.consumed_transfer_ids
+            .map((value) => asString(value))
+            .filter((value): value is string => !!value)
+        : [];
+      const outcome = await failClaimedAgentTask({
+        task,
+        error: "runner_lost",
+        consumedTransferIds,
+      });
+      if (outcome.task.status === "failed" && outcome.error === "runner_lost") {
+        failed += 1;
+      }
+    }
   }
 
   // Re-kick queued tasks whose original kick never landed (lost fetch,
@@ -1973,8 +2365,20 @@ export async function reconcileStaleAgentTasks(userId?: string): Promise<{
     const { data } = await query.limit(20);
     for (const row of data || []) {
       const task = row as { id: string; user_id: string };
-      kickAgentTask({ taskId: task.id, userId: task.user_id });
-      requeued += 1;
+      try {
+        const kicked = await kickAgentTask({
+          taskId: task.id,
+          userId: task.user_id,
+        });
+        if (kicked.status === "queued" || kicked.status === "running") {
+          requeued += 1;
+        }
+      } catch (error) {
+        console.warn(
+          "[agentTasks] reconciler kick failed:",
+          error instanceof Error ? error.message : String(error)
+        );
+      }
     }
   }
 

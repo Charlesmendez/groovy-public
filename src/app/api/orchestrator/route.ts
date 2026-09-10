@@ -9,12 +9,16 @@ import { streamText, stepCountIs, type ModelMessage, type UserContent } from "ai
 import type { SharedV3ProviderOptions } from "@ai-sdk/provider";
 import { embedText, embeddingToVectorLiteral } from "@/lib/ai/embeddings";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+import { acquireTurnLock } from "@/lib/teamChat";
 import {
   resolveChatModel,
   type ProviderId,
   getAnthropicContextProviderOptions,
   getModelContextBudget,
+  getOrchestratorAnthropicModel,
   getOrchestratorAgentSdkFallbackModel,
+  getOrchestratorOpenAiModel,
 } from "@/lib/ai/modelResolver";
 import { resolveKeys, buildToolApiKeys } from "@/lib/keys/resolveKeyMode";
 import { resolveOrchestratorModelOverride } from "@/lib/orchestrator/orchestratorModel";
@@ -68,6 +72,7 @@ import {
   normalizeConnectorPlatform,
   type ConnectorClientPlatform,
 } from "@/lib/connector/platform";
+import { resolveUserDeviceId } from "@/lib/devices/resolveUserDeviceId";
 import {
   getOrCreateWorkspaceIdForUser,
   getWorkspaceCapabilityOwnerUserId,
@@ -80,13 +85,14 @@ import {
 import { estimateTokensFromCostUsd, normalizeTokenUsage } from "@/lib/billing/usage";
 import { preflightGroovyUsage, settleGroovyUsageDebitBestEffort } from "@/lib/billing/guard";
 import {
+  normalizeUsageChargeType,
   usageChargeTypeForKeyMode,
 } from "@/lib/billing/pricing";
 import { getEnterpriseDemoConfig } from "@/lib/enterpriseDemo";
 import {
-  buildAssignedSkillsPromptContext,
-  preflightAgentSkills,
+  listAssignedSkillsCatalogForUser,
 } from "@/lib/skills-manager/service";
+import { buildAssignedSkillsCatalogPrompt } from "@/lib/skills-manager/assignedSkills";
 import { decryptTelegramBotToken } from "@/lib/telegram/botToken";
 import {
   addAnthropicNativeWebSearchTool,
@@ -94,6 +100,12 @@ import {
   isAnthropicNativeWebSearchEnabled,
   isWebSearchToolName,
 } from "@/lib/orchestrator/anthropicWebSearch";
+import {
+  assertUsableModelRound,
+  EmptyModelResponseError,
+  ModelStreamCompletionError,
+  modelStreamEventError,
+} from "@/lib/orchestrator/modelStreamReliability";
 
 // Keep orchestrator rounds alive for long data/browser workflows on Vercel.
 export const runtime = "nodejs";
@@ -486,6 +498,12 @@ function summarizeFilesForLog(files: unknown): Array<Record<string, unknown>> {
 }
 
 function isRetryableAgentSdkError(err: unknown): boolean {
+  if (
+    err instanceof EmptyModelResponseError ||
+    err instanceof ModelStreamCompletionError
+  ) {
+    return true;
+  }
   const message = formatOrchestratorError(err).toLowerCase();
 
   // Deterministic/configuration failures should fail fast with exact error.
@@ -701,41 +719,7 @@ export async function POST(req: Request) {
 
   let deviceId = await resolveOwnedDeviceId(requestedDeviceId);
   if (!deviceId) {
-    // Fallback 1: user's preferred connector device from onboarding preferences.
-    try {
-      const { data: prefs } = await supabase
-        .from("user_preferences")
-        .select("onboarding_data")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      const onboardingData =
-        prefs?.onboarding_data && typeof prefs.onboarding_data === "object"
-          ? (prefs.onboarding_data as Record<string, unknown>)
-          : null;
-      const preferredRaw =
-        onboardingData && typeof onboardingData.connectorDeviceId === "string"
-          ? onboardingData.connectorDeviceId.trim()
-          : "";
-      deviceId = await resolveOwnedDeviceId(preferredRaw || null);
-    } catch {
-      // ignore preference fallback failures
-    }
-  }
-  if (!deviceId) {
-    // Fallback 2: latest owned connector device.
-    try {
-      const { data: latest } = await supabase
-        .from("devices")
-        .select("id")
-        .eq("user_id", user.id)
-        .order("last_seen", { ascending: false, nullsFirst: false })
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      deviceId = latest?.id ? String(latest.id) : null;
-    } catch {
-      deviceId = null;
-    }
+    deviceId = await resolveUserDeviceId(supabase, user.id);
   }
 
   const hasAnyHistory = history.length > 0;
@@ -798,13 +782,20 @@ export async function POST(req: Request) {
   if (sessionId) {
     const { data: sessionRow, error: sessionProfileError } = await supabase
       .from("orchestrator_sessions")
-      .select("profile_id")
+      .select("id,profile_id")
       .eq("id", sessionId)
+      .eq("user_id", user.id)
       .maybeSingle();
     if (sessionProfileError) {
       return NextResponse.json(
         { error: "Could not resolve the profile bound to this session." },
         { status: 500 },
+      );
+    }
+    if (!sessionRow?.id) {
+      return NextResponse.json(
+        { error: "The selected orchestrator session does not exist." },
+        { status: 404 },
       );
     }
     sessionProfileId = (sessionRow?.profile_id as string | null) ?? null;
@@ -1196,6 +1187,18 @@ export async function POST(req: Request) {
     queryText: routingText,
     recentTexts: buildExtensionSelectionRecentTexts(history),
   }).filter((tool) => isToolAllowed(tool.toolName, toolPolicy));
+  const assignedSkillsCatalog = await listAssignedSkillsCatalogForUser({
+    userId: user.id,
+    agentId: effectiveAgentId,
+    profileId: harnessProfile?.id || null,
+    target: "flow",
+  }).catch((error) => {
+    console.warn(
+      "[orchestrator] skills catalog unavailable:",
+      error instanceof Error ? error.message : String(error),
+    );
+    return { items: [], artifactCount: 0 };
+  });
 
   let telegramBotToken: string | undefined;
   try {
@@ -1226,6 +1229,15 @@ export async function POST(req: Request) {
     obsidianVaultPath,
     directAgent: parsed.directAgent,
     orchestratorAgentId: effectiveAgentId,
+    assignedSkillScope:
+      assignedSkillsCatalog.artifactCount > 0
+        ? {
+            agentId: effectiveAgentId,
+            profileId: harnessProfile?.id || null,
+            additionalArtifactIds: [],
+            target: "flow",
+          }
+        : undefined,
     branchControllerMode: branchControllerSettings.mode,
     branchControllerMaxBranches: branchControllerSettings.maxBranches,
     branchControllerMaxTurnsPerBranch: branchControllerSettings.maxTurnsPerBranch,
@@ -1329,34 +1341,10 @@ export async function POST(req: Request) {
   // Append per-turn dynamic sections to dynamicContext
   const extraDynamic: string[] = [];
 
-  if (deviceId) {
-    await preflightAgentSkills({
-      deviceId,
-      agentId: effectiveAgentId,
-      profileId: harnessProfile?.id || null,
-      target: "flow",
-    }).catch((error) => {
-      console.warn(
-        "[orchestrator] skills preflight failed:",
-        error instanceof Error ? error.message : String(error)
-      );
-    });
-  }
-  const skillsPromptContext = await buildAssignedSkillsPromptContext({
-    deviceId: deviceId || "",
-    agentId: effectiveAgentId,
-    profileId: harnessProfile?.id || null,
-    target: "flow",
-  }).catch((error) => {
-    console.warn(
-      "[orchestrator] skills context unavailable:",
-      error instanceof Error ? error.message : String(error)
-    );
-    return { text: "", artifactCount: 0 };
-  });
-  if (skillsPromptContext.text) {
-    extraDynamic.push(`\n\n${skillsPromptContext.text}`);
-  }
+  const skillsCatalogPrompt = buildAssignedSkillsCatalogPrompt(
+    assignedSkillsCatalog.items,
+  );
+  if (skillsCatalogPrompt) extraDynamic.push(`\n\n${skillsCatalogPrompt}`);
 
   if (codeSessions.length > 0) {
     extraDynamic.push(`\n\n## CODE (Claude Code CLI)\nThe user has ${codeSessions.length} Code session(s) configured in the dashboard:\n${codeSessions
@@ -1579,6 +1567,11 @@ For browser work in this turn, use browser_task instead of the low-level browser
       const lvl1 = asRecord(outer?.result);
       const lvl2 = asRecord(lvl1?.result);
       const candidates = [outer, lvl1, lvl2];
+      const resultMetaCandidates = [
+        asRecord(outer?.meta),
+        asRecord(lvl1?.meta),
+        asRecord(lvl2?.meta),
+      ];
 
       // Prefer explicit tokens if present.
       const usageCandidate =
@@ -1605,6 +1598,11 @@ For browser work in this turn, use browser_task instead of the low-level browser
       const explicitChargeType = pickString(candidates, "billing_charge_type");
       const authOrigin = pickString(candidates, "billing_auth_origin");
       const authMethod = pickString(candidates, "billing_auth_method");
+      const playwrightDriver = pickString(resultMetaCandidates, "playwrightDriver");
+      const requestedPlaywrightDriver = pickString(
+        resultMetaCandidates,
+        "requestedPlaywrightDriver"
+      );
       const modelForEstimation =
         modelFromPayload || getOrchestratorAgentSdkFallbackModel();
 
@@ -1644,8 +1642,18 @@ For browser work in this turn, use browser_task instead of the low-level browser
       }
 
       const source = toolName === "code_cli_run" ? "connector_code_cli" : "connector_browser_task";
-      const connectorChargeType = connectorClaudeChargeType;
-      const connectorBillable = true;
+      const connectorChargeType =
+        explicitChargeType === "groovy_key" ||
+        explicitChargeType === "external_key_fee" ||
+        explicitChargeType === "no_charge"
+          ? normalizeUsageChargeType(explicitChargeType)
+          : connectorClaudeChargeType;
+      const connectorProvider: ProviderId =
+        authMethod === "local_codex_login" || /^gpt-|^o[13](?:-|$)/i.test(modelFromPayload || "")
+          ? "openai"
+          : "anthropic";
+      const connectorHarness = connectorProvider === "openai" ? "codex" : "claude";
+      const connectorBillable = connectorChargeType !== "no_charge";
       const usageForBilling = normalizedUsage ?? { inputTokens, outputTokens, totalTokens };
       const meta = {
         toolName,
@@ -1655,6 +1663,9 @@ For browser work in this turn, use browser_task instead of the low-level browser
         request_trace_id: traceId,
         authOrigin,
         authMethod,
+        playwrightDriver,
+        requestedPlaywrightDriver,
+        codeCliProvider: connectorHarness,
         echoedChargeType: explicitChargeType,
         chargeType: connectorChargeType,
       };
@@ -1667,8 +1678,9 @@ For browser work in this turn, use browser_task instead of the low-level browser
         traceId: tr.toolCallId,
         source,
         spanId: "main",
-        provider: "anthropic",
+        provider: connectorProvider,
         model: modelFromPayload || null,
+        harness: connectorHarness,
         inputTokens,
         outputTokens,
         totalTokens,
@@ -1957,7 +1969,10 @@ For browser work in this turn, use browser_task instead of the low-level browser
   const getProviderOptionsForModel = (
     candidateModelName: string
   ): SharedV3ProviderOptions | undefined => {
-    const effort = orchestratorModelOverride?.reasoningEffort;
+    const effort =
+      candidateModelName === modelName
+        ? orchestratorModelOverride?.reasoningEffort
+        : null;
     if (provider === "openai" && effort) {
       return {
         openai: {
@@ -2142,6 +2157,21 @@ For browser work in this turn, use browser_task instead of the low-level browser
       hasServerAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
     })
   );
+
+  // Serialize dashboard model rounds with Team Chat turns and asynchronous
+  // worker-completion continuations for the same orchestrator session.
+  const dashboardTurnLock = sessionId
+    ? await acquireTurnLock(createSupabaseAdminClient(), sessionId)
+    : null;
+  if (sessionId && !dashboardTurnLock) {
+    return NextResponse.json(
+      {
+        error:
+          "This orchestrator is already handling another message or worker result. Try again shortly.",
+      },
+      { status: 409 },
+    );
+  }
 
   if (shouldUseAgentSdk && hasSdkApiKey) {
     console.log(
@@ -2649,6 +2679,8 @@ For browser work in this turn, use browser_task instead of the low-level browser
           let sdkResult: Awaited<ReturnType<typeof runAgentSdkOrchestrator>> | null = null;
           let finalSdkError: string | null = null;
           for (let attempt = 1; attempt <= maxAgentSdkAttempts; attempt++) {
+            const toolCallsBeforeAttempt = toolCallsExecuted.length;
+            const streamedTextLengthBeforeAttempt = streamedText.length;
             try {
               sdkResult = await runAgentSdkOrchestrator({
                 systemPrompt: sdkSystemPrompt,
@@ -2690,6 +2722,10 @@ For browser work in this turn, use browser_task instead of the low-level browser
                   },
                 },
               });
+              assertUsableModelRound({
+                text: sdkResult.text || "",
+                connectorExecuteCount: needsClientContinuation ? 1 : 0,
+              });
               if (attempt > 1) {
                 console.log(
                   "[orchestrator] agent_sdk_retry_succeeded",
@@ -2705,7 +2741,15 @@ For browser work in this turn, use browser_task instead of the low-level browser
               const errorMessage = formatOrchestratorError(sdkErr);
               finalSdkError = errorMessage;
               const retryable = isRetryableAgentSdkError(sdkErr);
-              const canRetry = retryable && attempt < maxAgentSdkAttempts;
+              const hadToolCallsThisAttempt =
+                toolCallsExecuted.length > toolCallsBeforeAttempt;
+              const emittedTextThisAttempt =
+                streamedText.length > streamedTextLengthBeforeAttempt;
+              const canRetry =
+                retryable &&
+                !hadToolCallsThisAttempt &&
+                !emittedTextThisAttempt &&
+                attempt < maxAgentSdkAttempts;
               console.error(
                 "[orchestrator-agent-sdk-attempt-error]",
                 JSON.stringify({
@@ -2713,6 +2757,8 @@ For browser work in this turn, use browser_task instead of the low-level browser
                   attempt,
                   maxAgentSdkAttempts,
                   retryable,
+                  hadToolCallsThisAttempt,
+                  emittedTextThisAttempt,
                   error: errorMessage,
                 })
               );
@@ -2791,7 +2837,6 @@ For browser work in this turn, use browser_task instead of the low-level browser
               );
             }
           }
-
           if (billingWorkspaceId) {
             insertBillingUsageEventBestEffort({
               workspaceId: billingWorkspaceId,
@@ -2964,6 +3009,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
         } finally {
           streamClosed = true;
           toolStreamEmitter = null;
+          await dashboardTurnLock?.release();
           controller.close();
         }
       },
@@ -3026,16 +3072,21 @@ For browser work in this turn, use browser_task instead of the low-level browser
   };
 
   const buildLegacySystemMessages = (candidateModelName: string) => {
+    const isRecoveryModel = candidateModelName !== modelName;
     const runtimeIdentity = buildOrchestratorRuntimeIdentityPrompt({
       provider,
       modelName: candidateModelName,
-      reasoningEffort: orchestratorModelOverride?.reasoningEffort,
+      reasoningEffort: isRecoveryModel
+        ? null
+        : orchestratorModelOverride?.reasoningEffort,
       engine: "ai-sdk",
-      selectionSource: harnessProfile?.model
-        ? "profile"
-        : orchestratorModelOverride
-          ? "user-selected"
-          : "automatic-default",
+      selectionSource: isRecoveryModel
+        ? "automatic-default"
+        : harnessProfile?.model
+          ? "profile"
+          : orchestratorModelOverride
+            ? "user-selected"
+            : "automatic-default",
     });
     return provider === "anthropic"
       ? [
@@ -3289,14 +3340,18 @@ For browser work in this turn, use browser_task instead of the low-level browser
         );
         
         const legacyModelCandidates = (() => {
-          if (provider !== "anthropic") return [modelName];
           const candidates = [modelName];
-          const normalizedModel = modelName.toLowerCase();
-          // Opus overloads are common under high traffic; retry once on Sonnet.
-          if (normalizedModel.includes("opus")) {
-            candidates.push("claude-sonnet-4.6");
-          } else if (normalizedModel.includes("sonnet-4.6")) {
-            candidates.push("claude-sonnet-4.5");
+          if (provider === "anthropic") {
+            const normalizedModel = modelName.toLowerCase();
+            // Opus overloads are common under high traffic; retry once on Sonnet.
+            if (normalizedModel.includes("opus")) {
+              candidates.push("claude-sonnet-4.6");
+            } else if (normalizedModel.includes("sonnet-4.6")) {
+              candidates.push("claude-sonnet-4.5");
+            }
+            candidates.push(getOrchestratorAnthropicModel());
+          } else if (provider === "openai") {
+            candidates.push(getOrchestratorOpenAiModel());
           }
           return candidates.filter(
             (candidate, idx, arr) => arr.indexOf(candidate) === idx
@@ -3322,6 +3377,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
         let legacySuccessfulModelName = modelName;
         for (let attempt = 1; attempt <= legacyModelCandidates.length; attempt++) {
           const attemptModelName = legacyModelCandidates[attempt - 1] || modelName;
+          const textLengthBeforeAttempt = legacyAccumulatedText.length;
           const toolCallsBeforeAttempt = toolCallsExecuted.length;
           let emittedMeaningfulSseThisAttempt = false;
           let sawToolCallThisAttempt = false;
@@ -3339,7 +3395,16 @@ For browser work in this turn, use browser_task instead of the low-level browser
 
             const result = createLegacyResult(attemptModelName);
             for await (const event of result.fullStream) {
-              if (event.type === "text-delta") {
+              if (event.type === "error") {
+                throw modelStreamEventError(event.error);
+              } else if (event.type === "abort") {
+                throw new Error(event.reason || "The model stream was aborted.");
+              } else if (
+                (event.type === "finish" || event.type === "finish-step") &&
+                event.finishReason === "error"
+              ) {
+                throw new ModelStreamCompletionError(event.finishReason);
+              } else if (event.type === "text-delta") {
                 legacyAccumulatedText += event.text;
                 emittedMeaningfulSseThisAttempt = true;
                 if (!sawToolCallThisAttempt && !loggedPreToolTextThisAttempt && event.text.trim()) {
@@ -3661,6 +3726,10 @@ For browser work in this turn, use browser_task instead of the low-level browser
             }
           }
             }
+            assertUsableModelRound({
+              text: legacyAccumulatedText.slice(textLengthBeforeAttempt),
+              connectorExecuteCount: needsClientContinuation ? 1 : 0,
+            });
             legacyStreamSucceeded = true;
             legacySuccessfulModelName = attemptModelName;
             break;
@@ -3670,7 +3739,6 @@ For browser work in this turn, use browser_task instead of the low-level browser
             const hadToolCallsThisAttempt =
               toolCallsExecuted.length > toolCallsBeforeAttempt;
             const canRetry =
-              retryable &&
               !hadToolCallsThisAttempt &&
               !emittedMeaningfulSseThisAttempt &&
               attempt < legacyModelCandidates.length;
@@ -3696,8 +3764,8 @@ For browser work in this turn, use browser_task instead of the low-level browser
             const backoffMs = computeExponentialBackoffMs(attempt);
             emitActivity(
               "system",
-              "Model overloaded",
-              `Attempt ${attempt}/${legacyModelCandidates.length} failed. Retrying in ${backoffMs}ms...`,
+                retryable ? "Model temporarily unavailable" : "Recovering model call",
+                `Attempt ${attempt}/${legacyModelCandidates.length} failed. Retrying with a stable model in ${backoffMs}ms...`,
               "running"
             );
             await sleepMs(backoffMs);
@@ -3795,6 +3863,7 @@ For browser work in this turn, use browser_task instead of the low-level browser
       } finally {
         streamClosed = true;
         toolStreamEmitter = null;
+        await dashboardTurnLock?.release();
         controller.close();
       }
     },

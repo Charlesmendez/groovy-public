@@ -2,6 +2,27 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { createHmac, randomUUID, timingSafeEqual } from "crypto";
 import crypto from "crypto";
+import {
+  requireHttpOrigin,
+  resolveAgentTaskCompletionUrl,
+} from "./agentTaskCompletionUrl.mjs";
+import { scheduledJobManualRunDeviceDecision } from "./scheduledJobManualRun.mjs";
+import {
+  relayExecutableScheduledJobs,
+  scheduledJobRelayExecutionDenialReason,
+} from "./scheduledJobSafety.mjs";
+import {
+  deliverOrDeferWorkspacePickResult,
+  detachWorkspacePickBrowser,
+  rebindWorkspacePickBrowser,
+  WORKSPACE_PICK_CONNECTOR_TIMEOUT_MS,
+  WORKSPACE_PICK_RESULT_REPLAY_TTL_MS,
+} from "./workspacePickRequest.mjs";
+import {
+  handlePrivateLiveVoiceProxy,
+  isPrivateLiveVoiceRequest,
+  normalizePrivateLiveVoiceProvider,
+} from "./privateLiveVoiceProxy.mjs";
 
 const SUPABASE_URL =
   process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -20,7 +41,9 @@ const CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN =
 if (!CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN) {
   throw new Error("Missing GROOVY_APP_URL");
 }
-const AGENT_TASK_COMPLETION_ORIGIN = new URL(CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN).origin;
+const AGENT_TASK_COMPLETION_ORIGIN = requireHttpOrigin(
+  CONFIGURED_AGENT_TASK_COMPLETION_ORIGIN,
+);
 
 if (!SUPABASE_URL) throw new Error("Missing SUPABASE_URL");
 if (!SUPABASE_ANON_KEY) throw new Error("Missing SUPABASE_ANON_KEY");
@@ -35,9 +58,32 @@ const INTERNAL_AUTH_HEADER = "x-groovy-internal-auth";
 const RELAY_CONNECTOR_RPC_SCOPE = "relay_connector_rpc";
 const RELAY_AIYRA_RUNTIME_SCOPE = "relay_aiyra_runtime";
 const AGENT_TASK_COMPLETE_SCOPE = "agent_task_complete";
+const CONNECTOR_CALLBACK_ACK_MIN_VERSION = "0.24.21";
+const CONNECTOR_START_ACK_TIMEOUT_MS = 10_000;
 
 function trimmed(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function parseSemverTriplet(value) {
+  const normalized = trimmed(value)
+    .replace(/^v/i, "")
+    .split("-", 1)[0];
+  const parts = normalized.split(".");
+  return [0, 1, 2].map((index) => {
+    const parsed = Number(parts[index] || "0");
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  });
+}
+
+function connectorVersionAtLeast(value, minimum) {
+  const current = parseSemverTriplet(value);
+  const required = parseSemverTriplet(minimum);
+  for (let index = 0; index < 3; index += 1) {
+    if (current[index] > required[index]) return true;
+    if (current[index] < required[index]) return false;
+  }
+  return true;
 }
 
 function signInternalScope(scope, userId, ts) {
@@ -77,21 +123,6 @@ function buildInternalRouteAuthHeaders(userId, scope) {
       ts
     )}`,
   };
-}
-
-function normalizeAgentTaskCompletionUrl(value) {
-  const raw = trimmed(value);
-  if (!raw) return "";
-  try {
-    const url = new URL(raw);
-    if (url.origin !== AGENT_TASK_COMPLETION_ORIGIN) return "";
-    if (url.pathname !== "/api/agents/tasks/complete") return "";
-    url.search = "";
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return "";
-  }
 }
 
 function readJsonBody(req) {
@@ -552,6 +583,66 @@ async function persistAiyraVoiceHealthSnapshot({ deviceId, userId, health }) {
   } catch (err) {
     console.warn(
       "[relay] aiyra voice health persist error:",
+      err instanceof Error ? err.message : String(err)
+    );
+  }
+}
+
+async function persistVoiceHealthSnapshot({ deviceId, userId, health }) {
+  if (!deviceId || !userId || !health || typeof health !== "object") return;
+
+  const provider =
+    health.provider === "aiyra"
+      ? "aiyra"
+      : normalizePrivateLiveVoiceProvider(health.provider) || "none";
+  const status = ["healthy", "degraded", "recovering", "disabled", "unknown"].includes(
+    health.status
+  )
+    ? health.status
+    : "unknown";
+  const metrics =
+    health.metrics && typeof health.metrics === "object" && !Array.isArray(health.metrics)
+      ? health.metrics
+      : {};
+
+  try {
+    const res = await supabaseService(
+      "/rest/v1/connector_voice_health?on_conflict=device_id",
+      {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({
+          device_id: deviceId,
+          user_id: userId,
+          provider,
+          status,
+          listening: health.listening === true,
+          active: health.active === true,
+          wake_word: truncateText(health.wake_word, 160),
+          detail: truncateText(health.detail, 4000),
+          metrics,
+          last_healthy_at:
+            typeof health.last_healthy_at === "string" ? health.last_healthy_at : null,
+          last_failure_at:
+            typeof health.last_failure_at === "string" ? health.last_failure_at : null,
+          updated_at:
+            typeof health.updated_at === "string"
+              ? health.updated_at
+              : new Date().toISOString(),
+        }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(
+        "[relay] failed to persist provider-neutral voice health:",
+        truncateText(deviceId, 128) || "unknown_device",
+        truncateText(body, 500) || "unknown_error"
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "[relay] provider-neutral voice health persist error:",
       err instanceof Error ? err.message : String(err)
     );
   }
@@ -1208,6 +1299,19 @@ async function canUseDevice(userId, deviceId) {
   const owner = userByDevice.get(deviceId);
   if (owner && owner === userId) return true;
 
+  // Internal RPC requests do not share the connector WebSocket's in-process
+  // auth context. Revalidate ordinary local-device ownership from Supabase so
+  // a server-side Team Chat action can reach the same connector the browser
+  // already sees online. Hosted workspace devices retain the membership path
+  // below. This query never grants access across users.
+  const ownedRes = await supabaseService(
+    `/rest/v1/devices?id=eq.${encodeURIComponent(deviceId)}&user_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`
+  );
+  if (ownedRes.ok) {
+    const ownedRows = await ownedRes.json().catch(() => []);
+    if (Array.isArray(ownedRows) && ownedRows.length > 0) return true;
+  }
+
   const res = await supabaseService(
     `/rest/v1/hosted_devices?device_id=eq.${deviceId}&select=workspace_id&limit=1`
   );
@@ -1355,7 +1459,7 @@ async function persistClaudeRunResult({
       ? resultPayload.session_id.trim()
       : null;
 
-  if (sessionId) {
+  if (sessionId && resultPayload?.ok === true) {
     try {
       const res = await supabaseService(
         "/rest/v1/claude_code_cli_threads?on_conflict=user_id,claude_code_agent_id",
@@ -1380,6 +1484,37 @@ async function persistClaudeRunResult({
       }
     } catch (err) {
       console.error("[relay] failed to persist claude session_id:", err?.message || err);
+    }
+  } else if (
+    resultPayload?.session_recovery_attempted === true &&
+    pending?.resumeSessionId
+  ) {
+    try {
+      const query =
+        `/rest/v1/claude_code_cli_threads?user_id=eq.${encodeURIComponent(pending.userId)}` +
+        `&claude_code_agent_id=eq.${encodeURIComponent(pending.agentId)}` +
+        `&claude_session_id=eq.${encodeURIComponent(pending.resumeSessionId)}`;
+      const res = await supabaseService(query, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          claude_session_id: null,
+          updated_at: new Date().toISOString(),
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.error(
+          "[relay] failed to clear discarded claude session_id:",
+          res.status,
+          body || "(empty body)",
+        );
+      }
+    } catch (err) {
+      console.error(
+        "[relay] failed to clear discarded claude session_id:",
+        err?.message || err,
+      );
     }
   }
 
@@ -1422,6 +1557,7 @@ const healthByDevice = new Map(); // deviceId -> { whatsapp: { status, ... } }
 const sessionInfo = new WeakMap(); // ws -> { kind, userId?, deviceId? }
 
 const pendingRequests = new Map(); // requestId -> { type, browserWs, browserInstanceId?, persistResult?, userId, deviceId, terminalId?, timeoutId?, rpcType? }
+const recoveringAgentTaskResults = new Map(); // userId/deviceId/requestId -> Promise<boolean>
 const terminalSubs = new Map(); // terminalId -> Set<browserWs>
 const terminalOwner = new Map(); // terminalId -> { deviceId, connectorWs, persist, connected }
 const terminalCloseTimers = new Map(); // terminalId -> timeoutId
@@ -1434,7 +1570,36 @@ const AIYRA_RUNTIME_IDLE_CLOSE_MS = 30 * 60 * 1000;
 const AIYRA_RUNTIME_CONNECT_TIMEOUT_MS = 15_000;
 const AGENT_TASK_LIVE_TEXT_MAX_CHARS = 60_000;
 const AGENT_TASK_LIVE_TOOLS_MAX = 24;
+const AGENT_TASK_LIVE_EVENTS_MAX = 250;
+const AGENT_TASK_LIVE_EVENTS_MAX_CHARS = 60_000;
 const AGENT_TASK_PROGRESS_FLUSH_MS = 500;
+
+function settleAgentTaskStartAck(pending, accepted) {
+  if (!pending || pending.startAckSettled === true) return;
+  pending.startAckSettled = true;
+  if (pending.startAckTimeoutId) {
+    clearTimeout(pending.startAckTimeoutId);
+    pending.startAckTimeoutId = null;
+  }
+  const resolve = pending.startAckResolve;
+  pending.startAckResolve = null;
+  if (typeof resolve === "function") resolve(accepted === true);
+}
+
+function sendAgentTaskResultAck(pending) {
+  const requestId = trimmed(pending?.requestId);
+  const userId = trimmed(pending?.userId);
+  const deviceId = trimmed(pending?.deviceId);
+  if (!requestId || !userId || !deviceId) return false;
+  if (userByDevice.get(deviceId) !== userId) return false;
+  const connectorWs = connectorByDevice.get(deviceId);
+  if (!connectorWs) return false;
+  return wsSend(connectorWs, {
+    type: "relay_result_ack",
+    request_id: requestId,
+    ...(trimmed(pending?.taskId) ? { task_id: trimmed(pending.taskId) } : {}),
+  });
+}
 
 function buildAgentTaskLiveMeta(pending, status = "running") {
   return {
@@ -1444,6 +1609,11 @@ function buildAgentTaskLiveMeta(pending, status = "running") {
     live_text: pending.liveText || "",
     live_text_truncated: pending.liveTextTruncated === true || undefined,
     live_tools: Array.isArray(pending.liveTools) ? pending.liveTools : [],
+    live_events: Array.isArray(pending.liveEvents) ? pending.liveEvents : [],
+    live_event_count: Number.isFinite(Number(pending.liveEventCount))
+      ? Number(pending.liveEventCount)
+      : 0,
+    live_events_truncated: pending.liveEventsTruncated === true || undefined,
     progress_updated_at: new Date().toISOString(),
   };
 }
@@ -1495,6 +1665,45 @@ function queueAgentTaskProgress(pending, msg) {
   if (!pending) return;
   const eventType = trimmed(msg?.event_type) || "assistant";
   const content = typeof msg?.content === "string" ? msg.content : "";
+  let appendedLiveEvent = null;
+  const appendLiveEvent = (event) => {
+    const events = Array.isArray(pending.liveEvents) ? pending.liveEvents : [];
+    const nextSequence = Number.isFinite(Number(pending.liveEventCount))
+      ? Number(pending.liveEventCount) + 1
+      : events.length + 1;
+    pending.liveEventCount = nextSequence;
+    appendedLiveEvent = {
+      ...event,
+      seq: nextSequence,
+      at: new Date().toISOString(),
+    };
+    const nextEvents = [...events, appendedLiveEvent];
+    let boundedEvents = nextEvents.slice(-AGENT_TASK_LIVE_EVENTS_MAX);
+    let eventChars = boundedEvents.reduce(
+      (total, item) =>
+        total +
+        String(item?.content || "").length +
+        String(item?.input || "").length,
+      0
+    );
+    while (
+      boundedEvents.length > 1 &&
+      eventChars > AGENT_TASK_LIVE_EVENTS_MAX_CHARS
+    ) {
+      const removed = boundedEvents.shift();
+      eventChars -=
+        String(removed?.content || "").length +
+        String(removed?.input || "").length;
+    }
+    if (
+      boundedEvents.length < nextEvents.length ||
+      eventChars > AGENT_TASK_LIVE_EVENTS_MAX_CHARS
+    ) {
+      pending.liveEventsTruncated = true;
+    }
+    pending.liveEvents = boundedEvents;
+  };
+
   if (eventType === "assistant" && content) {
     const combined = `${pending.liveText || ""}${content}`;
     if (combined.length > AGENT_TASK_LIVE_TEXT_MAX_CHARS) {
@@ -1502,6 +1711,15 @@ function queueAgentTaskProgress(pending, msg) {
       pending.liveTextTruncated = true;
     } else {
       pending.liveText = combined;
+    }
+    appendLiveEvent({
+      type: "assistant",
+      content: content.slice(-AGENT_TASK_LIVE_EVENTS_MAX_CHARS),
+      content_truncated:
+        content.length > AGENT_TASK_LIVE_EVENTS_MAX_CHARS || undefined,
+    });
+    if (content.length > AGENT_TASK_LIVE_EVENTS_MAX_CHARS) {
+      pending.liveEventsTruncated = true;
     }
   }
   if (eventType === "tool_use") {
@@ -1520,6 +1738,23 @@ function queueAgentTaskProgress(pending, msg) {
         },
       ];
     }
+    // Keep every invocation in the chronological stream, even when two
+    // adjacent calls happen to have the same tool name and input.
+    appendLiveEvent({
+      type: "tool_use",
+      name: toolName,
+      input: toolInput,
+    });
+  }
+  if (appendedLiveEvent && pending.taskId && pending.userId) {
+    broadcastToUser(pending.userId, {
+      type: "agent_task_progress",
+      task_id: pending.taskId,
+      request_id: pending.requestId,
+      event: appendedLiveEvent,
+      live_event_count: pending.liveEventCount,
+      progress_updated_at: appendedLiveEvent.at,
+    });
   }
   pending.progressDirty = true;
   if (!pending.progressFlushTimer) {
@@ -1542,81 +1777,274 @@ async function deliverAgentTaskCompletion(pending, result) {
     clearTimeout(pending.timeoutId);
     pending.timeoutId = null;
   }
-  await flushAgentTaskProgress(pending, "finalizing").catch(() => {});
+  if (pending.completionDeliveryPromise) {
+    return pending.completionDeliveryPromise;
+  }
+  if (pending.completionRetryTimer) {
+    clearTimeout(pending.completionRetryTimer);
+    pending.completionRetryTimer = null;
+  }
 
-  const attempt = async () => {
-    if (pendingRequests.get(pending.requestId) !== pending) return;
-    pending.completionAttempts = (pending.completionAttempts || 0) + 1;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20_000);
-    let response;
-    let errorText = "";
-    try {
-      response = await fetch(pending.completionUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...buildInternalRouteAuthHeaders(
-            pending.userId,
-            AGENT_TASK_COMPLETE_SCOPE
-          ),
-        },
-        body: JSON.stringify({
-          taskId: pending.taskId,
-          requestId: pending.requestId,
-          result: pending.completionResult,
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        errorText = await response.text().catch(() => "");
-      }
-    } catch (error) {
-      errorText = error instanceof Error ? error.message : String(error);
-    } finally {
-      clearTimeout(timer);
-    }
-
-    if (response?.ok) {
-      pendingRequests.delete(pending.requestId);
-      console.log("[relay] agent task completion delivered", {
-        taskId: pending.taskId,
-        requestId: pending.requestId,
-        attempts: pending.completionAttempts,
-      });
-      return;
-    }
-
-    console.warn("[relay] agent task completion delivery failed", {
-      taskId: pending.taskId,
-      requestId: pending.requestId,
-      attempt: pending.completionAttempts,
-      status: response?.status || null,
-      error: errorText.slice(0, 300),
-    });
-    pending.taskMeta = {
-      ...buildAgentTaskLiveMeta(pending, "finalizing"),
-      completion_delivery_error:
-        errorText.slice(0, 500) || `HTTP ${response?.status || 0}`,
-    };
-    pending.progressDirty = true;
+  const delivery = (async () => {
     await flushAgentTaskProgress(pending, "finalizing").catch(() => {});
 
-    const delay =
-      pending.completionAttempts <= 1
-        ? 1_000
-        : pending.completionAttempts <= 3
-          ? 5_000
-          : pending.completionAttempts <= 6
-            ? 15_000
-            : 60_000;
-    pending.completionRetryTimer = setTimeout(() => {
-      pending.completionRetryTimer = null;
-      void attempt();
-    }, delay);
+    const attempt = async () => {
+      if (pendingRequests.get(pending.requestId) !== pending) return;
+      pending.completionAttempts = (pending.completionAttempts || 0) + 1;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 20_000);
+      let response;
+      let errorText = "";
+      try {
+        response = await fetch(pending.completionUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...buildInternalRouteAuthHeaders(
+              pending.userId,
+              AGENT_TASK_COMPLETE_SCOPE
+            ),
+          },
+          body: JSON.stringify({
+            taskId: pending.taskId,
+            requestId: pending.requestId,
+            result: pending.completionResult,
+          }),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          errorText = await response.text().catch(() => "");
+        }
+      } catch (error) {
+        errorText = error instanceof Error ? error.message : String(error);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (response?.ok) {
+        if (pending.completionRetryTimer) {
+          clearTimeout(pending.completionRetryTimer);
+          pending.completionRetryTimer = null;
+        }
+        // The connector retains callback results until this acknowledgment.
+        // Send it only after the app has durably accepted the completion.
+        sendAgentTaskResultAck(pending);
+        pendingRequests.delete(pending.requestId);
+        console.log("[relay] agent task completion delivered", {
+          taskId: pending.taskId,
+          requestId: pending.requestId,
+          attempts: pending.completionAttempts,
+        });
+        return;
+      }
+
+      console.warn("[relay] agent task completion delivery failed", {
+        taskId: pending.taskId,
+        requestId: pending.requestId,
+        attempt: pending.completionAttempts,
+        status: response?.status || null,
+        error: errorText.slice(0, 300),
+      });
+      pending.taskMeta = {
+        ...buildAgentTaskLiveMeta(pending, "finalizing"),
+        completion_delivery_error:
+          errorText.slice(0, 500) || `HTTP ${response?.status || 0}`,
+      };
+      pending.progressDirty = true;
+      await flushAgentTaskProgress(pending, "finalizing").catch(() => {});
+
+      const delay =
+        pending.completionAttempts <= 1
+          ? 1_000
+          : pending.completionAttempts <= 3
+            ? 5_000
+            : pending.completionAttempts <= 6
+              ? 15_000
+              : 60_000;
+      pending.completionRetryTimer = setTimeout(() => {
+        pending.completionRetryTimer = null;
+        void deliverAgentTaskCompletion(
+          pending,
+          pending.completionResult,
+        );
+      }, delay);
+    };
+
+    await attempt();
+  })();
+  pending.completionDeliveryPromise = delivery;
+  try {
+    await delivery;
+  } finally {
+    if (pending.completionDeliveryPromise === delivery) {
+      pending.completionDeliveryPromise = null;
+    }
+  }
+}
+
+async function recoverAgentTaskCompletionFromDatabase(args) {
+  const requestId = trimmed(args?.requestId);
+  const userId = trimmed(args?.userId);
+  const deviceId = trimmed(args?.deviceId);
+  if (!requestId || !userId || !deviceId) return false;
+
+  const existing = pendingRequests.get(requestId);
+  if (existing?.type === "agent_task_run_internal") {
+    if (existing.userId !== userId || existing.deviceId !== deviceId) {
+      return false;
+    }
+    await deliverAgentTaskCompletion(existing, args.result || {});
+    return true;
+  }
+  if (existing) return false;
+
+  const taskFilters = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    "result_meta->>relay_request_id": `eq.${requestId}`,
+    select: "id,agent_id,status,result_meta",
+    limit: "2",
+  });
+  const taskResponse = await supabaseService(
+    `/rest/v1/agent_tasks?${taskFilters.toString()}`,
+  );
+  if (!taskResponse.ok) {
+    throw new Error(`agent_task_recovery_lookup_failed:${taskResponse.status}`);
+  }
+  const taskRows = await taskResponse.json().catch(() => []);
+  if (!Array.isArray(taskRows) || taskRows.length !== 1) return false;
+  const task = taskRows[0] || {};
+  const taskId = trimmed(task.id);
+  const agentId = trimmed(task.agent_id);
+  const taskStatus = trimmed(task.status);
+  if (!taskId || !agentId || !taskStatus) return false;
+
+  // Bind the recovered request to the connector device that owns this agent.
+  // A different connector belonging to the same user cannot complete it merely
+  // by learning the opaque relay request id.
+  const configFilters = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    agent_id: `eq.${agentId}`,
+    select: "device_id",
+    limit: "1",
+  });
+  const configResponse = await supabaseService(
+    `/rest/v1/claude_code_agent_configs?${configFilters.toString()}`,
+  );
+  if (!configResponse.ok) {
+    throw new Error(`agent_task_recovery_device_lookup_failed:${configResponse.status}`);
+  }
+  const configRows = await configResponse.json().catch(() => []);
+  if (
+    !Array.isArray(configRows) ||
+    configRows.length !== 1 ||
+    trimmed(configRows[0]?.device_id) !== deviceId
+  ) {
+    return false;
+  }
+
+  if (
+    taskStatus === "done" ||
+    taskStatus === "failed" ||
+    taskStatus === "canceled"
+  ) {
+    // The completion endpoint is idempotent, but a relay restart may have lost
+    // the websocket ACK after the task became terminal. The user, device, and
+    // request were all validated above, so it is safe to stop connector replay.
+    sendAgentTaskResultAck({ requestId, userId, deviceId, taskId });
+    return true;
+  }
+  if (taskStatus !== "running") return false;
+
+  const taskMeta =
+    task.result_meta &&
+    typeof task.result_meta === "object" &&
+    !Array.isArray(task.result_meta)
+      ? task.result_meta
+      : {};
+  const recovered = {
+    type: "agent_task_run_internal",
+    requestId,
+    userId,
+    deviceId,
+    rpcType: "claude_run",
+    taskId,
+    completionUrl: new URL(
+      "/api/agents/tasks/complete",
+      AGENT_TASK_COMPLETION_ORIGIN,
+    ).toString(),
+    taskMeta,
+    liveText:
+      typeof taskMeta.live_text === "string"
+        ? taskMeta.live_text.slice(-AGENT_TASK_LIVE_TEXT_MAX_CHARS)
+        : "",
+    liveTextTruncated: taskMeta.live_text_truncated === true,
+    liveTools: Array.isArray(taskMeta.live_tools)
+      ? taskMeta.live_tools.slice(-AGENT_TASK_LIVE_TOOLS_MAX)
+      : [],
+    liveEvents: Array.isArray(taskMeta.live_events)
+      ? taskMeta.live_events.slice(-AGENT_TASK_LIVE_EVENTS_MAX)
+      : [],
+    liveEventCount: Number.isFinite(Number(taskMeta.live_event_count))
+      ? Math.max(0, Number(taskMeta.live_event_count))
+      : 0,
+    liveEventsTruncated: taskMeta.live_events_truncated === true,
+    progressDirty: false,
+    progressFlushTimer: null,
+    progressWritePromise: Promise.resolve(),
+    completionAttempts: 0,
+    completionRetryTimer: null,
+    timeoutId: null,
   };
 
-  await attempt();
+  const raced = pendingRequests.get(requestId);
+  if (
+    raced &&
+    (raced.type !== "agent_task_run_internal" ||
+      raced.userId !== userId ||
+      raced.deviceId !== deviceId)
+  ) {
+    return false;
+  }
+  const pending = raced || recovered;
+  if (pending === recovered) pendingRequests.set(requestId, pending);
+  console.warn("[relay] recovered agent task completion after relay state loss", {
+    taskId,
+    requestId,
+  });
+  await deliverAgentTaskCompletion(pending, args.result || {});
+  return true;
+}
+
+function recoverUnknownAgentTaskResult(args) {
+  const requestId = trimmed(args?.requestId);
+  const userId = trimmed(args?.userId);
+  const deviceId = trimmed(args?.deviceId);
+  if (!requestId || !userId || !deviceId) return;
+  const recoveryKey = JSON.stringify([userId, deviceId, requestId]);
+  if (recoveringAgentTaskResults.has(recoveryKey)) return;
+  const recovery = (async () => {
+    const retryDelays = [0, 1_000, 5_000, 15_000];
+    for (const delay of retryDelays) {
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      try {
+        if (await recoverAgentTaskCompletionFromDatabase(args)) return true;
+      } catch (error) {
+        console.warn("[relay] agent task result recovery attempt failed", {
+          requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    console.error("[relay] could not recover unknown agent task result", {
+      requestId,
+    });
+    return false;
+  })().finally(() => {
+    recoveringAgentTaskResults.delete(recoveryKey);
+  });
+  recoveringAgentTaskResults.set(recoveryKey, recovery);
 }
 
 async function handleInternalConnectorRpcHttp(req, res) {
@@ -1648,15 +2076,19 @@ async function handleInternalConnectorRpcHttp(req, res) {
       ? body.payload
       : {};
   const timeoutRaw = Number(body?.timeoutMs);
-  const maxTimeoutMs = rpcType === "claude_run" ? 22 * 60 * 1000 : 5 * 60 * 1000;
-  const defaultTimeoutMs = rpcType === "claude_run" ? 20 * 60 * 1000 + 30_000 : 30_000;
+  const maxTimeoutMs = rpcType === "claude_run" ? 32 * 60 * 1000 : 5 * 60 * 1000;
+  const defaultTimeoutMs = rpcType === "claude_run" ? 32 * 60 * 1000 : 30_000;
   const timeoutMs = Number.isFinite(timeoutRaw)
     ? Math.max(1000, Math.min(Math.trunc(timeoutRaw), maxTimeoutMs))
     : defaultTimeoutMs;
   const callbackDelivery =
     body?.delivery === "callback" && rpcType === "claude_run";
   const taskId = trimmed(body?.taskId);
-  const completionUrl = normalizeAgentTaskCompletionUrl(body?.completionUrl);
+  const completionResolution = resolveAgentTaskCompletionUrl(
+    body?.completionUrl,
+    AGENT_TASK_COMPLETION_ORIGIN,
+  );
+  const completionUrl = completionResolution.url;
   const requestedRequestId = trimmed(body?.requestId);
   const taskMeta =
     body?.taskMeta && typeof body.taskMeta === "object" && !Array.isArray(body.taskMeta)
@@ -1671,11 +2103,17 @@ async function handleInternalConnectorRpcHttp(req, res) {
     writeJson(res, 400, { error: "missing_rpc_type" });
     return;
   }
-  if (callbackDelivery && (!taskId || !completionUrl || !requestedRequestId)) {
+  if (callbackDelivery && (!taskId || !requestedRequestId)) {
     writeJson(res, 400, {
       error: "missing_callback_delivery_fields",
     });
     return;
+  }
+  if (callbackDelivery && completionResolution.usedCanonicalFallback) {
+    console.warn("[relay] canonicalized agent task completion callback", {
+      taskId,
+      requestId: requestedRequestId,
+    });
   }
 
   const connectorWs = connectorByDevice.get(deviceId);
@@ -1685,6 +2123,26 @@ async function handleInternalConnectorRpcHttp(req, res) {
     return;
   }
 
+  if (rpcType === "schedule_trigger") {
+    const jobId = trimmed(payload?.job_id);
+    if (!jobId) {
+      writeJson(res, 400, { error: "missing_job_id" });
+      return;
+    }
+    const prepared = await prepareScheduledJobForManualTrigger({
+      jobId,
+      targetDeviceId: deviceId,
+      userId: auth.userId,
+      connectorWs,
+    });
+    if (!prepared.ok) {
+      writeJson(res, 409, {
+        error: prepared.error || "scheduled_job_prepare_failed",
+      });
+      return;
+    }
+  }
+
   const requestId = requestedRequestId || randomUUID();
   if (pendingRequests.has(requestId)) {
     writeJson(res, 409, { error: "request_id_in_use" });
@@ -1692,6 +2150,10 @@ async function handleInternalConnectorRpcHttp(req, res) {
   }
 
   if (callbackDelivery) {
+    const requiresStartAck = connectorVersionAtLeast(
+      versionByDevice.get(deviceId),
+      CONNECTOR_CALLBACK_ACK_MIN_VERSION,
+    );
     const pending = {
       type: "agent_task_run_internal",
       requestId,
@@ -1701,16 +2163,48 @@ async function handleInternalConnectorRpcHttp(req, res) {
       taskId,
       completionUrl,
       taskMeta,
-      liveText: "",
-      liveTextTruncated: false,
-      liveTools: [],
+      liveText:
+        typeof taskMeta.live_text === "string"
+          ? taskMeta.live_text.slice(-AGENT_TASK_LIVE_TEXT_MAX_CHARS)
+          : "",
+      liveTextTruncated:
+        taskMeta.live_text_truncated === true ||
+        (typeof taskMeta.live_text === "string" &&
+          taskMeta.live_text.length > AGENT_TASK_LIVE_TEXT_MAX_CHARS),
+      liveTools: Array.isArray(taskMeta.live_tools)
+        ? taskMeta.live_tools.slice(-AGENT_TASK_LIVE_TOOLS_MAX)
+        : [],
+      liveEvents: Array.isArray(taskMeta.live_events)
+        ? taskMeta.live_events.slice(-AGENT_TASK_LIVE_EVENTS_MAX)
+        : [],
+      liveEventCount: Number.isFinite(Number(taskMeta.live_event_count))
+        ? Math.max(0, Number(taskMeta.live_event_count))
+        : Array.isArray(taskMeta.live_events)
+          ? taskMeta.live_events.length
+          : 0,
+      liveEventsTruncated:
+        taskMeta.live_events_truncated === true ||
+        (Array.isArray(taskMeta.live_events) &&
+          taskMeta.live_events.length > AGENT_TASK_LIVE_EVENTS_MAX),
       progressDirty: false,
       progressFlushTimer: null,
       progressWritePromise: Promise.resolve(),
       completionAttempts: 0,
       completionRetryTimer: null,
       timeoutId: null,
+      startAckRequired: requiresStartAck,
+      startAckSettled: !requiresStartAck,
+      startAckResolve: null,
+      startAckTimeoutId: null,
     };
+    const startAckPromise = requiresStartAck
+      ? new Promise((resolve) => {
+          pending.startAckResolve = resolve;
+          pending.startAckTimeoutId = setTimeout(() => {
+            settleAgentTaskStartAck(pending, false);
+          }, CONNECTOR_START_ACK_TIMEOUT_MS);
+        })
+      : Promise.resolve(true);
     pending.timeoutId = setTimeout(() => {
       if (pendingRequests.get(requestId) !== pending) return;
       const currentConnector = connectorByDevice.get(deviceId);
@@ -1739,13 +2233,43 @@ async function handleInternalConnectorRpcHttp(req, res) {
         ...payload,
         type: rpcType,
         request_id: requestId,
+        ...(requiresStartAck
+          ? {
+              require_start_ack: true,
+              result_ack_required: true,
+            }
+          : {}),
       },
       () => {}
     );
     if (!sent) {
       pendingRequests.delete(requestId);
       clearTimeout(pending.timeoutId);
+      settleAgentTaskStartAck(pending, false);
       writeJson(res, 502, { error: "connector_send_failed" });
+      return;
+    }
+
+    const startAccepted = await startAckPromise;
+    if (!startAccepted) {
+      if (pendingRequests.get(requestId) === pending) {
+        pendingRequests.delete(requestId);
+        if (pending.timeoutId) {
+          clearTimeout(pending.timeoutId);
+          pending.timeoutId = null;
+        }
+        const currentConnector = connectorByDevice.get(deviceId);
+        if (currentConnector) {
+          wsSend(currentConnector, {
+            type: "claude_run_cancel",
+            request_id: `relay-start-timeout-cancel-${requestId}`,
+            target_request_id: requestId,
+            agent_id: trimmed(payload?.agent_id),
+            cancel_all_for_agent: false,
+          });
+        }
+      }
+      writeJson(res, 504, { error: "connector_start_ack_timeout" });
       return;
     }
 
@@ -1811,7 +2335,8 @@ function normalizeConnectorHealth(raw) {
     raw.aiyra_voice && typeof raw.aiyra_voice === "object"
       ? raw.aiyra_voice
       : null;
-  if (!whatsappRaw && !aiyraRaw) return null;
+  const voiceRaw = raw.voice && typeof raw.voice === "object" ? raw.voice : null;
+  if (!whatsappRaw && !aiyraRaw && !voiceRaw) return null;
 
   const statusRaw =
     typeof (whatsappRaw || aiyraRaw)?.status === "string"
@@ -1975,6 +2500,60 @@ function normalizeConnectorHealth(raw) {
       twilio_supervisor_state: twilioSupervisorState,
     };
   }
+  if (voiceRaw) {
+    const provider =
+      voiceRaw.provider === "aiyra"
+        ? "aiyra"
+        : normalizePrivateLiveVoiceProvider(voiceRaw.provider) || "none";
+    out.voice = {
+      provider,
+      status: normalizeStatus(voiceRaw.status),
+      reason: typeof voiceRaw.reason === "string" ? voiceRaw.reason : "",
+      detail: typeof voiceRaw.detail === "string" ? voiceRaw.detail : "",
+      updated_at:
+        typeof voiceRaw.updated_at === "string" ? voiceRaw.updated_at : null,
+      last_healthy_at:
+        typeof voiceRaw.last_healthy_at === "string"
+          ? voiceRaw.last_healthy_at
+          : null,
+      last_failure_at:
+        typeof voiceRaw.last_failure_at === "string"
+          ? voiceRaw.last_failure_at
+          : null,
+      listening: voiceRaw.listening === true,
+      active: voiceRaw.active === true,
+      wake_word: typeof voiceRaw.wake_word === "string" ? voiceRaw.wake_word : "",
+      metrics: {
+        wake_hits: toSafeNumber(voiceRaw.wake_hits, 0),
+        wake_suppressed: toSafeNumber(voiceRaw.wake_suppressed, 0),
+        session_count: toSafeNumber(voiceRaw.session_count, 0),
+        session_error_count: toSafeNumber(voiceRaw.session_error_count, 0),
+        reconnect_attempt_count: toSafeNumber(voiceRaw.reconnect_attempt_count, 0),
+        last_session_duration_ms: toSafeNumber(
+          voiceRaw.last_session_duration_ms,
+          0
+        ),
+        last_metric_event:
+          typeof voiceRaw.last_metric_event === "string"
+            ? voiceRaw.last_metric_event
+            : "",
+        last_metric_at:
+          typeof voiceRaw.last_metric_at === "string"
+            ? voiceRaw.last_metric_at
+            : null,
+        low_mic_gain_detected: voiceRaw.low_mic_gain_detected === true,
+        mic_input_level: toOptionalNumber(voiceRaw.mic_input_level),
+        configured_mic_name:
+          typeof voiceRaw.configured_mic_name === "string"
+            ? voiceRaw.configured_mic_name
+            : null,
+        resolved_device_name:
+          typeof voiceRaw.resolved_device_name === "string"
+            ? voiceRaw.resolved_device_name
+            : null,
+      },
+    };
+  }
   return out;
 }
 
@@ -2010,6 +2589,7 @@ function mergeConnectorHealthSnapshot(prev, next) {
   return {
     whatsapp: next.whatsapp ?? prev?.whatsapp ?? null,
     aiyra_voice: mergeAiyraVoiceHealth(prev?.aiyra_voice, next.aiyra_voice),
+    voice: next.voice ?? prev?.voice ?? null,
   };
 }
 
@@ -2092,6 +2672,32 @@ function broadcastToUser(userId, msg) {
   const set = browsersByUser.get(userId);
   if (!set) return;
   for (const ws of set) wsSend(ws, msg);
+}
+
+function clearPendingRequestTimeout(pending) {
+  if (!pending?.timeoutId) return;
+  clearTimeout(pending.timeoutId);
+  pending.timeoutId = null;
+}
+
+function settleWorkspacePickRequest(requestId, pending, payload) {
+  if (pendingRequests.get(requestId) !== pending || pending?.type !== "workspace_pick") {
+    return false;
+  }
+
+  clearPendingRequestTimeout(pending);
+  const delivered = deliverOrDeferWorkspacePickResult(pending, payload, wsSend);
+  if (delivered) {
+    pendingRequests.delete(requestId);
+    return true;
+  }
+
+  // The native picker can make the browser reconnect as focus returns. Keep a
+  // completed result briefly so browser_hello can replay it into that same tab.
+  pending.timeoutId = setTimeout(() => {
+    if (pendingRequests.get(requestId) === pending) pendingRequests.delete(requestId);
+  }, WORKSPACE_PICK_RESULT_REPLAY_TTL_MS);
+  return false;
 }
 
 async function rebindScheduledJobsAfterPairFromSource({
@@ -3033,7 +3639,7 @@ async function fetchScheduledJobs({ deviceId, userId }) {
   const q = new URLSearchParams({
     device_id: `eq.${deviceId}`,
     select:
-      "id,user_id,device_id,kind,name,command,cwd,task,schedule,enabled,skip_next_run,last_run_at,last_status,last_exit_code,created_at,updated_at",
+      "id,user_id,device_id,kind,name,command,cwd,task,schedule,enabled,skip_next_run,last_run_at,last_status,last_exit_code,created_at,updated_at,channel_id",
     order: "updated_at.desc",
     limit: "200",
   });
@@ -3043,7 +3649,98 @@ async function fetchScheduledJobs({ deviceId, userId }) {
   });
   if (!res.ok) return { error: await res.text(), jobs: [] };
   const rows = await res.json();
-  return { jobs: Array.isArray(rows) ? rows : [] };
+  return { jobs: relayExecutableScheduledJobs(rows) };
+}
+
+async function prepareScheduledJobForManualTrigger({
+  jobId,
+  targetDeviceId,
+  userId,
+  connectorWs,
+}) {
+  const access = await productAccessForUser(userId);
+  if (!access.hasAccess) return { ok: false, error: "license_required" };
+
+  const jobQ = new URLSearchParams({
+    id: `eq.${jobId}`,
+    user_id: `eq.${userId}`,
+    select: "id,user_id,device_id,kind,target_agent_id,channel_id",
+    limit: "1",
+  });
+  const jobRes = await supabaseService(
+    `/rest/v1/scheduled_jobs?${jobQ.toString()}`,
+    {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    },
+  );
+  if (!jobRes.ok) {
+    return { ok: false, error: "scheduled_job_lookup_failed" };
+  }
+  const jobRows = await jobRes.json().catch(() => []);
+  const job = Array.isArray(jobRows) ? jobRows[0] : null;
+  if (!job) return { ok: false, error: "job_not_found" };
+  const safetyDenial = scheduledJobRelayExecutionDenialReason(job);
+  if (safetyDenial) return { ok: false, error: safetyDenial };
+
+  const decision = scheduledJobManualRunDeviceDecision(job, targetDeviceId);
+  if (!decision.ok) return decision;
+
+  if (decision.rebind) {
+    const targetOwner = await fetchDeviceOwner(targetDeviceId);
+    if (targetOwner?.userId !== userId) {
+      return { ok: false, error: "scheduled_job_target_device_not_owned" };
+    }
+    const rebindQ = new URLSearchParams({
+      id: `eq.${jobId}`,
+      user_id: `eq.${userId}`,
+      select: "id",
+    });
+    const rebindRes = await supabaseService(
+      `/rest/v1/scheduled_jobs?${rebindQ.toString()}`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          device_id: targetDeviceId,
+          updated_at: new Date().toISOString(),
+        }),
+      },
+    );
+    if (!rebindRes.ok) {
+      return { ok: false, error: "scheduled_job_rebind_failed" };
+    }
+    const reboundRows = await rebindRes.json().catch(() => []);
+    if (!Array.isArray(reboundRows) || reboundRows.length !== 1) {
+      return { ok: false, error: "scheduled_job_rebind_failed" };
+    }
+    console.log("[relay] rebound scheduled job for manual run", {
+      job_id: jobId,
+      user_id: userId,
+      previous_device_id: job.device_id,
+      target_device_id: targetDeviceId,
+    });
+  }
+
+  // Synchronize first so an online connector that was paired after this job
+  // was created has the job in memory before it receives schedule_trigger.
+  const fetched = await fetchScheduledJobs({ deviceId: targetDeviceId, userId });
+  if (fetched.error) {
+    return { ok: false, error: "scheduled_job_sync_failed" };
+  }
+  if (!fetched.jobs.some((candidate) => String(candidate?.id || "") === jobId)) {
+    return { ok: false, error: "job_not_found" };
+  }
+  const synced = wsSend(connectorWs, {
+    type: "schedule_sync",
+    ok: true,
+    device_id: targetDeviceId,
+    jobs: fetched.jobs,
+    server_time: new Date().toISOString(),
+  });
+  return synced
+    ? { ok: true, rebound: decision.rebind }
+    : { ok: false, error: "connector_send_failed" };
 }
 
 async function fetchScheduledJobForDevice({ jobId, deviceId, userId }) {
@@ -3286,7 +3983,20 @@ wss.on("close", () => {
   clearInterval(aiyraRuntimeHousekeeping);
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, request) => {
+  if (isPrivateLiveVoiceRequest(request)) {
+    handlePrivateLiveVoiceProxy({
+      client: ws,
+      request,
+      relayJwtSecret: RELAY_JWT_SECRET,
+      appUrl: GROOVY_APP_URL,
+      buildInternalHeaders: (userId, scope) =>
+        buildInternalRouteAuthHeaders(userId, scope),
+      log: (message, detail) => console.log(`[relay] ${message}`, detail || ""),
+      warn: (message, detail) => console.warn(`[relay] ${message}`, detail || ""),
+    });
+    return;
+  }
   console.log("[relay] NEW WebSocket connection opened");
   ws.isAlive = true;
   ws.on("pong", markAlive);
@@ -3333,7 +4043,28 @@ wss.on("connection", (ws) => {
       sessionInfo.set(ws, { kind: "browser", userId: user.id, browserInstanceId });
       addBrowser(user.id, ws);
       for (const [requestId, pending] of pendingRequests.entries()) {
-        if (!pending || pending.type !== "claude_run" || pending.userId !== user.id) continue;
+        if (!pending || pending.userId !== user.id) continue;
+        if (pending.type === "workspace_pick") {
+          const rebound = rebindWorkspacePickBrowser(pending, {
+            browserWs: ws,
+            browserInstanceId,
+            userId: user.id,
+            send: wsSend,
+          });
+          if (!rebound.matched) continue;
+          if (rebound.delivered) {
+            clearPendingRequestTimeout(pending);
+            pendingRequests.delete(requestId);
+          }
+          console.log("[relay] rebound pending workspace_pick to reconnected browser", {
+            requestId,
+            deviceId: pending.deviceId || null,
+            browserInstanceId,
+            replayedResult: rebound.delivered,
+          });
+          continue;
+        }
+        if (pending.type !== "claude_run") continue;
         if (!browserInstanceId || pending.browserInstanceId !== browserInstanceId) continue;
         if (pending.browserWs === ws) continue;
         pending.browserWs = ws;
@@ -3615,13 +4346,36 @@ wss.on("connection", (ws) => {
           return;
         }
         const requestId = msg?.request_id ? String(msg.request_id) : randomUUID();
-        pendingRequests.set(requestId, {
+        const pending = {
           type: "workspace_pick",
           browserWs: ws,
+          browserInstanceId: trimmed(msg?.browser_instance_id) || null,
           userId,
           deviceId,
-        });
-        wsSend(connectorWs, { type: "workspace_pick", request_id: requestId });
+          disconnectedAt: null,
+          completedPayload: null,
+          timeoutId: null,
+        };
+        pendingRequests.set(requestId, pending);
+        pending.timeoutId = setTimeout(() => {
+          if (pendingRequests.get(requestId) !== pending) return;
+          settleWorkspacePickRequest(requestId, pending, {
+            type: "workspace_pick_result",
+            request_id: requestId,
+            ok: false,
+            error: "relay_timeout",
+          });
+        }, WORKSPACE_PICK_CONNECTOR_TIMEOUT_MS);
+        const sent = wsSend(connectorWs, { type: "workspace_pick", request_id: requestId });
+        if (!sent) {
+          settleWorkspacePickRequest(requestId, pending, {
+            type: "workspace_pick_result",
+            request_id: requestId,
+            ok: false,
+            error: "connector_send_failed",
+          });
+          return;
+        }
         wsSend(ws, { type: "workspace_pick_started", request_id: requestId });
         return;
       }
@@ -3806,6 +4560,7 @@ wss.on("connection", (ws) => {
           userId,
           deviceId,
           agentId,
+          resumeSessionId: trimmed(msg?.session_id) || null,
           disconnectedAt: null,
           timeoutId: null,
         };
@@ -3854,8 +4609,8 @@ wss.on("connection", (ws) => {
         const requestedRunTimeoutMs = Number(msg?.timeout_ms);
         const runTimeoutMs =
           Number.isFinite(requestedRunTimeoutMs) && requestedRunTimeoutMs > 0
-            ? Math.min(Math.trunc(requestedRunTimeoutMs), 20 * 60 * 1000)
-            : 20 * 60 * 1000;
+            ? Math.min(Math.trunc(requestedRunTimeoutMs), 30 * 60 * 1000)
+            : 30 * 60 * 1000;
         console.log("[relay] claude_run forwarding model settings", {
           requestId,
           agentId: agentId || null,
@@ -3876,6 +4631,11 @@ wss.on("connection", (ws) => {
           timeout_ms: runTimeoutMs,
           session_id: msg?.session_id || "",
           plan_mode: msg?.plan_mode || false,
+          plan_response: msg?.plan_response !== false,
+          read_only: msg?.read_only === true || msg?.plan_mode === true,
+          ...(msg?.external_access === "vercel_read"
+            ? { external_access: "vercel_read" }
+            : {}),
           ...(forwardModel ? { model: forwardModel } : {}),
           ...(forwardReasoningEffort ? { reasoning_effort: forwardReasoningEffort } : {}),
         });
@@ -3905,7 +4665,7 @@ wss.on("connection", (ws) => {
               });
             }
           }
-        }, runTimeoutMs + 10000);
+        }, runTimeoutMs + 60_000);
         pendingEntry.timeoutId = timeoutId;
 
         return;
@@ -4356,10 +5116,12 @@ wss.on("connection", (ws) => {
         msgType.startsWith("schedule_") ||
         msgType.startsWith("site_") ||
         msgType.startsWith("skills_") ||
+        msgType.startsWith("skill_action_") ||
         msgType === "terminal_exec" ||
         msgType.startsWith("linkdb_") ||
         msgType.startsWith("sqlite_") ||
         msgType.startsWith("credential_") ||
+        msgType.startsWith("workspace_secret_") ||
         msgType.startsWith("aiyra_") ||
         msgType === "claude_plans_list";
       if (isConnectorRpc) {
@@ -4374,10 +5136,10 @@ wss.on("connection", (ws) => {
           });
           return;
         }
+        const requestId = msg?.request_id ? String(msg.request_id) : randomUUID();
         const connectorWs = connectorByDevice.get(deviceId);
         const allowed = await canUseDevice(userId, deviceId);
         if (!connectorWs || !allowed) {
-          const requestId = msg?.request_id ? String(msg.request_id) : randomUUID();
           wsSend(ws, {
             type: `${msgType}_result`,
             request_id: requestId,
@@ -4387,7 +5149,34 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        const requestId = msg?.request_id ? String(msg.request_id) : randomUUID();
+        if (msgType === "schedule_trigger") {
+          const jobId = String(msg?.job_id || "").trim();
+          if (!jobId) {
+            wsSend(ws, {
+              type: "schedule_trigger_result",
+              request_id: requestId,
+              ok: false,
+              error: "missing_job_id",
+            });
+            return;
+          }
+          const prepared = await prepareScheduledJobForManualTrigger({
+            jobId,
+            targetDeviceId: deviceId,
+            userId,
+            connectorWs,
+          });
+          if (!prepared.ok) {
+            wsSend(ws, {
+              type: "schedule_trigger_result",
+              request_id: requestId,
+              ok: false,
+              error: prepared.error || "scheduled_job_prepare_failed",
+            });
+            return;
+          }
+        }
+
         const rpcTimeoutMs = (() => {
           if (msgType !== "browser_task_run") return null;
           const requested = Number(msg?.timeout_ms);
@@ -4461,6 +5250,13 @@ wss.on("connection", (ws) => {
             deviceId,
             userId,
             health: merged.aiyra_voice,
+          }).catch(() => {});
+        }
+        if (merged.voice) {
+          persistVoiceHealthSnapshot({
+            deviceId,
+            userId,
+            health: merged.voice,
           }).catch(() => {});
         }
         const deviceOnlineMsg = buildDeviceOnlineMessage(deviceId);
@@ -4593,17 +5389,12 @@ wss.on("connection", (ws) => {
         const requestId = String(msg?.request_id || "");
         const pending = pendingRequests.get(requestId);
         if (!pending || pending.type !== "workspace_pick") return;
-        pendingRequests.delete(requestId);
 
         if (pending.userId !== userId || pending.deviceId !== deviceId) return;
 
-        // Broadcast to all of the user's browser sockets rather than the original
-        // pending.browserWs — the OS folder picker steals focus, which can trigger
-        // a reconnect in useRelay while the picker is open, leaving the original
-        // socket closed by the time the reply arrives.
         const ok = Boolean(msg?.ok);
         if (!ok) {
-          broadcastToUser(pending.userId, {
+          settleWorkspacePickRequest(requestId, pending, {
             type: "workspace_pick_result",
             request_id: requestId,
             ok: false,
@@ -4614,7 +5405,7 @@ wss.on("connection", (ws) => {
 
         const rootPath = String(msg?.root_path || "");
         if (!rootPath) {
-          broadcastToUser(pending.userId, {
+          settleWorkspacePickRequest(requestId, pending, {
             type: "workspace_pick_result",
             request_id: requestId,
             ok: false,
@@ -4630,7 +5421,7 @@ wss.on("connection", (ws) => {
           label: msg?.label ? String(msg.label) : null,
         });
         if (created.error) {
-          broadcastToUser(pending.userId, {
+          settleWorkspacePickRequest(requestId, pending, {
             type: "workspace_pick_result",
             request_id: requestId,
             ok: false,
@@ -4639,7 +5430,7 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        broadcastToUser(pending.userId, {
+        settleWorkspacePickRequest(requestId, pending, {
           type: "workspace_added",
           request_id: requestId,
           ok: true,
@@ -4649,6 +5440,22 @@ wss.on("connection", (ws) => {
       }
 
       // ===== Claude CLI responses from connector =====
+      if (msg?.type === "claude_run_start_ack") {
+        const requestId = trimmed(msg?.request_id);
+        const pending = pendingRequests.get(requestId);
+        if (
+          !pending ||
+          pending.type !== "agent_task_run_internal" ||
+          pending.startAckRequired !== true ||
+          pending.userId !== userId ||
+          pending.deviceId !== deviceId
+        ) {
+          return;
+        }
+        settleAgentTaskStartAck(pending, true);
+        return;
+      }
+
       if (msg?.type === "claude_discover_commands_result") {
         const requestId = String(msg?.request_id || "");
         const pending = pendingRequests.get(requestId);
@@ -4674,6 +5481,9 @@ wss.on("connection", (ws) => {
         if (!pending) return;
         if (pending.userId !== userId || pending.deviceId !== deviceId) return;
         if (pending.type === "agent_task_run_internal") {
+          // Progress proves the connector accepted this exact request even if
+          // its dedicated start ACK was lost in transit.
+          settleAgentTaskStartAck(pending, true);
           queueAgentTaskProgress(pending, msg);
           return;
         }
@@ -4696,9 +5506,19 @@ wss.on("connection", (ws) => {
       if (msg?.type === "claude_run_result") {
         const requestId = String(msg?.request_id || "");
         const pending = pendingRequests.get(requestId);
-        if (!pending) return;
+        if (!pending) {
+          recoverUnknownAgentTaskResult({
+            requestId,
+            userId,
+            deviceId,
+            result: msg && typeof msg === "object" ? msg : {},
+          });
+          return;
+        }
         if (pending.type === "agent_task_run_internal") {
           if (pending.userId !== userId || pending.deviceId !== deviceId) return;
+          // A terminal result is also definitive proof of receipt.
+          settleAgentTaskStartAck(pending, true);
           void deliverAgentTaskCompletion(
             pending,
             msg && typeof msg === "object" ? msg : {}
@@ -4799,7 +5619,19 @@ wss.on("connection", (ws) => {
           usage: usageObject,
           duration_ms: msg?.duration_ms || null,
           error: msg?.error || null,
+          error_code: msg?.error_code || null,
           diffs: forwardedDiffs,
+          timed_out: msg?.timed_out === true,
+          aborted: msg?.aborted === true,
+          partial: msg?.partial === true,
+          exit_code:
+            typeof msg?.exit_code === "number" ? msg.exit_code : null,
+          signal:
+            typeof msg?.signal === "string" ? msg.signal : null,
+          has_result_event: msg?.has_result_event === true,
+          session_recovery_attempted:
+            msg?.session_recovery_attempted === true,
+          session_recovered: msg?.session_recovered === true,
         };
         const sent = pending.browserWs ? wsSend(pending.browserWs, resultPayload) : false;
 
@@ -5034,6 +5866,12 @@ wss.on("connection", (ws) => {
       // so long-running Playwright/Claude tasks do not continue after tab reload/close.
       for (const [requestId, pending] of pendingRequests.entries()) {
         if (pending?.browserWs !== ws) continue;
+        if (pending?.type === "workspace_pick") {
+          // The OS picker can trigger a browser reconnect as focus returns. Keep
+          // the request so the matching browser instance can rebind or replay it.
+          detachWorkspacePickBrowser(pending, ws);
+          continue;
+        }
         if (pending?.type === "claude_run") {
           // Keep Claude runs alive across browser reconnects. The matching browser
           // instance can rebind on the next browser_hello, and the final result is
@@ -5090,6 +5928,13 @@ wss.on("connection", (ws) => {
       for (const [requestId, pending] of pendingRequests.entries()) {
         if (pending?.deviceId !== info.deviceId) continue;
         if (pending?.type === "agent_task_run_internal") {
+          settleAgentTaskStartAck(pending, false);
+          if (pending.startAckRequired === true) {
+            // ACK-capable connectors retain the final result and replay it
+            // after reconnect. Keep the callback pending; the normal task
+            // timeout remains the upper bound if the connector never returns.
+            continue;
+          }
           void deliverAgentTaskCompletion(pending, {
             type: "claude_run_result",
             request_id: requestId,

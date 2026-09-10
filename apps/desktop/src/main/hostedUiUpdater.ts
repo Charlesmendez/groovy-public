@@ -4,6 +4,8 @@ import {
   UiRevisionState,
   type HostedUiUpdateStatus,
 } from "./uiRevisionState";
+import { clearHostedUiDeploymentPin } from "./hostedUiDeploymentPin";
+import { isHostedPageUrl } from "./hostedPageRecovery";
 
 const CHECK_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -38,6 +40,9 @@ export class HostedUiUpdater {
     this.origin = origin;
 
     const onDidFinishLoad = () => {
+      // Chromium's internal error page can finish loading after the hosted
+      // navigation fails. It must not mark a pending Groovy revision loaded.
+      if (!isHostedPageUrl(win.webContents.getURL(), origin)) return;
       const completedRevision = this.revisions.completeReload();
       if (completedRevision) {
         this.notifiedRevision = null;
@@ -59,8 +64,8 @@ export class HostedUiUpdater {
       this.publishStatus();
     };
     const onFocus = () => void this.check();
-    const onBlur = () => this.reloadPending();
-    const onHide = () => this.reloadPending();
+    const onBlur = () => void this.reloadPending();
+    const onHide = () => void this.reloadPending();
     const onClosed = () => this.detach();
 
     win.webContents.on("did-finish-load", onDidFinishLoad);
@@ -126,7 +131,7 @@ export class HostedUiUpdater {
 
       if (this.revisions.getStatus().state !== "ready") return;
       if (!win.isVisible() || !win.isFocused()) {
-        this.reloadPending();
+        void this.reloadPending();
         return;
       }
       this.showReadyNotification(revision);
@@ -142,10 +147,10 @@ export class HostedUiUpdater {
   }
 
   reloadNow(): void {
-    this.reloadPending();
+    void this.reloadPending();
   }
 
-  private reloadPending() {
+  private async reloadPending(): Promise<void> {
     const win = this.win;
     if (!win || win.isDestroyed()) return;
     const revision = this.revisions.beginReload();
@@ -153,6 +158,28 @@ export class HostedUiUpdater {
 
     log.info(`[ui-updater] reloading hosted revision ${revision}`);
     this.publishStatus();
+
+    try {
+      await clearHostedUiDeploymentPin(
+        win.webContents.session.cookies,
+        this.origin
+      );
+    } catch (error) {
+      log.warn(
+        `[ui-updater] could not clear the hosted deployment pin: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      this.revisions.failReload();
+      this.publishStatus();
+      return;
+    }
+
+    if (win !== this.win || win.isDestroyed()) {
+      this.revisions.failReload();
+      this.publishStatus();
+      return;
+    }
     win.webContents.reloadIgnoringCache();
   }
 

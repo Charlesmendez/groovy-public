@@ -1,8 +1,9 @@
 -- Channel-scoped skills and instruction documents.
 --
--- These assignments are additive to the selected Mind's capabilities. The
--- application runtime deliberately excludes them whenever a channel contains
--- workspace guests, so internal Markdown cannot cross that trust boundary.
+-- These assignments are additive to the selected Mind's capabilities and are
+-- explicit grants to the channel, including when that channel contains guests.
+-- Guest channels still require a guest-safe Mind, which prevents workspace-wide
+-- skill inheritance and keeps access limited to these deliberate assignments.
 
 create table if not exists public.chat_channel_skill_assignments (
   id uuid primary key default gen_random_uuid(),

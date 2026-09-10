@@ -1,6 +1,6 @@
 {
   "name": "groovy-desktop",
-  "version": "0.1.8",
+  "version": "0.24.46",
   "private": true,
   "description": "Groovy Desktop — Electron shell for the hosted Groovy web app with a managed local connector",
   "main": "dist/main/main.js",

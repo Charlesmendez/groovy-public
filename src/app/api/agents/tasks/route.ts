@@ -117,7 +117,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const task = await createAgentTask({
+  let task = await createAgentTask({
     userId: user.id,
     agentId: resolved.agent.id,
     prompt,
@@ -131,7 +131,7 @@ export async function POST(req: Request) {
   });
 
   if (task.status === "queued") {
-    kickAgentTask({
+    task = await kickAgentTask({
       taskId: task.id,
       userId: user.id,
       userEmail: user.email || null,

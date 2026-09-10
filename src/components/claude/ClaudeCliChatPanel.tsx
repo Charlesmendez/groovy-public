@@ -36,6 +36,10 @@ import {
   recordCodeAgentUsageBestEffort,
   type CodeAgentBillingContext,
 } from "@/lib/claude/codeAgentUsage";
+import {
+  CODE_AGENT_RUN_TIMEOUT_MS,
+  CODE_AGENT_TIMEOUT_CONTINUE_PROMPT,
+} from "@/lib/orchestrator/agentTaskTimeout";
 
 // Helper to extract filename from a diff string
 function extractFilenameFromDiff(diff: string): string {
@@ -217,9 +221,12 @@ type ClaudeRunResultMsg = {
   exit_code?: number | null;
   signal?: string | null;
   has_result_event?: boolean;
+  error_code?: string | null;
+  session_recovery_attempted?: boolean;
+  session_recovered?: boolean;
 };
 
-const CONNECTOR_CLAUDE_RUN_TIMEOUT_MS = 20 * 60 * 1000;
+const CONNECTOR_CLAUDE_RUN_TIMEOUT_MS = CODE_AGENT_RUN_TIMEOUT_MS;
 const CLAUDE_RUN_TIMEOUT_MS = CONNECTOR_CLAUDE_RUN_TIMEOUT_MS + 120_000;
 const CLAUDE_RUN_PROGRESS_TIMEOUT_MS = CLAUDE_RUN_TIMEOUT_MS;
 const MAX_RESTORED_INFLIGHT_AGE_MS = CLAUDE_RUN_TIMEOUT_MS + 60_000;
@@ -230,8 +237,7 @@ const CONNECTOR_WARNING_DELAY_MS = 2_500;
 const SLASH_COMMAND_DISCOVERY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CLAUDE_SLASH_DISCOVERY_COMPAT_PROMPT = "__GROOVY_DISCOVER_SLASH_COMMANDS__";
 const CLAUDE_SLASH_DISCOVERY_RESULT_PREFIX = "__GROOVY_SLASH_COMMANDS__:";
-const CLAUDE_TIMEOUT_CONTINUE_PROMPT =
-  "Continue from where you left off. Do not repeat completed tool calls or duplicate file edits. Finish the current task and return the final answer directly.";
+const CLAUDE_TIMEOUT_CONTINUE_PROMPT = CODE_AGENT_TIMEOUT_CONTINUE_PROMPT;
 const HANDSHAKE_SEND_MARKER = "HANDSHAKE_SEND_REQUEST:";
 
 function isTimeoutErrorMessage(value: string | null | undefined) {
@@ -1357,7 +1363,7 @@ export function ClaudeCliChatPanel({
   }, [agentId, supabase]);
 
   // Save thread session_id
-  const saveThreadSessionId = useCallback(async (sessionId: string) => {
+  const saveThreadSessionId = useCallback(async (sessionId: string | null) => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
@@ -1784,6 +1790,9 @@ export function ClaudeCliChatPanel({
           if (result.session_id) {
             setCliSessionId(result.session_id);
             void saveThreadSessionId(result.session_id);
+          } else if (result.session_recovery_attempted) {
+            setCliSessionId(null);
+            void saveThreadSessionId(null);
           }
 
         } else {
@@ -1826,6 +1835,9 @@ export function ClaudeCliChatPanel({
           if (result.session_id) {
             setCliSessionId(result.session_id);
             void saveThreadSessionId(result.session_id);
+          } else if (result.session_recovery_attempted) {
+            setCliSessionId(null);
+            void saveThreadSessionId(null);
           }
 
           setStreamingContent("");

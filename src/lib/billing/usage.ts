@@ -137,29 +137,46 @@ export type PricingUsdPerMillion = { input: number; output: number };
 // If we add more models later, extend this map.
 export const MODEL_PRICING_USD_PER_MILLION: Record<string, PricingUsdPerMillion> = {
   // https://platform.claude.com/docs/en/about-claude/pricing
+  "claude-fable-5": { input: 10, output: 50 },
+  "claude-opus-5": { input: 5, output: 25 },
+  "claude-opus-4-8": { input: 5, output: 25 },
   "claude-opus-4-7": { input: 5, output: 25 },
   "claude-opus-4-6": { input: 5, output: 25 },
   "claude-sonnet-4-6": { input: 3, output: 15 },
   "claude-sonnet-4-5": { input: 3, output: 15 },
   "claude-haiku-4-5": { input: 0.8, output: 4 },
+  "gpt-5.6-sol": { input: 5, output: 30 },
+  "gpt-5.6-terra": { input: 2, output: 12 },
+  "gpt-5.6-luna": { input: 0.2, output: 1.2 },
   "gpt-5.5": { input: 5, output: 30 },
   "gpt-5.5-pro": { input: 30, output: 180 },
   "gpt-5.4": { input: 2.5, output: 15 },
   "gpt-5.4-mini": { input: 0.75, output: 4.5 },
   "gpt-5.4-codex-mini": { input: 0.75, output: 6 },
+  "gpt-4o": { input: 2.5, output: 10 },
+  "gpt-4o-mini": { input: 0.15, output: 0.6 },
 };
 
 const MODEL_PRICING_ALIASES: Array<{ match: RegExp; pricing: PricingUsdPerMillion }> = [
+  { match: /^claude-fable-5(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-fable-5"] },
+  { match: /^claude-opus-5(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-opus-5"] },
+  { match: /^claude-opus-4[.-]8/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-opus-4-8"] },
   { match: /^claude-opus-4[.-]7/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-opus-4-7"] },
   { match: /^claude-opus-4[.-]6/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-opus-4-6"] },
   { match: /^claude-sonnet-4[.-]6/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-sonnet-4-6"] },
   { match: /^claude-sonnet-4[.-]5/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-sonnet-4-5"] },
   { match: /^claude-haiku-4[.-]5/i, pricing: MODEL_PRICING_USD_PER_MILLION["claude-haiku-4-5"] },
+  { match: /^gpt-5\.6-sol(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.6-sol"] },
+  { match: /^gpt-5\.6-terra(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.6-terra"] },
+  { match: /^gpt-5\.6-luna(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.6-luna"] },
+  { match: /^gpt-5\.6(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.6-sol"] },
   { match: /^gpt-5\.5-pro/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.5-pro"] },
   { match: /^gpt-5\.5/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.5"] },
   { match: /^gpt-5\.4-codex-mini/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.4-codex-mini"] },
   { match: /^gpt-5\.4-mini/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.4-mini"] },
   { match: /^gpt-5\.4/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-5.4"] },
+  { match: /^gpt-4o-mini(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-4o-mini"] },
+  { match: /^gpt-4o(?:$|[-.])/i, pricing: MODEL_PRICING_USD_PER_MILLION["gpt-4o"] },
 ];
 
 function clamp01(n: number): number {

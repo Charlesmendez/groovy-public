@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --check server.mjs && node --test ./*.test.mjs"
   },
   "dependencies": {
-    "ws": "^8.19.0"
+    "ws": "^8.21.3"
   }
 }
-

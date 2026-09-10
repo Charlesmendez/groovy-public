@@ -18,6 +18,10 @@
   /* Mobile-first spacing */
   --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
   --safe-area-inset-top: env(safe-area-inset-top, 0px);
+  --app-header-height: 3.5rem;
+  --app-header-offset: calc(
+    var(--safe-area-inset-top) + var(--app-header-height)
+  );
   --bottom-nav-height: 64px;
 }
 
@@ -321,6 +325,24 @@ body {
   height: calc(100vh - var(--safe-area-inset-top));
   height: calc(100dvh - var(--safe-area-inset-top));
   min-height: 0;
+}
+
+.email-workspace-sidebar {
+  position: absolute;
+  translate: -100% 0;
+  background: #0d0e11;
+  transition: translate 180ms ease;
+}
+
+.email-workspace-sidebar[data-open="true"] {
+  translate: 0 0;
+}
+
+@media (min-width: 64rem) {
+  .email-workspace-sidebar {
+    position: static;
+    translate: none;
+  }
 }
 
 .touch-scroll-y {

@@ -1,12 +1,53 @@
 import { generateText } from "ai";
+import type { SharedV3ProviderOptions } from "@ai-sdk/provider";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import {
-  getAnthropicReasoningProviderOptions,
-  resolveChatModel,
-  type ProviderId,
-} from "@/lib/ai/modelResolver";
+import { resolveChatModel } from "@/lib/ai/modelResolver";
 import { decryptLlmApiKey } from "@/lib/crypto/llmKey";
-import { resolveKeys } from "@/lib/keys/resolveKeyMode";
+import {
+  calendarMessageMethod,
+  calendarPartsContainInvitation,
+} from "@/lib/email/calendarInvite";
+import { ensureGroovyAiEmailDisclosure } from "@/lib/email/disclosure";
+import {
+  closeCoveredPendingInboxActions,
+  EmailWorkspacePersistenceError,
+  persistEmailWorkspaceActionMutation,
+} from "@/lib/email/actionPersistence";
+import { resolveEmailModel } from "@/lib/email/modelRouting";
+import type { EmailFocusArrival } from "@/lib/email/focusNotifications";
+import {
+  buildReplyAllRecipients as buildGmailReplyAllRecipients,
+  fetchVerifiedGmailMailboxAddress,
+  gmailApiCall,
+} from "@/lib/email/gmail";
+import {
+  mergeAutomaticReplyRecipients,
+  mergeVerifiedOwnedRecipientAddresses,
+  sanitizeAutomaticRecipientFields,
+} from "@/lib/email/recipients";
+import {
+  ACTIVE_DRAFT_REPLY_STATUSES,
+  EMAIL_TRIAGE_MODEL_FAILURE_SOURCE,
+  emailActionIsRetryableModelFailure,
+  EMAIL_TRIAGE_SUPERSEDED_REASON,
+  shouldReleaseDraftReplyThreadClaim,
+  shouldSupersedeEmailClassification,
+} from "@/lib/email/triageFreshness";
+import {
+  EMAIL_AUTO_ARCHIVE_CONFIDENCE,
+  EMAIL_AUTO_SPAM_CONFIDENCE,
+  EMAIL_CLASSIFICATION_ROUTING_CONFIDENCE,
+  routeEmailClassification,
+  shouldAutoExecuteEmailAction,
+} from "@/lib/email/routing";
+import {
+  applyEmailTriageEvidence,
+  EMAIL_TRIAGE_POLICY_VERSION,
+  mergeEmailTriageEvidence,
+  type SemanticEmailKind,
+} from "@/lib/email/triagePolicy";
+import { isEmailClassificationCorrection } from "@/lib/email/classificationFeedback";
+import { sendEmailFocusPush } from "@/lib/notifications/webPush";
 
 const GROOVY_LABEL_PROCESSED = "Groovy/Processed";
 const GROOVY_LABEL_DRAFTED = "Groovy/Drafted";
@@ -15,8 +56,10 @@ const GROOVY_LABEL_UNSUBSCRIBED = "Groovy/Unsubscribed";
 
 const INBOX_ACTIONS_MAX_PER_RUN = 12;
 const STAGE_B_MAX_BODY_CHARS = 14_000;
+const TRIAGE_MODEL_FAILURE_RETRY_DELAY_MS = 5 * 60_000;
 const HEARTBEAT_DRAFT_PREVIEW_CHARS = 260;
 const COMMAND_LIST_MAX_ROWS = 12;
+const PENDING_ACTION_SCAN_MAX_ROWS = COMMAND_LIST_MAX_ROWS * 10;
 // Auto-canceling pending inbox actions proved too brittle in real chats (WhatsApp especially).
 // Default is disabled; can be enabled via env for experimentation.
 const INBOX_PENDING_AUTO_CANCEL_AFTER_MESSAGES = (() => {
@@ -28,9 +71,6 @@ const INBOX_PENDING_AUTO_CANCEL_AFTER_MESSAGES = (() => {
 })();
 const DATAGRAN_API_TIMEOUT_MS = 60_000;
 const SENDER_INTEL_TIMEOUT_MS = 8_000;
-const GROOVY_EMAIL_SEND_NOTICE = "Sent with Groovy AI assistant. I apologize for any unintended messages.";
-const GROOVY_EMAIL_SEND_NOTICE_LEGACY = "Email sent via my Groovy assistant. Please excuse any unintended requests.";
-
 type DatagranResult = {
   ok: boolean;
   data?: unknown;
@@ -45,14 +85,28 @@ type GmailLabelMutationResult = {
 };
 
 export type HeartbeatPolicyModel = {
-  provider: ProviderId;
+  provider: "openai";
   modelName: string;
   apiKey: string | null;
+  reasoningEffort?: "none" | "low";
 };
+
+function emailPolicyProviderOptions(
+  model: HeartbeatPolicyModel,
+  defaultOpenAiEffort: "none" | "low",
+): SharedV3ProviderOptions {
+  return {
+    openai: {
+      reasoningEffort: model.reasoningEffort || defaultOpenAiEffort,
+    },
+  };
+}
 
 export type TriageMailbox = {
   connectionId: string;
   mailboxLabel: string;
+  address?: string | null;
+  ownedAddresses?: string[];
   datagranApiKey?: string | null;
 };
 
@@ -68,6 +122,11 @@ export type TriageEmailItem = {
   date: string;
   snippet: string;
   listUnsubscribe?: string;
+  authenticationResults?: string;
+  autoSubmitted?: string;
+  precedence?: string;
+  listId?: string;
+  labelIds?: string[];
   messageIdHeader?: string;
 };
 
@@ -78,6 +137,8 @@ export type HeartbeatTriageResult = {
   autoExecutedCount: number;
   criticalCount: number;
   notes: string[];
+  focusArrivals: EmailFocusArrival[];
+  focusNotification: { attempted: number; delivered: number };
 };
 
 export type BuildHeartbeatActionBlockResult = {
@@ -135,6 +196,8 @@ type ThreadMessageCandidate = {
   from: string;
   to: string;
   cc: string;
+  deliveredTo: string;
+  originalTo: string;
   subject: string;
   date: string;
   snippet: string;
@@ -142,6 +205,7 @@ type ThreadMessageCandidate = {
 };
 
 type PolicyDecision = {
+  messageKind: SemanticEmailKind;
   action: ActionType;
   confidence: number;
   pImportant: number;
@@ -187,6 +251,7 @@ type InboxActionRow = {
   draft_subject: string | null;
   draft_body: string | null;
   metadata: unknown;
+  received_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -251,16 +316,6 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 
 function toTrimmed(v: unknown): string {
   return typeof v === "string" ? v.trim() : v === null || v === undefined ? "" : String(v).trim();
-}
-
-function appendGroovyEmailSendNotice(body: string): string {
-  const trimmed = toTrimmed(body);
-  const noticeLower = normalizeKey(GROOVY_EMAIL_SEND_NOTICE);
-  const legacyLower = normalizeKey(GROOVY_EMAIL_SEND_NOTICE_LEGACY);
-  if (!trimmed) return GROOVY_EMAIL_SEND_NOTICE;
-  const normalized = normalizeKey(trimmed);
-  if (normalized.includes(noticeLower) || normalized.includes(legacyLower)) return trimmed;
-  return `${trimmed}\n\n${GROOVY_EMAIL_SEND_NOTICE}`;
 }
 
 function parseDatagranErrorPayload(parsed: unknown): { message: string; reasons: string[] } {
@@ -340,6 +395,7 @@ function formatThreadCandidatesForPolicy(candidates: ThreadMessageCandidate[]): 
         `from=${truncateForPrompt(c.from, 140) || "(missing)"}`,
         `to=${truncateForPrompt(c.to, 160) || "(missing)"}`,
         `cc=${truncateForPrompt(c.cc, 160) || "(none)"}`,
+        `delivered_to=${truncateForPrompt(c.deliveredTo, 160) || "(none)"}`,
         `subject=${truncateForPrompt(c.subject, 160) || "(none)"}`,
         `date=${truncateForPrompt(c.date, 120) || "(none)"}`,
       ].join(" | ")
@@ -377,51 +433,6 @@ function parseEmailAddresses(header: string): string[] {
   return out;
 }
 
-function buildReplyAllRecipients(args: {
-  senderEmail: string;
-  toHeader: string;
-  ccHeader: string;
-  userEmail?: string | null;
-}): { to: string[]; cc: string[] } {
-  const sender = normalizeKey(args.senderEmail);
-  const user = normalizeKey(toTrimmed(args.userEmail));
-  const toParsed = parseEmailAddresses(args.toHeader);
-  const ccParsed = parseEmailAddresses(args.ccHeader);
-
-  const to: string[] = [];
-  const toSet = new Set<string>();
-  const addTo = (email: string) => {
-    const e = normalizeKey(email);
-    if (!e) return;
-    if (user && e === user) return;
-    if (toSet.has(e)) return;
-    toSet.add(e);
-    to.push(e);
-  };
-
-  const cc: string[] = [];
-  const ccSet = new Set<string>();
-  const addCc = (email: string) => {
-    const e = normalizeKey(email);
-    if (!e) return;
-    if (user && e === user) return;
-    if (toSet.has(e)) return;
-    if (ccSet.has(e)) return;
-    ccSet.add(e);
-    cc.push(e);
-  };
-
-  // Gmail-style reply-all:
-  // - To: sender (or first visible recipient when sender missing)
-  // - Cc: everyone else from original To/Cc (excluding user + sender)
-  if (sender) addTo(sender);
-  else if (toParsed.length > 0) addTo(toParsed[0]);
-  for (const e of toParsed) addCc(e);
-  for (const e of ccParsed) addCc(e);
-
-  return { to, cc };
-}
-
 function listRecipientEmails(value: unknown): string[] {
   const values: unknown[] = Array.isArray(value) ? value : value === null || value === undefined ? [] : [value];
   const out: string[] = [];
@@ -446,43 +457,10 @@ function listRecipientEmails(value: unknown): string[] {
   return out;
 }
 
-function mergeRecipients(args: {
-  to: string[];
-  cc: string[];
-  senderEmail?: string | null;
-  userEmail?: string | null;
-}): { to: string[]; cc: string[] } {
-  const sender = normalizeKey(toTrimmed(args.senderEmail));
-  const user = normalizeKey(toTrimmed(args.userEmail));
-  const toOut: string[] = [];
-  const toSet = new Set<string>();
-  const ccOut: string[] = [];
-  const ccSet = new Set<string>();
-
-  const addTo = (email: string) => {
-    const e = normalizeKey(email);
-    if (!e || !e.includes("@")) return;
-    if (user && e === user) return;
-    if (toSet.has(e)) return;
-    toSet.add(e);
-    toOut.push(e);
-  };
-  const addCc = (email: string) => {
-    const e = normalizeKey(email);
-    if (!e || !e.includes("@")) return;
-    if (user && e === user) return;
-    if (sender && e === sender) return;
-    if (toSet.has(e)) return;
-    if (ccSet.has(e)) return;
-    ccSet.add(e);
-    ccOut.push(e);
-  };
-
-  for (const e of args.to || []) addTo(e);
-  if (toOut.length === 0 && sender) addTo(sender);
-  for (const e of args.cc || []) addCc(e);
-
-  return { to: toOut, cc: ccOut };
+function uniqueRecipientEmails(...values: unknown[]): string[] {
+  return listRecipientEmails(values.flatMap((value) =>
+    Array.isArray(value) ? value : [value],
+  ));
 }
 
 function decodeBase64Url(input: string): string {
@@ -687,7 +665,12 @@ Rules:
 - If explicit=false then kind must be "none".`;
 
   try {
-    const out = await generateText({ model, prompt });
+    const out = await generateText({
+      model,
+      prompt,
+      maxOutputTokens: 200,
+      providerOptions: emailPolicyProviderOptions(modelConfig, "none"),
+    });
     const parsed = extractJsonObject(out.text || "");
     if (!parsed) return { kind: "none" };
     return parseAiInboxCommandConfirmationObject({ raw: parsed, userText });
@@ -769,6 +752,19 @@ async function datagranApiCall(
   if (!datagranApiKey || !connectionId) {
     return { ok: false, error: "missing_datagran_key_or_connection" };
   }
+  const normalizedMethod = method.toUpperCase();
+  if (
+    endpoint.startsWith("/api/proxy/gmail/") &&
+    ["GET", "POST", "PUT", "DELETE"].includes(normalizedMethod)
+  ) {
+    return gmailApiCall({
+      datagranApiKey,
+      connectionId,
+      method: normalizedMethod as "GET" | "POST" | "PUT" | "DELETE",
+      endpoint,
+      body,
+    });
+  }
   try {
     const url = new URL(endpoint, "https://www.datagran.io");
     if (!url.searchParams.has("connection_id")) {
@@ -778,7 +774,7 @@ async function datagranApiCall(
     const ac = new AbortController();
     const timeout = setTimeout(() => ac.abort(), DATAGRAN_API_TIMEOUT_MS);
     const opts: RequestInit = {
-      method: method.toUpperCase(),
+      method: normalizedMethod,
       headers: {
         "x-api-key": datagranApiKey,
         "Content-Type": "application/json",
@@ -958,7 +954,7 @@ async function createGmailDraft(args: {
     to: args.to,
     cc: args.cc,
     subject: args.subject,
-    body: args.body,
+    body: ensureGroovyAiEmailDisclosure(args.body),
     inReplyTo: args.inReplyTo || undefined,
     references: args.references || undefined,
   });
@@ -999,7 +995,7 @@ async function updateGmailDraft(args: {
     to: args.to,
     cc: args.cc,
     subject: args.subject,
-    body: args.body,
+    body: ensureGroovyAiEmailDisclosure(args.body),
     inReplyTo: args.inReplyTo || undefined,
     references: args.references || undefined,
   });
@@ -1064,8 +1060,22 @@ async function fetchGmailMessageHeaders(args: {
   datagranApiKey: string;
   connectionId: string;
   messageId: string;
-}): Promise<{ toHeader: string; ccHeader: string; fromHeader: string; messageIdHeader: string }> {
-  const empty = { toHeader: "", ccHeader: "", fromHeader: "", messageIdHeader: "" };
+}): Promise<{
+  toHeader: string;
+  ccHeader: string;
+  fromHeader: string;
+  deliveredToHeader: string;
+  originalToHeader: string;
+  messageIdHeader: string;
+}> {
+  const empty = {
+    toHeader: "",
+    ccHeader: "",
+    fromHeader: "",
+    deliveredToHeader: "",
+    originalToHeader: "",
+    messageIdHeader: "",
+  };
   const messageId = toTrimmed(args.messageId);
   if (!messageId) return empty;
   const res = await datagranApiCall(
@@ -1074,7 +1084,7 @@ async function fetchGmailMessageHeaders(args: {
     "GET",
     `/api/proxy/gmail/gmail/v1/users/me/messages/${encodeURIComponent(
       messageId
-    )}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=From&metadataHeaders=Message-ID`
+    )}?format=metadata&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=From&metadataHeaders=Delivered-To&metadataHeaders=X-Original-To&metadataHeaders=Message-ID`
   );
   if (!res.ok || !res.data) return empty;
   const root = asRecord(res.data);
@@ -1093,8 +1103,38 @@ async function fetchGmailMessageHeaders(args: {
     toHeader: toTrimmed(byName.get("to") || ""),
     ccHeader: toTrimmed(byName.get("cc") || ""),
     fromHeader: toTrimmed(byName.get("from") || ""),
+    deliveredToHeader: toTrimmed(byName.get("delivered-to") || ""),
+    originalToHeader: toTrimmed(byName.get("x-original-to") || ""),
     messageIdHeader: toTrimmed(byName.get("message-id") || ""),
   };
+}
+
+async function resolveActionOwnedAddresses(args: {
+  userId: string;
+  datagranApiKey: string;
+  connectionId: string;
+  metadata: Record<string, unknown>;
+  userEmail?: string | null;
+  addressHints?: unknown;
+}): Promise<string[]> {
+  const profileAddress = await fetchVerifiedGmailMailboxAddress({
+    userId: args.userId,
+    datagranApiKey: args.datagranApiKey,
+    connectionId: args.connectionId,
+  });
+  if (!profileAddress) {
+    throw new Error(
+      "Could not verify the connected Gmail identity. The automatic draft was not sent.",
+    );
+  }
+  return mergeVerifiedOwnedRecipientAddresses({
+    knownAddresses: [
+      args.metadata.owned_addresses,
+      args.addressHints,
+    ],
+    userAddress: args.userEmail,
+    verifiedMailboxAddress: profileAddress,
+  });
 }
 
 async function fetchGmailDraftState(args: {
@@ -1158,7 +1198,12 @@ async function fetchFullMessageAndThread(args: {
   connectionId: string;
   messageId: string;
   threadId?: string | null;
-}): Promise<{ body: string; threadSummary: string; threadCandidates: ThreadMessageCandidate[] }> {
+}): Promise<{
+  body: string;
+  hasCalendarInvitation: boolean;
+  threadSummary: string;
+  threadCandidates: ThreadMessageCandidate[];
+}> {
   const msgRes = await datagranApiCall(
     args.datagranApiKey,
     args.connectionId,
@@ -1166,18 +1211,35 @@ async function fetchFullMessageAndThread(args: {
     `/api/proxy/gmail/gmail/v1/users/me/messages/${encodeURIComponent(args.messageId)}?format=full`
   );
   let body = "";
+  let hasCalendarInvitation = false;
   if (msgRes.ok && msgRes.data) {
     const root = asRecord(msgRes.data);
     const snippet = root ? toTrimmed(root.snippet) : "";
     const payload = root ? asRecord(root.payload) : null;
     const plainParts: string[] = [];
     const htmlParts: string[] = [];
+    const calendarMethods: string[] = [];
 
     const walk = (part: Record<string, unknown> | null) => {
       if (!part) return;
       const mime = toTrimmed(part.mimeType).toLowerCase();
       const bodyRec = asRecord(part.body);
       const data = bodyRec ? toTrimmed(bodyRec.data) : "";
+      if (mime === "text/calendar" || mime === "application/ics") {
+        const headers = Array.isArray(part.headers) ? part.headers : [];
+        const contentType = headers
+          .map((header) => asRecord(header))
+          .find(
+            (header) =>
+              normalizeKey(toTrimmed(header?.name)) === "content-type",
+          );
+        calendarMethods.push(
+          calendarMessageMethod({
+            contentType: toTrimmed(contentType?.value),
+            ics: data ? decodeBase64Url(data) : "",
+          }),
+        );
+      }
       if (data) {
         const decoded = decodeBase64Url(data);
         if (mime === "text/plain") plainParts.push(decoded);
@@ -1187,6 +1249,7 @@ async function fetchFullMessageAndThread(args: {
       for (const child of parts) walk(asRecord(child));
     };
     walk(payload);
+    hasCalendarInvitation = calendarPartsContainInvitation(calendarMethods);
     body =
       plainParts.join("\n\n").trim() ||
       stripHtml(htmlParts.join("\n\n")) ||
@@ -1226,6 +1289,8 @@ async function fetchFullMessageAndThread(args: {
           from: toTrimmed(byName.get("from") || ""),
           to: toTrimmed(byName.get("to") || ""),
           cc: toTrimmed(byName.get("cc") || ""),
+          deliveredTo: toTrimmed(byName.get("delivered-to") || ""),
+          originalTo: toTrimmed(byName.get("x-original-to") || ""),
           subject: toTrimmed(byName.get("subject") || ""),
           date: toTrimmed(byName.get("date") || ""),
           snippet: toTrimmed(rec.snippet),
@@ -1247,6 +1312,7 @@ async function fetchFullMessageAndThread(args: {
 
   return {
     body: body.slice(0, STAGE_B_MAX_BODY_CHARS),
+    hasCalendarInvitation,
     threadSummary: threadSummary.slice(0, 3000),
     threadCandidates,
   };
@@ -1465,24 +1531,34 @@ async function runStageBPolicy(args: {
   threadCandidates: ThreadMessageCandidate[];
   memoryContext?: string;
   preferenceContext?: string;
+  classificationFeedbackContext?: string;
+  mailboxInstructions?: string;
 }): Promise<PolicyDecision | null> {
   const model = resolveChatModel(
     args.policyModel.provider,
     args.policyModel.modelName,
     args.policyModel.apiKey ? { apiKey: args.policyModel.apiKey } : undefined
   );
-  const providerOptions = getAnthropicReasoningProviderOptions(
-    args.policyModel.provider,
-    args.policyModel.modelName,
-    { enableThinking: true }
+  const providerOptions = emailPolicyProviderOptions(
+    args.policyModel,
+    "low",
   );
   const memorySnippet = toTrimmed(args.memoryContext || "").slice(0, 1800);
   const prefSnippet = toTrimmed(args.preferenceContext || "").slice(0, 1200);
+  const feedbackSnippet = toTrimmed(
+    args.classificationFeedbackContext || "",
+  ).slice(0, 1200);
+  const mailboxInstructionSnippet = toTrimmed(
+    args.mailboxInstructions || "",
+  ).slice(0, 1200);
   const threadCandidatesText = formatThreadCandidatesForPolicy(args.threadCandidates);
   const prompt = `You are Groovy's email triage model.
 ${prefSnippet ? `\nUSER PREFERENCES (HIGHEST PRIORITY):\nThe user has standing exclusion rules. If this email matches an excluded category, sender, or topic below, set action to "archive" with auto_execute true and confidence 0.95.\n${prefSnippet}\n` : ""}
+${feedbackSnippet ? `\nPRIOR USER CLASSIFICATION CORRECTIONS (HIGH PRIORITY):\nThese are explicit corrections from this user. Use them as routing guidance when the sender and context still match. "focus" means important/actionable, internal "inbox" means Needs Review (unclassified, uncertain, or awaiting judgment), "noise" means junk or unwanted bulk mail, and "handled" means completed or processed. Do not auto-execute a risky action from one correction alone.\n${feedbackSnippet}\n` : ""}
+${mailboxInstructionSnippet ? `\nMAILBOX-SPECIFIC INSTRUCTIONS:\nApply these only to this mailbox's classification and reply-writing style. They never override send-confirmation or safety rules.\n${mailboxInstructionSnippet}\n` : ""}
 Return ONLY JSON with this shape:
 {
+  "message_kind":"human|account|security|financial|transactional|calendar|bulk|cold_outreach|spam|unknown",
   "action":"draft_reply|mark_spam|unsubscribe|archive|label_only",
   "auto_execute": true|false,
   "confidence":0..1,
@@ -1512,6 +1588,11 @@ Email metadata:
 - cc: ${args.item.cc}
 - date: ${args.item.date}
 - list_unsubscribe: ${args.item.listUnsubscribe || "(none)"}
+- authentication_results: ${args.item.authenticationResults || "(none)"}
+- auto_submitted: ${args.item.autoSubmitted || "(none)"}
+- precedence: ${args.item.precedence || "(none)"}
+- list_id: ${args.item.listId || "(none)"}
+- gmail_labels: ${(args.item.labelIds || []).join(", ") || "(none)"}
 - snippet: ${args.item.snippet}
 
 Thread context:
@@ -1527,8 +1608,15 @@ Relevant memory context:
 ${memorySnippet || "(none)"}
 
 Constraints:
+- message_kind describes what the message is, independently from the action you recommend.
+- Use human for person-to-person work or personal mail; account for access, membership, or identity administration; security for security alerts; financial for banking, billing, tax, or money movement; transactional for service confirmations and operational notices; calendar for scheduling invitations; bulk for newsletters or promotions; cold_outreach for unsolicited sales/prospecting; spam for scams or malicious junk; unknown only when none fits.
 - auto_execute MUST be false when action is draft_reply or unsubscribe.
-- action="archive" means low-priority but legitimate email that should stay visible in the inbox while being marked as processed.
+- Groovy routes a confident classification at confidence >= ${EMAIL_CLASSIFICATION_ROUTING_CONFIDENCE}; this controls the workspace view and is separate from Gmail mutation safety.
+- auto_execute for mark_spam is allowed only at confidence >= ${EMAIL_AUTO_SPAM_CONFIDENCE}.
+- auto_execute for archive is allowed only at confidence >= ${EMAIL_AUTO_ARCHIVE_CONFIDENCE}.
+- action="archive" means low-priority but legitimate email that can leave Gmail Inbox only after approval or the stricter auto-execution threshold.
+- action="label_only" means the email should remain visible and no email reply is needed; it does NOT mean the user's underlying task is complete.
+- Use label_only with high importance/actionability for external tasks such as reviewing or signing contracts, approving requests, completing forms, or taking action through another service.
 - Only use mark_spam or unsubscribe for junk, spam, or mailing-list style email that should leave the inbox.
 - If action is draft_reply, draft_reply must be non-empty plain text (no HTML).
 - If action is draft_reply, choose exactly one candidate and copy its thread_id + message_id_header exactly.
@@ -1540,11 +1628,25 @@ Constraints:
     const out = await generateText({
       model,
       prompt,
+      maxOutputTokens: 1_200,
       providerOptions,
     });
     const parsed = extractJsonObject(out.text || "");
     if (!parsed) return null;
     const actionRaw = normalizeKey(toTrimmed(parsed.action));
+    const messageKindRaw = normalizeKey(toTrimmed(parsed.message_kind));
+    const messageKind: SemanticEmailKind =
+      messageKindRaw === "human" ||
+      messageKindRaw === "account" ||
+      messageKindRaw === "security" ||
+      messageKindRaw === "financial" ||
+      messageKindRaw === "transactional" ||
+      messageKindRaw === "calendar" ||
+      messageKindRaw === "bulk" ||
+      messageKindRaw === "cold_outreach" ||
+      messageKindRaw === "spam"
+        ? messageKindRaw
+        : "unknown";
     const action: ActionType =
       actionRaw === "draft_reply" ||
       actionRaw === "mark_spam" ||
@@ -1553,11 +1655,16 @@ Constraints:
       actionRaw === "label_only"
         ? actionRaw
         : "label_only";
-    const autoExecuteRaw = parsed.auto_execute === true;
-    const autoExecute = autoExecuteRaw && action !== "draft_reply" && action !== "unsubscribe";
-    return {
+    const confidence = clamp01(Number(parsed.confidence ?? 0.5));
+    const autoExecute = shouldAutoExecuteEmailAction({
       action,
-      confidence: clamp01(Number(parsed.confidence ?? 0.5)),
+      requested: parsed.auto_execute === true,
+      confidence,
+    });
+    return {
+      messageKind,
+      action,
+      confidence,
       pImportant: clamp01(Number(parsed.p_important ?? 0.5)),
       pSpam: clamp01(Number(parsed.p_spam ?? 0.5)),
       pActionable: clamp01(Number(parsed.p_actionable ?? 0.5)),
@@ -1617,6 +1724,66 @@ function resolveDraftTarget(args: {
   };
 }
 
+async function rejectSupersededEmailClassifications(args: {
+  supabase: SupabaseClient;
+  userId: string;
+  item: TriageEmailItem;
+  current: InboxActionRow;
+  currentPolicyVersion: number;
+}): Promise<void> {
+  if (
+    !Number.isFinite(args.currentPolicyVersion) ||
+    args.currentPolicyVersion <= 0
+  ) {
+    return;
+  }
+  const priorResult = await args.supabase
+    .from("inbox_actions")
+    .select("id,recommended_action,status,metadata,updated_at")
+    .eq("user_id", args.userId)
+    .eq("provider", "gmail")
+    .eq("connection_id", args.item.connectionId)
+    .eq("gmail_message_id", args.item.id)
+    .in("status", ["pending", "done"])
+    .neq("id", args.current.id);
+  if (priorResult.error) throw new Error(priorResult.error.message);
+  const supersededIds = (priorResult.data || [])
+    .filter((candidate) => {
+      const previous = asRecord(candidate) || {};
+      const metadata = asRecord(previous.metadata) || {};
+      const action = toTrimmed(previous.recommended_action);
+      const status = toTrimmed(previous.status);
+      const previousVersion = Number(metadata.triage_policy_version || 0);
+      return (
+        action !== "draft_reply" &&
+        (status === "pending" ||
+          (status === "done" && action === "label_only")) &&
+        !toTrimmed(metadata.email_workspace_override_view) &&
+        shouldSupersedeEmailClassification({
+          candidateId: toTrimmed(previous.id),
+          candidateDecisionAt: toTrimmed(previous.updated_at),
+          candidatePolicyVersion: previousVersion,
+          currentId: args.current.id,
+          currentDecisionAt: args.current.updated_at,
+          currentPolicyVersion: args.currentPolicyVersion,
+        })
+      );
+    })
+    .map((candidate) => toTrimmed(candidate.id))
+    .filter(Boolean);
+  if (supersededIds.length === 0) return;
+  const rejected = await args.supabase
+    .from("inbox_actions")
+    .update({
+      status: "rejected",
+      reason: EMAIL_TRIAGE_SUPERSEDED_REASON,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", args.userId)
+    .in("id", supersededIds);
+  if (rejected.error) throw new Error(rejected.error.message);
+}
+
 async function insertInboxAction(args: {
   supabase: SupabaseClient;
   userId: string;
@@ -1640,10 +1807,91 @@ async function insertInboxAction(args: {
     .eq("gmail_message_id", args.item.id)
     .eq("recommended_action", args.decision.action)
     .maybeSingle();
+  if (existing.error) throw new Error(existing.error.message);
 
   if (existing.data) {
     const row = rowToInboxAction(existing.data);
-    return row ? { row, inserted: false } : null;
+    if (!row) return null;
+    const existingMetadata = asRecord(row.metadata) || {};
+    const incomingVersion = Number(
+      args.metadata?.triage_policy_version || 0,
+    );
+    const existingVersion = Number(
+      existingMetadata.triage_policy_version || 0,
+    );
+    const refreshableStatus =
+      row.status === "pending" ||
+      (row.status === "done" && row.recommended_action === "label_only") ||
+      (row.status === "rejected" &&
+        row.reason === EMAIL_TRIAGE_SUPERSEDED_REASON);
+    const canRefresh =
+      refreshableStatus &&
+      row.recommended_action !== "draft_reply" &&
+      !toTrimmed(existingMetadata.email_workspace_override_view) &&
+      Number.isFinite(incomingVersion) &&
+      (incomingVersion > existingVersion ||
+        emailActionIsRetryableModelFailure(row));
+    if (!canRefresh) return { row, inserted: false };
+
+    const refreshedAt = new Date().toISOString();
+    const refreshedStatus =
+      row.status === "rejected" ? args.status || "pending" : row.status;
+    try {
+      await persistEmailWorkspaceActionMutation({
+        supabase: args.supabase,
+        actionId: row.id,
+        userId: args.userId,
+        changedAt: refreshedAt,
+        expectedStatus: row.status,
+        status: refreshedStatus,
+        metadataPatch: {
+          ...(args.metadata || {}),
+          critical: args.decision.critical,
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof EmailWorkspacePersistenceError &&
+        /status changed/i.test(error.details)
+      ) {
+        const currentResult = await args.supabase
+          .from("inbox_actions")
+          .select("*")
+          .eq("id", row.id)
+          .eq("user_id", args.userId)
+          .maybeSingle();
+        const current = rowToInboxAction(currentResult.data) || row;
+        return { row: current, inserted: false };
+      }
+      throw error;
+    }
+
+    const refreshed = await args.supabase
+      .from("inbox_actions")
+      .update({
+        confidence: args.decision.confidence,
+        p_important: args.decision.pImportant,
+        p_spam: args.decision.pSpam,
+        p_actionable: args.decision.pActionable,
+        reason: args.decision.reason,
+        updated_at: refreshedAt,
+      })
+      .eq("id", row.id)
+      .eq("user_id", args.userId)
+      .eq("status", refreshedStatus)
+      .select("*")
+      .maybeSingle();
+    if (refreshed.error) throw new Error(refreshed.error.message);
+    const refreshedRow = rowToInboxAction(refreshed.data);
+    const current = refreshedRow || row;
+    await rejectSupersededEmailClassifications({
+      supabase: args.supabase,
+      userId: args.userId,
+      item: args.item,
+      current,
+      currentPolicyVersion: incomingVersion,
+    });
+    return { row: current, inserted: false };
   }
 
   const payload: Record<string, unknown> = {
@@ -1674,13 +1922,28 @@ async function insertInboxAction(args: {
     draft_to: args.draft ? args.draft.to : null,
     draft_subject: args.draft?.subject || null,
     draft_body: args.draft?.body || null,
-    metadata: args.metadata || {},
+    metadata: {
+      ...(args.metadata || {}),
+      critical: args.decision.critical,
+    },
   };
 
   const inserted = await args.supabase.from("inbox_actions").insert(payload).select("*").maybeSingle();
   if (inserted.data) {
     const row = rowToInboxAction(inserted.data);
-    return row ? { row, inserted: true } : null;
+    if (!row) return null;
+
+    const incomingVersion = Number(
+      args.metadata?.triage_policy_version || 0,
+    );
+    await rejectSupersededEmailClassifications({
+      supabase: args.supabase,
+      userId: args.userId,
+      item: args.item,
+      current: row,
+      currentPolicyVersion: incomingVersion,
+    });
+    return { row, inserted: true };
   }
 
   if (inserted.error && /duplicate key|unique/i.test(inserted.error.message || "")) {
@@ -1709,6 +1972,60 @@ async function insertInboxAction(args: {
         .limit(1)
         .maybeSingle();
       const threadRow = rowToInboxAction(reReadThread.data);
+      if (
+        threadRow &&
+        shouldReleaseDraftReplyThreadClaim({
+          status: threadRow.status,
+          existingMessageId: threadRow.gmail_message_id,
+          incomingMessageId: args.item.id,
+        })
+      ) {
+        const releasedAt = new Date().toISOString();
+        const released = await args.supabase
+          .from("inbox_actions")
+          .update({
+            gmail_thread_id: null,
+            updated_at: releasedAt,
+          })
+          .eq("id", threadRow.id)
+          .eq("gmail_thread_id", args.item.threadId)
+          .eq("status", threadRow.status)
+          .select("id")
+          .maybeSingle();
+        if (!released.error && toTrimmed(released.data?.id)) {
+          try {
+            await persistEmailWorkspaceActionMutation({
+              supabase: args.supabase,
+              actionId: threadRow.id,
+              userId: args.userId,
+              changedAt: releasedAt,
+              expectedStatus: threadRow.status,
+              metadataPatch: {
+                released_draft_reply_thread_id: args.item.threadId,
+                released_draft_reply_thread_at: releasedAt,
+                released_for_new_message_id: args.item.id,
+              },
+            });
+          } catch (error) {
+            if (
+              !(
+                error instanceof EmailWorkspacePersistenceError &&
+                /status changed/i.test(error.details)
+              )
+            ) {
+              throw error;
+            }
+            return { row: threadRow, inserted: false };
+          }
+          const retried = await args.supabase
+            .from("inbox_actions")
+            .insert(payload)
+            .select("*")
+            .maybeSingle();
+          const retriedRow = rowToInboxAction(retried.data);
+          if (retriedRow) return { row: retriedRow, inserted: true };
+        }
+      }
       if (threadRow) return { row: threadRow, inserted: false };
     }
   }
@@ -1736,7 +2053,15 @@ async function findExistingDraftReplyAction(args: {
       .limit(1)
       .maybeSingle();
     const row = rowToInboxAction(byMessage.data);
-    if (row) return row;
+    if (row && row.status !== "pending") return row;
+    if (row) {
+      const eligible = await filterEligiblePendingInboxActions({
+        supabase: args.supabase,
+        userId: args.userId,
+        rows: [row],
+      });
+      if (eligible[0]) return eligible[0];
+    }
   }
 
   const threadId = toTrimmed(args.threadId);
@@ -1749,10 +2074,18 @@ async function findExistingDraftReplyAction(args: {
     .eq("connection_id", args.connectionId)
     .eq("gmail_thread_id", threadId)
     .eq("recommended_action", "draft_reply")
+    .in("status", [...ACTIVE_DRAFT_REPLY_STATUSES])
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  return rowToInboxAction(byThread.data);
+  const threadRow = rowToInboxAction(byThread.data);
+  if (!threadRow || threadRow.status !== "pending") return threadRow;
+  const eligible = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: [threadRow],
+  });
+  return eligible[0] || null;
 }
 
 function rowToInboxAction(v: unknown): InboxActionRow | null {
@@ -1796,9 +2129,73 @@ function rowToInboxAction(v: unknown): InboxActionRow | null {
     draft_subject: toTrimmed(r.draft_subject) || null,
     draft_body: toTrimmed(r.draft_body) || null,
     metadata: r.metadata,
+    received_at: toTrimmed(r.received_at) || null,
     created_at: toTrimmed(r.created_at),
     updated_at: toTrimmed(r.updated_at),
   };
+}
+
+export function inboxActionCompletionMetadataPatch(
+  value: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value || {}).filter(
+      ([key]) => !key.startsWith("email_workspace_"),
+    ),
+  );
+}
+
+async function filterEligiblePendingInboxActions(args: {
+  supabase: SupabaseClient;
+  userId: string;
+  rows: InboxActionRow[];
+}): Promise<InboxActionRow[]> {
+  const pending = args.rows.filter(
+    (row) => row.user_id === args.userId && row.status === "pending",
+  );
+  if (pending.length === 0) return [];
+  const actionIds = Array.from(new Set(pending.map((row) => row.id)));
+  await closeCoveredPendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    actionIds,
+    changedAt: new Date().toISOString(),
+  });
+
+  // Re-read after the atomic cleanup. This also excludes a row concurrently
+  // completed by another device even when this cleanup did not update it, and
+  // keeps a row when a newer Focus/Inbox placement reversed the old marker.
+  const remaining = await args.supabase
+    .from("inbox_actions")
+    .select("*")
+    .eq("user_id", args.userId)
+    .eq("status", "pending")
+    .in("id", actionIds)
+    .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+  if (remaining.error) throw new Error(remaining.error.message);
+  const currentById = new Map<string, InboxActionRow>();
+  for (const value of remaining.data || []) {
+    const row = rowToInboxAction(value);
+    if (row) currentById.set(row.id, row);
+  }
+  return actionIds
+    .map((actionId) => currentById.get(actionId))
+    .filter((row): row is InboxActionRow => !!row);
+}
+
+async function eligiblePendingInboxActionMap(args: {
+  supabase: SupabaseClient;
+  userId: string;
+  values: readonly unknown[];
+}): Promise<Map<string, InboxActionRow>> {
+  const rows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: args.values
+      .map((value) => rowToInboxAction(value))
+      .filter((row): row is InboxActionRow => !!row),
+  });
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
 async function tryAcquireActionExecutionLock(args: {
@@ -1808,14 +2205,15 @@ async function tryAcquireActionExecutionLock(args: {
 }): Promise<InboxActionRow | null> {
   const nowIso = new Date().toISOString();
   const res = await args.supabase
-    .from("inbox_actions")
-    .update({ status: "executing", updated_at: nowIso })
-    .eq("id", args.actionId)
-    .eq("user_id", args.userId)
-    .eq("status", "pending")
-    .select("*")
+    .rpc("try_acquire_inbox_action_execution", {
+      p_action_id: args.actionId,
+      p_user_id: args.userId,
+      p_changed_at: nowIso,
+    })
     .maybeSingle();
-  return rowToInboxAction(res.data);
+  if (res.error) throw new Error(res.error.message);
+  const row = rowToInboxAction(res.data);
+  return row?.user_id === args.userId ? row : null;
 }
 
 function describeGmailMutationFailure(base: string, mutation: GmailLabelMutationResult): string {
@@ -1844,19 +2242,15 @@ async function completeAction(args: {
   extra?: Record<string, unknown>;
 }) {
   const nowIso = new Date().toISOString();
-  const patch: Record<string, unknown> = {
+  await persistEmailWorkspaceActionMutation({
+    supabase: args.supabase,
+    actionId: args.actionId,
+    userId: args.userId,
+    changedAt: nowIso,
     status: args.status,
-    updated_at: nowIso,
-  };
-  if (args.status === "done") patch.executed_at = nowIso;
-  if (args.extra) {
-    patch.metadata = args.extra;
-  }
-  await args.supabase
-    .from("inbox_actions")
-    .update(patch)
-    .eq("id", args.actionId)
-    .eq("user_id", args.userId);
+    executedAt: args.status === "done" ? nowIso : null,
+    metadataPatch: inboxActionCompletionMetadataPatch(args.extra),
+  });
 }
 
 async function executeInboxAction(args: {
@@ -1893,28 +2287,40 @@ async function executeInboxAction(args: {
     const senderFromLive = parseSender(targetFromHeader || liveHeaders.fromHeader).email;
     const senderEmail = senderFromLive || row.sender_email || "";
     const userEmail = toTrimmed(meta.user_email) || null;
+    const ownedAddresses = await resolveActionOwnedAddresses({
+      userId: row.user_id,
+      datagranApiKey,
+      connectionId,
+      metadata: meta,
+      userEmail,
+      addressHints: [
+        liveHeaders.deliveredToHeader,
+        liveHeaders.originalToHeader,
+      ],
+    });
     const originalToHeader = targetToHeader || toTrimmed(meta.original_to_header) || liveHeaders.toHeader;
     const originalCcHeader = targetCcHeader || toTrimmed(meta.original_cc_header) || liveHeaders.ccHeader;
-    const replyAll = buildReplyAllRecipients({
-      senderEmail,
-      toHeader: originalToHeader,
-      ccHeader: originalCcHeader,
-      userEmail,
+    const replyAll = buildGmailReplyAllRecipients({
+      from: targetFromHeader || liveHeaders.fromHeader || senderEmail,
+      to: originalToHeader,
+      cc: originalCcHeader,
+      userAddress: ownedAddresses[0] || userEmail || "",
+      ownedAddresses,
     });
-    const mergedRecipients = mergeRecipients({
+    const mergedRecipients = mergeAutomaticReplyRecipients({
       to: [...listRecipientEmails(liveDraft?.toHeader), ...listRecipientEmails(row.draft_to), ...replyAll.to],
       cc: [...listRecipientEmails(liveDraft?.ccHeader), ...listRecipientEmails(meta.draft_cc), ...replyAll.cc],
-      senderEmail,
-      userEmail,
+      senderAddress: senderEmail,
+      ownedAddresses,
     });
-    const toList = mergedRecipients.to.length > 0 ? mergedRecipients.to : senderEmail ? [senderEmail] : [];
+    const toList = mergedRecipients.to;
     const ccList = mergedRecipients.cc;
     const to = toList.join(", ");
     const cc = ccList.join(", ");
     const subject = toTrimmed(liveDraft?.subject) || row.draft_subject || `Re: ${row.subject || ""}`;
     const bodyText = toTrimmed(liveDraft?.body) || toTrimmed(row.draft_body);
     if (!bodyText) return { ok: false, detail: "Draft body is empty. Edit the draft text first." };
-    const body = appendGroovyEmailSendNotice(bodyText);
+    const body = ensureGroovyAiEmailDisclosure(bodyText);
     const targetMessageIdHeader = toTrimmed(meta.target_message_id_header) || null;
     const targetThreadId = toTrimmed(meta.target_thread_id) || null;
     const messageIdHeader =
@@ -1972,9 +2378,9 @@ async function executeInboxAction(args: {
       return { ok: false, detail: "Draft action has no Gmail draft id." };
     }
     const persistedTargetThreadId = threadIdForDraft || targetThreadId || null;
-    const nextMeta: Record<string, unknown> = {
-      ...meta,
+    const draftMetadataPatch: Record<string, unknown> = {
       user_email: userEmail || null,
+      owned_addresses: ownedAddresses,
       original_to_header: originalToHeader || null,
       original_cc_header: originalCcHeader || null,
       draft_cc: ccList,
@@ -1985,18 +2391,59 @@ async function executeInboxAction(args: {
       ...(targetMessageIdHeader ? { target_message_id_header: targetMessageIdHeader } : {}),
       ...(messageIdHeader ? { message_id_header: messageIdHeader } : {}),
     };
-    await args.supabase
+    const draftPersistedAt = new Date().toISOString();
+    const structuralWrite = await args.supabase
       .from("inbox_actions")
       .update({
         gmail_draft_id: draftId,
         draft_to: toList,
         draft_subject: subject,
         draft_body: body,
-        metadata: nextMeta,
-        updated_at: new Date().toISOString(),
+        updated_at: draftPersistedAt,
       })
       .eq("id", row.id)
-      .eq("user_id", row.user_id);
+      .eq("user_id", row.user_id)
+      .eq("status", "executing")
+      .select("id")
+      .maybeSingle();
+    if (structuralWrite.error) {
+      return {
+        ok: false,
+        detail: `Failed to save the prepared draft: ${structuralWrite.error.message}`,
+      };
+    }
+    if (!toTrimmed(structuralWrite.data?.id)) {
+      return {
+        ok: false,
+        detail: "The draft action was handled before it could be sent.",
+      };
+    }
+    try {
+      await persistEmailWorkspaceActionMutation({
+        supabase: args.supabase,
+        actionId: row.id,
+        userId: row.user_id,
+        changedAt: draftPersistedAt,
+        expectedStatus: "executing",
+        metadataPatch: draftMetadataPatch,
+      });
+    } catch (error) {
+      if (
+        error instanceof EmailWorkspacePersistenceError &&
+        /status changed/i.test(error.details)
+      ) {
+        return {
+          ok: false,
+          detail: "The draft action was handled before it could be sent.",
+        };
+      }
+      return {
+        ok: false,
+        detail: `Failed to save the prepared draft: ${
+          error instanceof Error ? error.message : "unknown persistence error"
+        }`,
+      };
+    }
     const sent = await sendGmailDraft({
       datagranApiKey,
       connectionId,
@@ -2071,11 +2518,11 @@ async function executeInboxAction(args: {
       threadId: row.gmail_thread_id,
       applyToThread: true,
       addLabelIds: [processed].filter(Boolean),
-      removeLabelIds: [],
+      removeLabelIds: ["INBOX"],
     });
     return mutation.ok
-      ? { ok: true, detail: "Kept in inbox and labeled as processed." }
-      : { ok: false, detail: describeGmailMutationFailure("Failed to keep in inbox.", mutation) };
+      ? { ok: true, detail: "Archived and labeled as processed." }
+      : { ok: false, detail: describeGmailMutationFailure("Failed to archive.", mutation) };
   }
 
   const mutation = await modifyGmailMessageLabels({
@@ -2239,25 +2686,33 @@ async function markDraftSendConfirmationPending(args: {
   row: InboxActionRow;
   userId: string;
   alias: number;
-}) {
+}): Promise<boolean> {
   const nowIso = new Date().toISOString();
-  const meta = asRecord(args.row.metadata) || {};
-  await args.supabase
-    .from("inbox_actions")
-    .update({
-      metadata: {
-        ...meta,
+  try {
+    await persistEmailWorkspaceActionMutation({
+      supabase: args.supabase,
+      actionId: args.row.id,
+      userId: args.userId,
+      changedAt: nowIso,
+      expectedStatus: "pending",
+      metadataPatch: {
         approved_via: "command",
         send_confirmation_required: true,
         send_confirmation_pending: true,
         send_confirmation_requested_at: nowIso,
         send_confirmation_alias: args.alias,
       },
-      updated_at: nowIso,
-    })
-    .eq("id", args.row.id)
-    .eq("user_id", args.userId)
-    .eq("status", "pending");
+    });
+    return true;
+  } catch (error) {
+    if (
+      error instanceof EmailWorkspacePersistenceError &&
+      /status changed/i.test(error.details)
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function formatActionForHeartbeat(alias: number, row: InboxActionRow): string {
@@ -2444,25 +2899,30 @@ async function loadInboxAliasIntentContext(args: {
   const actionIds = aliasList.map((row) => row.actionId);
   const actionRows = await args.supabase
     .from("inbox_actions")
-    .select("id,recommended_action,status,subject")
+    .select("*")
     .eq("user_id", args.userId)
     .in("id", actionIds);
+  const eligibleRows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: (actionRows.data || [])
+      .map((row) => rowToInboxAction(row))
+      .filter((row): row is InboxActionRow => !!row),
+  });
   const byId = new Map<
     string,
     { action: string; status: string; subject: string }
   >();
-  for (const row of actionRows.data || []) {
-    const rec = asRecord(row) || {};
-    const actionId = toTrimmed(rec.id);
-    if (!actionId) continue;
-    byId.set(actionId, {
-      action: toTrimmed(rec.recommended_action) || "unknown",
-      status: toTrimmed(rec.status) || "unknown",
-      subject: toTrimmed(rec.subject) || "(no subject)",
+  for (const row of eligibleRows) {
+    byId.set(row.id, {
+      action: row.recommended_action,
+      status: row.status,
+      subject: row.subject || "(no subject)",
     });
   }
 
   return aliasList
+    .filter((row) => byId.has(row.actionId))
     .map((row) => {
       const details = byId.get(row.actionId);
       return {
@@ -2512,19 +2972,23 @@ async function recoverExplicitAliasesForAgent(args: {
   const actionIds = Array.from(new Set(candidates.map((row) => row.actionId)));
   const actionRows = await args.supabase
     .from("inbox_actions")
-    .select("id,recommended_action,status,subject")
+    .select("*")
     .eq("user_id", args.userId)
     .in("id", actionIds);
+  const eligibleRows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: (actionRows.data || [])
+      .map((row) => rowToInboxAction(row))
+      .filter((row): row is InboxActionRow => !!row),
+  });
 
   const actionById = new Map<string, { action: string; status: string; subject: string }>();
-  for (const row of actionRows.data || []) {
-    const rec = asRecord(row) || {};
-    const id = toTrimmed(rec.id);
-    if (!id) continue;
-    actionById.set(id, {
-      action: toTrimmed(rec.recommended_action) || "unknown",
-      status: toTrimmed(rec.status) || "unknown",
-      subject: toTrimmed(rec.subject) || "(no subject)",
+  for (const row of eligibleRows) {
+    actionById.set(row.id, {
+      action: row.recommended_action,
+      status: row.status,
+      subject: row.subject || "(no subject)",
     });
   }
 
@@ -2588,11 +3052,16 @@ async function resolveInboxCommandIntentModel(args: {
   userId: string;
 }): Promise<HeartbeatPolicyModel | null> {
   try {
-    const resolved = await resolveKeys(args.userId, args.supabase);
+    const resolved = await resolveEmailModel({
+      supabase: args.supabase,
+      userId: args.userId,
+      tier: "fast",
+    });
     return {
       provider: resolved.provider,
-      modelName: resolved.provider === "anthropic" ? "claude-haiku-4.5" : "gpt-4o-mini",
+      modelName: resolved.modelName,
       apiKey: resolved.apiKey,
+      reasoningEffort: resolved.reasoningEffort,
     };
   } catch (err) {
     console.warn("[inbox-actions] command intent model resolve failed:", err);
@@ -2835,15 +3304,22 @@ async function parseInboxCommandWithAi(args: {
     // Best-effort: aliases can be missing/stale if a user issues commands before the action block was rendered.
     const pendingRes = await args.supabase
       .from("inbox_actions")
-      .select("id")
+      .select("*")
       .eq("user_id", args.userId)
       .eq("agent_id", args.agentId)
       .eq("status", "pending")
       .order("created_at", { ascending: false })
-      .limit(COMMAND_LIST_MAX_ROWS);
-    const pendingIds = (pendingRes.data || [])
-      .map((r) => toTrimmed((r as { id?: unknown }).id))
-      .filter(Boolean);
+      .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+    const eligibleRows = await filterEligiblePendingInboxActions({
+      supabase: args.supabase,
+      userId: args.userId,
+      rows: (pendingRes.data || [])
+        .map((row) => rowToInboxAction(row))
+        .filter((row): row is InboxActionRow => !!row),
+    });
+    const pendingIds = eligibleRows
+      .slice(0, COMMAND_LIST_MAX_ROWS)
+      .map((row) => row.id);
     if (pendingIds.length > 0) {
       await syncSessionAliases({
         supabase: args.supabase,
@@ -2862,20 +3338,24 @@ async function parseInboxCommandWithAi(args: {
     // Cross-agent recovery: if alias state is stale, recover from current pending actions.
     const crossPendingRes = await args.supabase
       .from("inbox_actions")
-      .select("id,agent_id,created_at")
+      .select("*")
       .eq("user_id", args.userId)
       .eq("status", "pending")
       .order("created_at", { ascending: false })
-      .limit(COMMAND_LIST_MAX_ROWS * 3);
+      .limit(PENDING_ACTION_SCAN_MAX_ROWS);
 
-    const rows = Array.isArray(crossPendingRes.data) ? crossPendingRes.data : [];
+    const rows = await filterEligiblePendingInboxActions({
+      supabase: args.supabase,
+      userId: args.userId,
+      rows: (Array.isArray(crossPendingRes.data) ? crossPendingRes.data : [])
+        .map((row) => rowToInboxAction(row))
+        .filter((row): row is InboxActionRow => !!row),
+    });
     const pendingByAgent = new Map<string, string[]>();
     const allPendingIds: string[] = [];
-    for (const raw of rows) {
-      const rec = asRecord(raw);
-      if (!rec) continue;
-      const id = toTrimmed(rec.id);
-      const aid = toTrimmed(rec.agent_id);
+    for (const row of rows.slice(0, COMMAND_LIST_MAX_ROWS * 3)) {
+      const id = row.id;
+      const aid = row.agent_id || "";
       if (!id || !aid) continue;
       allPendingIds.push(id);
       const existing = pendingByAgent.get(aid) || [];
@@ -3031,6 +3511,8 @@ Rules:
       const out = await generateText({
         model,
         prompt,
+        maxOutputTokens: 600,
+        providerOptions: emailPolicyProviderOptions(modelConfig, "none"),
       });
       const parsed = extractJsonObject(out.text || "");
       if (parsed) {
@@ -3160,10 +3642,16 @@ export async function applyPendingInboxActionSilencePolicy(args: {
     .eq("agent_id", args.agentId)
     .eq("status", "pending")
     .order("created_at", { ascending: true })
-    .limit(COMMAND_LIST_MAX_ROWS);
-  const pendingRows = (pendingRes.data || [])
-    .map((row) => rowToInboxAction(row))
-    .filter((row): row is InboxActionRow => !!row);
+    .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+  const pendingRows = (
+    await filterEligiblePendingInboxActions({
+      supabase: args.supabase,
+      userId: args.userId,
+      rows: (pendingRes.data || [])
+        .map((row) => rowToInboxAction(row))
+        .filter((row): row is InboxActionRow => !!row),
+    })
+  ).slice(0, COMMAND_LIST_MAX_ROWS);
 
   if (pendingRows.length === 0) {
     return {
@@ -3187,13 +3675,6 @@ export async function applyPendingInboxActionSilencePolicy(args: {
     const previousTurns = Number.isFinite(previousTurnsRaw) ? Math.max(0, Math.floor(previousTurnsRaw)) : 0;
     const nextTurns = mentionsActions ? 0 : previousTurns + 1;
 
-    const nextMeta: Record<string, unknown> = {
-      ...existingMeta,
-      auto_cancel_silence_turns: nextTurns,
-      auto_cancel_threshold_messages: threshold,
-      auto_cancel_last_user_message_at: nowIso,
-    };
-
     if (!mentionsActions && nextTurns >= threshold) {
       cancelledCount += 1;
       await completeAction({
@@ -3202,7 +3683,9 @@ export async function applyPendingInboxActionSilencePolicy(args: {
         userId: args.userId,
         status: "rejected",
         extra: {
-          ...nextMeta,
+          auto_cancel_silence_turns: nextTurns,
+          auto_cancel_threshold_messages: threshold,
+          auto_cancel_last_user_message_at: nowIso,
           auto_cancelled: true,
           auto_cancelled_at: nowIso,
           auto_cancel_reason: `No inbox action follow-up after ${threshold} user messages.`,
@@ -3211,20 +3694,35 @@ export async function applyPendingInboxActionSilencePolicy(args: {
       return;
     }
 
-    remainingIds.push(row.id);
-
     // If user referenced actions and the counter was already zero, avoid a no-op write.
-    if (mentionsActions && previousTurns === 0) return;
+    if (mentionsActions && previousTurns === 0) {
+      remainingIds.push(row.id);
+      return;
+    }
 
-    await args.supabase
-      .from("inbox_actions")
-      .update({
-        metadata: nextMeta,
-        updated_at: nowIso,
-      })
-      .eq("id", row.id)
-      .eq("user_id", args.userId)
-      .eq("status", "pending");
+    try {
+      await persistEmailWorkspaceActionMutation({
+        supabase: args.supabase,
+        actionId: row.id,
+        userId: args.userId,
+        changedAt: nowIso,
+        expectedStatus: "pending",
+        metadataPatch: {
+          auto_cancel_silence_turns: nextTurns,
+          auto_cancel_threshold_messages: threshold,
+          auto_cancel_last_user_message_at: nowIso,
+        },
+      });
+      remainingIds.push(row.id);
+    } catch (error) {
+      if (
+        error instanceof EmailWorkspacePersistenceError &&
+        /status changed/i.test(error.details)
+      ) {
+        return;
+      }
+      throw error;
+    }
   });
 
   await syncSessionAliases({
@@ -3269,16 +3767,23 @@ async function listPendingAliases(args: {
     .select("*")
     .eq("user_id", args.userId)
     .in("id", actionIds);
-  const byId = new Map<string, InboxActionRow>();
-  for (const r of rows.data || []) {
-    const parsed = rowToInboxAction(r);
-    if (parsed) byId.set(parsed.id, parsed);
-  }
-  const lines = aliases.map((a) => {
-    const row = byId.get(a.actionId);
-    if (!row) return `#${a.alias} (missing action)`;
-    return `#${a.alias} ${shortMailboxLabel(row.mailbox_label || "")}: ${row.recommended_action} — ${row.subject || "(no subject)"}`;
+  const eligibleRows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: (rows.data || [])
+      .map((row) => rowToInboxAction(row))
+      .filter((row): row is InboxActionRow => !!row),
   });
+  const byId = new Map<string, InboxActionRow>();
+  for (const row of eligibleRows) {
+    byId.set(row.id, row);
+  }
+  const lines = aliases.filter((a) => byId.has(a.actionId)).map((a) => {
+    const row = byId.get(a.actionId);
+    if (!row) return "";
+    return `#${a.alias} ${shortMailboxLabel(row.mailbox_label || "")}: ${row.recommended_action} — ${row.subject || "(no subject)"}`;
+  }).filter(Boolean);
+  if (lines.length === 0) return "No pending inbox actions right now.";
   return `Pending inbox actions:\n${lines.join("\n")}`;
 }
 
@@ -3289,15 +3794,22 @@ async function resequencePendingAliases(args: {
 }) {
   const pending = await args.supabase
     .from("inbox_actions")
-    .select("id")
+    .select("*")
     .eq("user_id", args.userId)
     .eq("agent_id", args.agentId)
     .eq("status", "pending")
     .order("created_at", { ascending: false })
-    .limit(COMMAND_LIST_MAX_ROWS);
-  const ids = (pending.data || [])
-    .map((r) => toTrimmed((r as { id?: unknown }).id))
-    .filter(Boolean);
+    .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+  const eligibleRows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: (pending.data || [])
+      .map((row) => rowToInboxAction(row))
+      .filter((row): row is InboxActionRow => !!row),
+  });
+  const ids = eligibleRows
+    .slice(0, COMMAND_LIST_MAX_ROWS)
+    .map((row) => row.id);
   await syncSessionAliases({
     supabase: args.supabase,
     userId: args.userId,
@@ -3526,11 +4038,11 @@ export async function executeInboxCommand(args: {
         .select("*")
         .eq("user_id", args.userId)
         .in("id", wanted.map((w) => w.actionId));
-      const byId = new Map<string, InboxActionRow>();
-      for (const r of rows.data || []) {
-        const parsedRow = rowToInboxAction(r);
-        if (parsedRow) byId.set(parsedRow.id, parsedRow);
-      }
+      const byId = await eligiblePendingInboxActionMap({
+        supabase: args.supabase,
+        userId: args.userId,
+        values: rows.data || [],
+      });
 
       const normalizedUserText = normalizeInboxCommandText(args.text);
       const mentioned = extractMentionedAliases(
@@ -3601,7 +4113,6 @@ export async function executeInboxCommand(args: {
             userId: args.userId,
             status: "rejected",
             extra: {
-              ...(asRecord(row.metadata) || {}),
               rejected_via: "command",
               rejected_at: new Date().toISOString(),
             },
@@ -3611,13 +4122,17 @@ export async function executeInboxCommand(args: {
         }
 
         if (row.recommended_action === "draft_reply") {
-          await markDraftSendConfirmationPending({
+          const marked = await markDraftSendConfirmationPending({
             supabase: args.supabase,
             row,
             userId: args.userId,
             alias: target.alias,
           });
-          outcomes.push(`${prefix}: draft approved. Send is not executed yet. Confirm with "send ${target.alias}".`);
+          outcomes.push(
+            marked
+              ? `${prefix}: draft approved. Send is not executed yet. Confirm with "send ${target.alias}".`
+              : `${prefix}: already handled`,
+          );
           continue;
         }
 
@@ -3653,7 +4168,6 @@ export async function executeInboxCommand(args: {
             userId: args.userId,
             status: "done",
             extra: {
-              ...(asRecord(lock.metadata) || {}),
               approved_via: "command",
               execution_detail: exec.detail,
               ...(Array.isArray(exec.connectorExecutes) && exec.connectorExecutes.length > 0
@@ -3679,7 +4193,6 @@ export async function executeInboxCommand(args: {
             userId: args.userId,
             status: "failed",
             extra: {
-              ...(asRecord(lock.metadata) || {}),
               execution_error: exec.detail,
             },
           });
@@ -3751,11 +4264,11 @@ export async function executeInboxCommand(args: {
         .select("*")
         .eq("user_id", args.userId)
         .in("id", wanted.map((w) => w.actionId));
-      const byId = new Map<string, InboxActionRow>();
-      for (const row of rows.data || []) {
-        const parsedRow = rowToInboxAction(row);
-        if (parsedRow) byId.set(parsedRow.id, parsedRow);
-      }
+      const byId = await eligiblePendingInboxActionMap({
+        supabase: args.supabase,
+        userId: args.userId,
+        values: rows.data || [],
+      });
 
       const outcomes: string[] = [];
       for (const alias of wanted) {
@@ -3812,7 +4325,6 @@ export async function executeInboxCommand(args: {
             userId: args.userId,
             status: "done",
             extra: {
-              ...(asRecord(lock.metadata) || {}),
               approved_via: "command",
               send_confirmed_via: "command",
               send_confirmation_pending: false,
@@ -3828,7 +4340,6 @@ export async function executeInboxCommand(args: {
             userId: args.userId,
             status: "failed",
             extra: {
-              ...(asRecord(lock.metadata) || {}),
               send_confirmation_pending: false,
               execution_error: exec.detail,
             },
@@ -3882,17 +4393,19 @@ export async function executeInboxCommand(args: {
         }
         const actionRows = await args.supabase
           .from("inbox_actions")
-          .select("id,recommended_action,status")
+          .select("*")
           .eq("user_id", args.userId)
           .in("id", aliasList.map((a) => a.actionId));
+        const eligibleById = await eligiblePendingInboxActionMap({
+          supabase: args.supabase,
+          userId: args.userId,
+          values: actionRows.data || [],
+        });
         const byId = new Map<string, { action: string; status: string }>();
-        for (const row of actionRows.data || []) {
-          const rec = asRecord(row) || {};
-          const id = toTrimmed(rec.id);
-          if (!id) continue;
-          byId.set(id, {
-            action: normalizeKey(toTrimmed(rec.recommended_action)),
-            status: normalizeKey(toTrimmed(rec.status)),
+        for (const row of eligibleById.values()) {
+          byId.set(row.id, {
+            action: row.recommended_action,
+            status: row.status,
           });
         }
         const draftAliases = aliasList.filter((a) => {
@@ -3928,7 +4441,12 @@ export async function executeInboxCommand(args: {
         .eq("id", actionId)
         .eq("user_id", args.userId)
         .maybeSingle();
-      const row = rowToInboxAction(actionRow.data);
+      const eligible = await eligiblePendingInboxActionMap({
+        supabase: args.supabase,
+        userId: args.userId,
+        values: actionRow.data ? [actionRow.data] : [],
+      });
+      const row = eligible.get(actionId);
       if (!row) return { handled: true, reply: `Action #${alias} not found.` };
       if (row.recommended_action !== "draft_reply") {
         return { handled: true, reply: `Action #${alias} is not a draft action.` };
@@ -3968,7 +4486,12 @@ export async function executeInboxCommand(args: {
         .eq("id", actionId)
         .eq("user_id", args.userId)
         .maybeSingle();
-      const row = rowToInboxAction(actionRow.data);
+      const eligible = await eligiblePendingInboxActionMap({
+        supabase: args.supabase,
+        userId: args.userId,
+        values: actionRow.data ? [actionRow.data] : [],
+      });
+      const row = eligible.get(actionId);
       if (!row) return { handled: true, reply: `Action #${parsed.alias} is no longer available.` };
       const reason = row.reason || "(no reason)";
       const probs = `important=${(row.p_important ?? 0).toFixed(2)}, spam=${(row.p_spam ?? 0).toFixed(2)}, actionable=${(row.p_actionable ?? 0).toFixed(2)}`;
@@ -3998,7 +4521,12 @@ export async function executeInboxCommand(args: {
         .eq("id", actionId)
         .eq("user_id", args.userId)
         .maybeSingle();
-      const row = rowToInboxAction(actionRow.data);
+      const eligible = await eligiblePendingInboxActionMap({
+        supabase: args.supabase,
+        userId: args.userId,
+        values: actionRow.data ? [actionRow.data] : [],
+      });
+      const row = eligible.get(actionId);
       if (!row) return { handled: true, reply: `Action #${parsed.alias} not found.` };
       if (row.recommended_action !== "draft_reply") {
         return { handled: true, reply: `Action #${parsed.alias} is not a draft action.` };
@@ -4075,7 +4603,7 @@ export async function executeInboxCommand(args: {
       await args.supabase
         .from("inbox_actions")
         .update({
-          draft_body: parsed.text,
+          draft_body: ensureGroovyAiEmailDisclosure(parsed.text),
           gmail_draft_id: finalDraftId,
           updated_at: new Date().toISOString(),
         })
@@ -4129,11 +4657,11 @@ export async function executeInboxCommand(args: {
       .select("*")
       .eq("user_id", args.userId)
       .in("id", wanted.map((w) => w.actionId));
-    const byId = new Map<string, InboxActionRow>();
-    for (const r of rows.data || []) {
-      const parsedRow = rowToInboxAction(r);
-      if (parsedRow) byId.set(parsedRow.id, parsedRow);
-    }
+    const byId = await eligiblePendingInboxActionMap({
+      supabase: args.supabase,
+      userId: args.userId,
+      values: rows.data || [],
+    });
 
     const normalizedUserText = normalizeInboxCommandText(args.text);
     const mentioned = extractMentionedAliases(
@@ -4195,7 +4723,6 @@ export async function executeInboxCommand(args: {
           userId: args.userId,
           status: "rejected",
           extra: {
-            ...(asRecord(row.metadata) || {}),
             rejected_via: "command",
             rejected_at: new Date().toISOString(),
           },
@@ -4205,13 +4732,17 @@ export async function executeInboxCommand(args: {
       }
 
       if (row.recommended_action === "draft_reply") {
-        await markDraftSendConfirmationPending({
+        const marked = await markDraftSendConfirmationPending({
           supabase: args.supabase,
           row,
           userId: args.userId,
           alias: alias.alias,
         });
-        outcomes.push(`${prefix}: draft approved. Send is not executed yet. Confirm with "send ${alias.alias}".`);
+        outcomes.push(
+          marked
+            ? `${prefix}: draft approved. Send is not executed yet. Confirm with "send ${alias.alias}".`
+            : `${prefix}: already handled`,
+        );
         continue;
       }
 
@@ -4247,7 +4778,6 @@ export async function executeInboxCommand(args: {
           userId: args.userId,
           status: "done",
           extra: {
-            ...(asRecord(lock.metadata) || {}),
             approved_via: "command",
             execution_detail: exec.detail,
             ...(Array.isArray(exec.connectorExecutes) && exec.connectorExecutes.length > 0
@@ -4273,7 +4803,6 @@ export async function executeInboxCommand(args: {
           userId: args.userId,
           status: "failed",
           extra: {
-            ...(asRecord(lock.metadata) || {}),
             execution_error: exec.detail,
           },
         });
@@ -4367,18 +4896,70 @@ export async function runInboxTriageForHeartbeat(args: {
       autoExecutedCount: 0,
       criticalCount: 0,
       notes,
+      focusArrivals: [],
+      focusNotification: { attempted: 0, delivered: 0 },
     };
   }
 
   const byConnection = new Map<string, TriageMailbox>();
   for (const m of args.mailboxes || []) byConnection.set(m.connectionId, m);
+  const allOwnedAddresses = uniqueRecipientEmails(
+    args.userEmail,
+    (args.mailboxes || []).flatMap((mailbox) => [
+      mailbox.address,
+      ...(mailbox.ownedAddresses || []),
+    ]),
+  );
   const labelCache = new Map<string, LabelsByName>();
   const keyCache = new Map<string, string>();
   const affinityCache = new Map<string, SenderAffinity>();
   const intelCache = new Map<string, SenderIntel>();
   const draftReplyScopeClaims = new Set<string>();
+  const feedbackResult = await args.supabase
+    .from("email_classification_feedback")
+    .select(
+      "connection_id,sender_email,sender_domain,previous_action,corrected_action,scope,created_at",
+    )
+    .eq("user_id", args.userId)
+    .eq("provider", "gmail")
+    .in("corrected_action", ["focus", "inbox", "noise"])
+    .order("created_at", { ascending: false })
+    .limit(200);
+  const classificationFeedback = (feedbackResult.data || []).flatMap(
+    (raw) => {
+      const row = asRecord(raw) || {};
+      const correctedAction = toTrimmed(row.corrected_action);
+      // Keep this guard even with the database filter so historical Done
+      // feedback can never become sender-wide classifier guidance.
+      if (!isEmailClassificationCorrection(correctedAction)) return [];
+      return [{
+        connectionId: toTrimmed(row.connection_id),
+        senderEmail: normalizeKey(toTrimmed(row.sender_email)),
+        senderDomain: normalizeKey(toTrimmed(row.sender_domain)),
+        previousAction: toTrimmed(row.previous_action),
+        correctedAction,
+        scope: toTrimmed(row.scope),
+        createdAt: toTrimmed(row.created_at),
+      }];
+    },
+  );
+  const mailboxPreferenceResult = await args.supabase
+    .from("email_mailbox_preferences")
+    .select("connection_id,ai_instructions")
+    .eq("user_id", args.userId)
+    .eq("provider", "gmail");
+  const mailboxInstructionsByConnection = new Map(
+    (mailboxPreferenceResult.data || []).map((raw) => {
+      const row = asRecord(raw) || {};
+      return [
+        toTrimmed(row.connection_id),
+        toTrimmed(row.ai_instructions),
+      ] as const;
+    }),
+  );
 
   const pendingActionIds: string[] = [];
+  const focusArrivals: EmailFocusArrival[] = [];
   let autoExecutedCount = 0;
   let criticalCount = 0;
 
@@ -4397,6 +4978,13 @@ export async function runInboxTriageForHeartbeat(args: {
       date: toTrimmed(item.date),
       snippet: toTrimmed(item.snippet),
       listUnsubscribe: toTrimmed(item.listUnsubscribe || ""),
+      authenticationResults: toTrimmed(item.authenticationResults || ""),
+      autoSubmitted: toTrimmed(item.autoSubmitted || ""),
+      precedence: toTrimmed(item.precedence || ""),
+      listId: toTrimmed(item.listId || ""),
+      labelIds: Array.isArray(item.labelIds)
+        ? item.labelIds.map((label) => toTrimmed(label)).filter(Boolean)
+        : [],
       messageIdHeader: toTrimmed(item.messageIdHeader || ""),
     }))
     .filter((i) => i.connectionId && i.id);
@@ -4404,6 +4992,29 @@ export async function runInboxTriageForHeartbeat(args: {
   await mapLimit(items, 3, async (item) => {
     const sender = parseSender(item.from);
     if (!sender.email && !sender.domain) return;
+    const matchingFeedback = classificationFeedback
+      .filter((entry) => {
+        const scopeMatches =
+          entry.scope === "global" ||
+          entry.connectionId === item.connectionId;
+        const senderMatches =
+          (entry.senderEmail &&
+            entry.senderEmail === normalizeKey(sender.email)) ||
+          (entry.senderDomain &&
+            entry.senderDomain === normalizeKey(sender.domain));
+        return scopeMatches && senderMatches && entry.correctedAction;
+      })
+      .slice(0, 6);
+    const feedbackContext = matchingFeedback
+      .map(
+        (entry) =>
+          `- ${entry.createdAt || "prior"}: ${
+            entry.senderEmail || entry.senderDomain
+          } corrected from ${entry.previousAction || "unknown"} to ${
+            entry.correctedAction
+          } (${entry.scope || "mailbox"} scope)`,
+      )
+      .join("\n");
 
     let dgKey = keyCache.get(item.connectionId) || "";
     if (!dgKey) {
@@ -4444,6 +5055,35 @@ export async function runInboxTriageForHeartbeat(args: {
       intelCache.set(intelKey, intel);
     }
 
+    const mailboxInstructions =
+      mailboxInstructionsByConnection.get(item.connectionId) || "";
+    const hasExplicitClassificationGuidance = Boolean(
+      toTrimmed(args.preferenceContext || "") ||
+        toTrimmed(feedbackContext) ||
+        toTrimmed(mailboxInstructions),
+    );
+    const hasExplicitSenderClassification = matchingFeedback.length > 0;
+    const policyEvidence = {
+      senderEmail: sender.email,
+      senderDomain: sender.domain,
+      to: item.to,
+      cc: item.cc,
+      listUnsubscribe: item.listUnsubscribe,
+      authenticationResults: item.authenticationResults,
+      precedence: item.precedence,
+      listId: item.listId,
+      gmailLabelIds: item.labelIds,
+      ownedAddresses: uniqueRecipientEmails(
+        args.userEmail,
+        byConnection.get(item.connectionId)?.address,
+        byConnection.get(item.connectionId)?.ownedAddresses,
+        allOwnedAddresses,
+      ),
+      incomingCount: affinity.incomingCount,
+      repliedCount: affinity.repliedCount,
+      senderReputation: intel.reputation,
+    } as const;
+
     const full = await fetchFullMessageAndThread({
       datagranApiKey: dgKey,
       connectionId: item.connectionId,
@@ -4462,10 +5102,29 @@ export async function runInboxTriageForHeartbeat(args: {
         threadCandidates: full.threadCandidates,
         memoryContext: args.memoryContext,
         preferenceContext: args.preferenceContext,
+        classificationFeedbackContext: feedbackContext,
+        mailboxInstructions,
       })) || null;
+    let decisionSource = decision ? "model" : "model_failure";
+    const candidateEvidence = decision
+      ? applyEmailTriageEvidence(policyEvidence, decision.messageKind)
+      : null;
+    const evidenceDecision =
+      candidateEvidence?.signal === "prior_correspondent"
+        ? hasExplicitSenderClassification
+          ? null
+          : candidateEvidence
+        : !hasExplicitClassificationGuidance
+          ? candidateEvidence
+          : null;
+    if (decision && evidenceDecision) {
+      decision = mergeEmailTriageEvidence(decision, evidenceDecision);
+      decisionSource = `evidence:${evidenceDecision.signal}`;
+    }
     if (!decision) {
       notes.push(`${item.mailboxLabel}: triage model failed for "${item.subject}"`);
       decision = {
+        messageKind: "unknown",
         action: "label_only",
         autoExecute: false,
         confidence: 0.2,
@@ -4473,6 +5132,22 @@ export async function runInboxTriageForHeartbeat(args: {
         pSpam: 0.5,
         pActionable: 0.5,
         reason: "Triage model failed; manual review recommended.",
+        critical: false,
+        draftReply: "",
+      };
+    }
+    const calendarInvitation = full.hasCalendarInvitation;
+    if (calendarInvitation) {
+      decision = {
+        messageKind: "calendar",
+        action: "label_only",
+        autoExecute: false,
+        confidence: 1,
+        pImportant: 1,
+        pSpam: 0,
+        pActionable: 1,
+        reason:
+          "Calendar invitation requires an Accept, Maybe, or Decline response.",
         critical: false,
         draftReply: "",
       };
@@ -4486,6 +5161,7 @@ export async function runInboxTriageForHeartbeat(args: {
     let targetFromHeaderForDraft: string | null = null;
     let targetToHeaderForDraft: string | null = null;
     let targetCcHeaderForDraft: string | null = null;
+    let ownedAddressesForDraft: string[] = [];
     let draftInfo:
       | { to: string[]; cc?: string[]; subject: string; body: string; gmailDraftId?: string | null }
       | null = null;
@@ -4522,14 +5198,38 @@ export async function runInboxTriageForHeartbeat(args: {
 
         const draftSubjectSource = toTrimmed(anchor.subject || item.subject);
         const draftSubject = draftSubjectSource ? `Re: ${draftSubjectSource}` : "Re:";
-        const replyAll = buildReplyAllRecipients({
-          senderEmail: anchorSender,
-          toHeader: anchor.to || item.to,
-          ccHeader: anchor.cc || item.cc,
-          userEmail: args.userEmail || null,
+        const triageMailbox = byConnection.get(item.connectionId);
+        const mailboxAddress = toTrimmed(triageMailbox?.address);
+        const ownedAddresses = uniqueRecipientEmails(
+          mailboxAddress,
+          triageMailbox?.ownedAddresses,
+          allOwnedAddresses,
+          anchor.deliveredTo,
+          anchor.originalTo,
+        );
+        ownedAddressesForDraft = ownedAddresses;
+        const replyAll = mailboxAddress
+          ? buildGmailReplyAllRecipients({
+              from: anchor.from || anchorSender,
+              to: anchor.to || item.to,
+              cc: anchor.cc || item.cc,
+              userAddress: mailboxAddress,
+              ownedAddresses,
+            })
+          : { to: [], cc: [] };
+        const automaticRecipients = sanitizeAutomaticRecipientFields({
+          to: mailboxAddress
+            ? replyAll.to.length > 0
+              ? replyAll.to
+              : anchorSender
+                ? [anchorSender]
+                : []
+            : [],
+          cc: replyAll.cc,
+          ownedAddresses,
         });
-        const draftTo = replyAll.to.length > 0 ? replyAll.to : anchorSender ? [anchorSender] : [];
-        const draftCc = replyAll.cc;
+        const draftTo = automaticRecipients.to;
+        const draftCc = automaticRecipients.cc;
         if (!targetThreadIdForDraft) {
           notes.push(
             `${item.mailboxLabel}: draft_reply skipped for "${item.subject}" (target thread id missing)`
@@ -4548,6 +5248,7 @@ export async function runInboxTriageForHeartbeat(args: {
           targetFromHeaderForDraft = null;
           targetToHeaderForDraft = null;
           targetCcHeaderForDraft = null;
+          ownedAddressesForDraft = [];
         }
         if (decision.action === "draft_reply" && draftTo.length === 0) {
           notes.push(
@@ -4568,6 +5269,7 @@ export async function runInboxTriageForHeartbeat(args: {
           targetFromHeaderForDraft = null;
           targetToHeaderForDraft = null;
           targetCcHeaderForDraft = null;
+          ownedAddressesForDraft = [];
         }
         const rawDraft = toTrimmed(decision.draftReply || "");
         if (decision.action === "draft_reply" && !rawDraft) {
@@ -4587,8 +5289,11 @@ export async function runInboxTriageForHeartbeat(args: {
           targetFromHeaderForDraft = null;
           targetToHeaderForDraft = null;
           targetCcHeaderForDraft = null;
+          ownedAddressesForDraft = [];
         }
-        const replyBody = rawDraft ? appendGroovyEmailSendNotice(rawDraft) : "";
+        const replyBody = rawDraft
+          ? ensureGroovyAiEmailDisclosure(rawDraft)
+          : "";
         if (decision.action === "draft_reply" && replyBody && draftTo.length > 0) {
           const draftScopeThreadId = targetThreadIdForDraft || item.threadId || "";
           const draftScopeKey = `${item.connectionId}:${draftScopeThreadId || `message:${item.id}`}`;
@@ -4647,6 +5352,32 @@ export async function runInboxTriageForHeartbeat(args: {
         original_to_header: item.to || null,
         original_cc_header: item.cc || null,
         user_email: args.userEmail || null,
+        owned_addresses: uniqueRecipientEmails(
+          byConnection.get(item.connectionId)?.address,
+          byConnection.get(item.connectionId)?.ownedAddresses,
+          allOwnedAddresses,
+          ownedAddressesForDraft,
+        ),
+        auto_execute_planned: decision.autoExecute === true,
+        triage_policy_version: EMAIL_TRIAGE_POLICY_VERSION,
+        triage_decision_source: decisionSource,
+        ...(decisionSource === EMAIL_TRIAGE_MODEL_FAILURE_SOURCE
+          ? {
+              triage_retry_after: new Date(
+                Date.now() + TRIAGE_MODEL_FAILURE_RETRY_DELAY_MS,
+              ).toISOString(),
+            }
+          : { triage_retry_after: null }),
+        message_kind: decision.messageKind,
+        ...(evidenceDecision
+          ? { policy_evidence_signal: evidenceDecision.signal }
+          : {}),
+        ...(calendarInvitation
+          ? {
+              calendar_invite_detected: true,
+              calendar_invite_verified: true,
+            }
+          : {}),
         ...(targetThreadIdForDraft ? { target_thread_id: targetThreadIdForDraft } : {}),
         ...(targetMessageIdHeaderForDraft ? { target_message_id_header: targetMessageIdHeaderForDraft } : {}),
         ...(targetResolutionForDraft ? { target_resolution: targetResolutionForDraft } : {}),
@@ -4707,6 +5438,28 @@ export async function runInboxTriageForHeartbeat(args: {
       }
     }
 
+    if (
+      actionWrite.inserted &&
+      decision.autoExecute !== true &&
+      routeEmailClassification({
+        action: decision.action,
+        status: "pending",
+        confidence: decision.confidence,
+        critical: decision.critical,
+      }) === "focus"
+    ) {
+      focusArrivals.push({
+        actionId: actionRow.id,
+        senderName: sender.name,
+        senderEmail: sender.email,
+        subject: item.subject || "(no subject)",
+        mailboxLabel: item.mailboxLabel,
+        connectionId: item.connectionId || undefined,
+        threadId: item.threadId || undefined,
+        messageId: item.id || undefined,
+      });
+    }
+
     const auto = decision.autoExecute === true;
     if (!auto) {
       if (actionRow.status === "pending" && actionRow.run_id === runId) {
@@ -4745,7 +5498,6 @@ export async function runInboxTriageForHeartbeat(args: {
         userId: args.userId,
         status: "done",
         extra: {
-          ...(asRecord(lock.metadata) || {}),
           auto_executed: true,
           execution_detail: exec.detail,
         },
@@ -4758,7 +5510,6 @@ export async function runInboxTriageForHeartbeat(args: {
         userId: args.userId,
         status: "failed",
         extra: {
-          ...(asRecord(lock.metadata) || {}),
           auto_executed: true,
           execution_error: exec.detail,
         },
@@ -4767,6 +5518,55 @@ export async function runInboxTriageForHeartbeat(args: {
     }
   });
 
+  const surfacedActionIds = Array.from(
+    new Set([
+      ...pendingActionIds,
+      ...focusArrivals.map((arrival) => arrival.actionId),
+    ]),
+  );
+  if (surfacedActionIds.length > 0) {
+    const surfacedRows = await args.supabase
+      .from("inbox_actions")
+      .select("*")
+      .eq("user_id", args.userId)
+      .eq("status", "pending")
+      .in("id", surfacedActionIds)
+      .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+    if (surfacedRows.error) throw new Error(surfacedRows.error.message);
+    const eligibleById = await eligiblePendingInboxActionMap({
+      supabase: args.supabase,
+      userId: args.userId,
+      values: surfacedRows.data || [],
+    });
+    pendingActionIds.splice(
+      0,
+      pendingActionIds.length,
+      ...pendingActionIds.filter((actionId) => eligibleById.has(actionId)),
+    );
+    focusArrivals.splice(
+      0,
+      focusArrivals.length,
+      ...focusArrivals.filter((arrival) =>
+        eligibleById.has(arrival.actionId),
+      ),
+    );
+  }
+
+  let focusNotification = { attempted: 0, delivered: 0 };
+  if (focusArrivals.length > 0) {
+    try {
+      focusNotification = await sendEmailFocusPush({
+        admin: args.supabase,
+        userId: args.userId,
+        arrivals: focusArrivals,
+      });
+    } catch (error) {
+      notes.push(
+        `Focus notification failed (${error instanceof Error ? error.message : "unknown error"})`,
+      );
+    }
+  }
+
   return {
     runId,
     pendingActionIds,
@@ -4774,6 +5574,8 @@ export async function runInboxTriageForHeartbeat(args: {
     autoExecutedCount,
     criticalCount,
     notes,
+    focusArrivals,
+    focusNotification,
   };
 }
 
@@ -4784,45 +5586,30 @@ export async function buildHeartbeatActionBlock(args: {
   runId: string;
   pendingActionIds: string[];
 }): Promise<BuildHeartbeatActionBlockResult> {
-  const requestedIds = Array.from(new Set(args.pendingActionIds.filter(Boolean)));
   const sessionPendingRes = await args.supabase
-    .from("inbox_actions")
-    .select("id")
-    .eq("user_id", args.userId)
-    .eq("agent_id", args.agentId)
-    .eq("status", "pending")
-    .order("confidence", { ascending: false })
-    .limit(COMMAND_LIST_MAX_ROWS);
-  const sessionPendingIds = (sessionPendingRes.data || [])
-    .map((row) => toTrimmed((row as { id?: unknown }).id))
-    .filter(Boolean);
-  const ids = Array.from(new Set([...requestedIds, ...sessionPendingIds]));
-  if (ids.length === 0) {
-    // Clear stale aliases for this agent if nothing is pending.
-    await syncSessionAliases({
-      supabase: args.supabase,
-      userId: args.userId,
-      agentId: args.agentId,
-      actionIds: [],
-    });
-    return { block: "", pendingCount: 0, aliases: [] };
-  }
-
-  const rowsRes = await args.supabase
     .from("inbox_actions")
     .select("*")
     .eq("user_id", args.userId)
     .eq("agent_id", args.agentId)
     .eq("status", "pending")
-    .in("id", ids)
     .order("confidence", { ascending: false })
-    .limit(COMMAND_LIST_MAX_ROWS);
-
-  const rows: InboxActionRow[] = [];
-  for (const raw of rowsRes.data || []) {
-    const parsed = rowToInboxAction(raw);
-    if (parsed) rows.push(parsed);
-  }
+    .limit(PENDING_ACTION_SCAN_MAX_ROWS);
+  if (sessionPendingRes.error) throw new Error(sessionPendingRes.error.message);
+  const eligibleSessionRows = await filterEligiblePendingInboxActions({
+    supabase: args.supabase,
+    userId: args.userId,
+    rows: (sessionPendingRes.data || [])
+      .map((row) => rowToInboxAction(row))
+      .filter((row): row is InboxActionRow => !!row),
+  });
+  const requestedIds = new Set(args.pendingActionIds.filter(Boolean));
+  const rows = eligibleSessionRows
+    .sort((left, right) => {
+      const leftRequested = requestedIds.has(left.id) ? 1 : 0;
+      const rightRequested = requestedIds.has(right.id) ? 1 : 0;
+      return rightRequested - leftRequested;
+    })
+    .slice(0, COMMAND_LIST_MAX_ROWS);
   if (rows.length === 0) {
     await syncSessionAliases({
       supabase: args.supabase,

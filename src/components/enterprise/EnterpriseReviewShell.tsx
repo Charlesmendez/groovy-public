@@ -12,6 +12,8 @@ import {
   WifiOff,
 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
+import { clearChatWorkspaceCaches } from "@/lib/chat/workspaceCache";
+import { clearEmailFeedCache } from "@/lib/email/feedCache";
 import {
   useOrchestrator,
   type AgentActivity,
@@ -663,6 +665,8 @@ export function EnterpriseReviewShell({
     pendingEnterpriseReviewSessionCreatedAtMs = 0;
     pendingEnterpriseReviewSessionPromise = null;
     await supabase.auth.signOut();
+    clearEmailFeedCache();
+    clearChatWorkspaceCaches();
     router.push("/login");
   }, [router, supabase.auth]);
 

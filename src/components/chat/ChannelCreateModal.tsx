@@ -35,6 +35,7 @@ type ProfileOption = {
   id: string;
   name: string;
   is_default: boolean;
+  agent_roster?: string[] | null;
   surface: string;
   authorization_stance: string;
   memory_scope: string;
@@ -66,6 +67,24 @@ export type ChannelSkillOption = {
 };
 
 const STEPS = ["Details", "Participants", "Capabilities"] as const;
+
+function mindAgentIds(
+  profileId: string,
+  profiles: ProfileOption[],
+  agents: AgentOption[],
+): string[] {
+  const profile = profileId
+    ? profiles.find((candidate) => candidate.id === profileId)
+    : profiles.find((candidate) => candidate.is_default);
+  if (!profile) return [];
+  const availableIds = new Set(agents.map((agent) => agent.id));
+  if (profile.agent_roster === null) {
+    return agents.map((agent) => agent.id);
+  }
+  return Array.isArray(profile.agent_roster)
+    ? profile.agent_roster.filter((agentId) => availableIds.has(agentId))
+    : [];
+}
 
 function SelectionRow({
   checked,
@@ -147,15 +166,17 @@ export function ChannelCreateModal({
   const [visibility, setVisibility] = useState<"workspace" | "private">(
     "workspace",
   );
-  const [profileId, setProfileId] = useState(
-    profiles.find((profile) => profile.is_default)?.id || "",
-  );
+  const initialProfileId =
+    profiles.find((profile) => profile.is_default)?.id || "";
+  const [profileId, setProfileId] = useState(initialProfileId);
   const [orchestratorMode, setOrchestratorMode] = useState<
     "mention" | "always" | "off"
   >("mention");
   const [orchestratorInstructions, setOrchestratorInstructions] = useState("");
   const [userIds, setUserIds] = useState<string[]>([]);
-  const [agentIds, setAgentIds] = useState<string[]>([]);
+  const [agentIds, setAgentIds] = useState<string[]>(() =>
+    canAssignAgents ? mindAgentIds(initialProfileId, profiles, agents) : [],
+  );
   const [skillArtifactIds, setSkillArtifactIds] = useState<string[]>([]);
   const [participantQuery, setParticipantQuery] = useState("");
   const [skillQuery, setSkillQuery] = useState("");
@@ -291,8 +312,7 @@ export function ChannelCreateModal({
         orchestratorInstructions: orchestratorInstructions.trim() || null,
         userIds,
         agentIds,
-        skillArtifactIds:
-          selectedGuests.length > 0 ? [] : skillArtifactIds,
+        skillArtifactIds,
       });
     } catch (cause) {
       setError(
@@ -485,7 +505,14 @@ export function ChannelCreateModal({
                   </div>
                   <CustomSelect
                     value={profileId}
-                    onChange={setProfileId}
+                    onChange={(nextProfileId) => {
+                      setProfileId(nextProfileId);
+                      setAgentIds(
+                        canAssignAgents
+                          ? mindAgentIds(nextProfileId, profiles, agents)
+                          : [],
+                      );
+                    }}
                     options={[
                       {
                         value: "",
@@ -600,8 +627,9 @@ export function ChannelCreateModal({
                     Add people and agents
                   </h3>
                   <p className="mt-1 text-xs leading-relaxed text-zinc-500">
-                    You are included automatically. Private rooms remain hidden
-                    from everyone else.
+                    You are included automatically. Agents start with the
+                    selected Mind&apos;s saved roster and can be adjusted for this
+                    channel.
                   </p>
                 </div>
                 <span className="shrink-0 rounded-full bg-white/[0.05] px-2 py-1 text-[10px] text-zinc-500">
@@ -702,9 +730,10 @@ export function ChannelCreateModal({
               {selectedGuests.length > 0 ? (
                 <div className="mt-4 rounded-xl border border-amber-400/25 bg-amber-400/[0.07] p-3 text-xs leading-relaxed text-amber-100">
                   This room includes {selectedGuests.length} channel{" "}
-                  {selectedGuests.length === 1 ? "guest" : "guests"}. For
-                  safety, channel skills stay unavailable while any guest is a
-                  participant.
+                  {selectedGuests.length === 1 ? "guest" : "guests"}.
+                  Assigned skills and docs are available to the Mind when it
+                  responds here, so only add capabilities approved for
+                  guest-facing use.
                 </div>
               ) : null}
               <div className="relative mt-4">
@@ -722,7 +751,6 @@ export function ChannelCreateModal({
                   <SelectionRow
                     key={skill.id}
                     checked={skillArtifactIds.includes(skill.id)}
-                    disabled={selectedGuests.length > 0}
                     onChange={() => toggle(skill.id, setSkillArtifactIds)}
                     icon={
                       skill.artifact_type === "skill" ? (

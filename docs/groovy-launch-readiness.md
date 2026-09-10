@@ -113,6 +113,8 @@ Production and development envs are set for:
 - `GROOVY_ADMIN_EMAILS`
 - `ENTERPRISE_SALES_EMAIL=sales@gogroovy.ai`
 - `RESEND_API_KEY` (Preview and Production)
+- `CRON_SECRET` (Production; authenticates the Vercel cron declared in
+  `vercel.json`)
 - Resend sending domain `hi.gogroovy.ai` (the application defaults to
   `Groovy <notifications@hi.gogroovy.ai>` and
   `Groovy Sales <sales@hi.gogroovy.ai>`)
@@ -142,6 +144,19 @@ Generate the pair once with `npx web-push generate-vapid-keys --json`. Store the
 private key only in Vercel; never expose it through a `NEXT_PUBLIC_*` variable
 or commit it. Configure Production, Preview, and Development independently if
 all three environments should send notifications.
+
+Huddles use public STUN without extra setup. For dependable calls across
+restrictive corporate and mobile networks, add a TURN service in Vercel:
+
+```text
+CHAT_TURN_URLS=turns:turn.example.com:5349
+CHAT_TURN_SHARED_SECRET=<coturn-rest-shared-secret>
+```
+
+The authenticated huddle ICE endpoint turns that shared secret into one-hour
+coturn REST credentials; the shared secret never reaches the browser. Static
+`CHAT_TURN_USERNAME` and `CHAT_TURN_CREDENTIAL` are supported only for
+providers that do not offer shared-secret credentials.
 
 ### Where to go
 
@@ -187,7 +202,12 @@ production. The workspace-selection migration adds the normalized active
 workspace preference used by multi-workspace accounts; until it is applied,
 the app uses the existing protected onboarding preferences JSON as a
 backward-compatible fallback. The scheduler migration binds scheduled tasks to their originating
-Team Chat channel and backfills existing channel-session schedules; the image
+Team Chat channel and backfills existing channel-session schedules. At run time,
+channel schedules resolve the channel's current Mind, roster, operating brief,
+skills, and guest boundary, then publish the final result back into that exact
+channel. The runner can recover the channel from the existing Team Chat session
+during migration rollout, but the migration is still required for durable task
+management and direct channel indexing. The image
 attachment migration adds channel-scoped authorization records for objects in
 the existing private `chat_uploads` bucket. The web
 deployment remains backward-compatible while they are pending: existing
@@ -322,6 +342,11 @@ Fly app `groovy-relay` exists and has required secrets:
 - `SUPABASE_ANON_KEY`
 
 No licensing-specific Fly envs are required.
+
+For the relay to provide the optional always-on scheduler fallback, also set
+`SCHEDULER_CRON_SECRET` to the same value as Vercel's `CRON_SECRET`. Vercel
+cron remains the primary hosted scheduler and does not require this Fly
+fallback.
 
 ### Where to go
 

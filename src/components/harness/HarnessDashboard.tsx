@@ -11,23 +11,13 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Image from "next/image";
 import { useRouter } from "next/navigation";
 import {
-  AlertTriangle,
-  BarChart3,
-  BookOpen,
-  CalendarClock,
   ChevronRight,
-  FileText,
   Loader2,
   MessageSquare,
   PanelRightClose,
   PanelRightOpen,
-  Plug,
-  Settings,
-  Wifi,
-  WifiOff,
 } from "lucide-react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { useOrchestrator } from "@/hooks/useOrchestrator";
@@ -43,9 +33,12 @@ import { HarnessOnboarding } from "@/components/onboarding/HarnessOnboarding";
 import { HarnessChecklist } from "@/components/onboarding/HarnessChecklist";
 import { useDesktopAutoPair } from "@/hooks/useDesktopAutoPair";
 import { useLicenseAccess } from "@/hooks/useLicenseAccess";
-import { DesktopUpdateBadge } from "@/components/desktop/DesktopUpdateBadge";
+import { useMobileUi } from "@/hooks/useMobileUi";
 import { LicenseAccessGate } from "@/components/licensing/LicenseAccessGate";
 import { MIN_CONNECTOR_VERSION } from "@/lib/connector/version";
+import { clearEmailFeedCache } from "@/lib/email/feedCache";
+import { clearChatWorkspaceCaches } from "@/lib/chat/workspaceCache";
+import { AppHeader } from "@/components/AppHeader";
 import { WorkerGrid } from "@/components/harness/WorkerGrid";
 import {
   OrchestratorBar,
@@ -55,18 +48,23 @@ import { OrchestratorRail } from "@/components/harness/OrchestratorRail";
 import { NewAgentModal } from "@/components/harness/NewAgentModal";
 import { TransferContextModal } from "@/components/harness/TransferContextModal";
 import { AgentDrawer } from "@/components/harness/AgentDrawer";
-import { SettingsModal } from "@/components/command-center/SettingsModal";
+import {
+  SettingsModal,
+  type SettingsFocusSection,
+} from "@/components/command-center/SettingsModal";
 import { SchedulePanel } from "@/components/command-center/SchedulePanel";
 import { PlansBrowser } from "@/components/claude/PlansBrowser";
 import { useClaudePlans, type ClaudePlan } from "@/hooks/useClaudePlans";
 import { canonicalWorkspacePath } from "@/lib/workspaces/path";
-import { AppNav } from "@/components/AppNav";
 import { WorkspaceSwitcher } from "@/components/workspaces/WorkspaceSwitcher";
+import { isDesktopShell } from "@/lib/desktop/shell";
+import { dispatchOrchestratorContext } from "@/lib/navigation/orchestratorContextEvent";
 
 export default function HarnessDashboard() {
   const router = useRouter();
   const supabase = getSupabaseBrowserClient();
   const connectorGuide = useConnectorInstallGuide();
+  const mobileUi = useMobileUi();
   // Inside the Groovy Desktop shell this silently pairs the bundled connector
   // to the signed-in account; the connector status pill reflects the result.
   const desktopAutoPair = useDesktopAutoPair();
@@ -91,6 +89,8 @@ export default function HarnessDashboard() {
 
   // ---- Device / relay ----
   const device = useConnectorDevice();
+  const connectorManagedByDesktop =
+    device.capabilities.managedByDesktop === true || isDesktopShell();
   const { connectorExecute } = useConnectorExecute({
     relay: device.relay,
     activeDeviceId: device.activeDeviceId,
@@ -98,6 +98,18 @@ export default function HarnessDashboard() {
 
   // ---- Orchestrator ----
   const orchestrator = useOrchestrator({ onConnectorExecute: connectorExecute });
+  const activeOrchestratorAgentId = orchestrator.getAgentIdForSession(
+    orchestrator.currentSessionId,
+  );
+  useEffect(() => {
+    dispatchOrchestratorContext({
+      agentId: activeOrchestratorAgentId,
+      sessionId: orchestrator.currentSessionId,
+    });
+    return () => {
+      dispatchOrchestratorContext({ agentId: null, sessionId: null });
+    };
+  }, [activeOrchestratorAgentId, orchestrator.currentSessionId]);
 
   // ---- Workers + grid + tasks ----
   const workers = useWorkerAgents({
@@ -105,7 +117,10 @@ export default function HarnessDashboard() {
     activeDeviceId: device.activeDeviceId,
   });
   const grid = useWorkerGrid();
-  const taskFeed = useAgentTasks({ userId: user?.id || null });
+  const taskFeed = useAgentTasks({
+    userId: user?.id || null,
+    relay: device.relay,
+  });
 
   // ---- Onboarding gate (harness flow) ----
   const onboarding = useOnboardingGate();
@@ -123,13 +138,38 @@ export default function HarnessDashboard() {
   // ---- Settings ----
   const settings = useSettingsState(user?.id || null);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsFocusSection, setSettingsFocusSection] =
+    useState<SettingsFocusSection>();
   const [showSchedules, setShowSchedules] = useState(false);
   const [showPlans, setShowPlans] = useState(false);
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [pendingPlan, setPendingPlan] = useState<ClaudePlan | null>(null);
   const [runningScheduledJobs, setRunningScheduledJobs] = useState<Set<string>>(new Set());
   const scheduledJobRequestIdsRef = useRef<Map<string, string>>(new Map());
   const scheduledJobTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const panel = url.searchParams.get("panel");
+    if (panel === "plans") setShowPlans(true);
+    if (panel === "schedules") setShowSchedules(true);
+    if (panel === "settings") {
+      setSettingsFocusSection(
+        url.searchParams.get("section") === "connector"
+          ? "connector"
+          : "account",
+      );
+      setShowSettings(true);
+    }
+    if (panel === "plans" || panel === "schedules" || panel === "settings") {
+      url.searchParams.delete("panel");
+      url.searchParams.delete("section");
+      window.history.replaceState(
+        {},
+        "",
+        `${url.pathname}${url.search}${url.hash}`,
+      );
+    }
+  }, []);
 
   const clearRunningScheduledJob = useCallback((jobId: string) => {
     const timeout = scheduledJobTimeoutsRef.current.get(jobId);
@@ -575,233 +615,47 @@ export default function HarnessDashboard() {
         <div className="absolute bottom-0 right-1/4 w-[500px] h-[500px] bg-violet-500/[0.04] rounded-full blur-[160px]" />
       </div>
 
-      {/* Header */}
-      <header className="relative z-10 shrink-0 border-b border-white/5 bg-[var(--bg-primary)]/80 backdrop-blur-xl">
-        <div className="flex items-center gap-2 px-3 py-2 sm:gap-3 sm:px-4">
-          <Image
-            src="/Groovy_no_bg.png"
-            alt="Groovy"
-            width={140}
-            height={40}
-            className="h-7 w-auto max-w-[78px] object-contain sm:h-10 sm:max-w-none"
-            unoptimized
-            priority
-          />
-          <AppNav />
-          <WorkspaceSwitcher
-            compact
-            fallbackName="Workspace"
-            switchDestination="/dashboard"
-            showPendingGate={false}
-          />
-
-          {/* Connector status */}
-          <button
-            type="button"
-            onClick={() => {
-              device.refresh();
-              setShowSettings(true);
-            }}
-            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-all hover:opacity-90 ${
-              device.connectorOnline
-                ? "bg-emerald-500/10 text-emerald-400"
-                : device.relayConnected
-                  ? "bg-zinc-800 text-zinc-300"
-                  : "bg-zinc-800 text-zinc-500"
-            }`}
-          >
-            {device.connectorOnline ? (
-              <Wifi className="w-3 h-3" />
-            ) : (
-              <WifiOff className="w-3 h-3" />
-            )}
-            <span className="hidden sm:inline">
-              {device.connectorOnline
-                ? "Connector online"
-                : device.relayConnected
-                  ? "Connector offline"
-                  : "Relay offline"}
-            </span>
-            {device.connectorOnline && device.connectorVersion && (
-              <span className="hidden lg:inline text-[10px] opacity-70">v{device.connectorVersion}</span>
-            )}
-          </button>
-          {device.connectorOutdated &&
-            (device.supportsInPlaceUpdate ? (
-              <button
-                type="button"
-                onClick={device.updateConnector}
-                className="hidden sm:inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/15 transition-all"
-              >
-                <AlertTriangle className="w-2.5 h-2.5" />
-                Update v{MIN_CONNECTOR_VERSION}
-              </button>
-            ) : (
-              <a
-                href={connectorGuide.downloadUrl}
-                className="hidden sm:inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] bg-amber-500/10 text-amber-300 border border-amber-500/20 hover:bg-amber-500/15 transition-all"
-              >
-                Download v{MIN_CONNECTOR_VERSION}
-              </a>
-            ))}
-          <DesktopUpdateBadge />
-
-          <div className="ml-auto flex items-center gap-1">
-            {/* Full toolbar from sm up; on phones these collapse into the ⋯ sheet */}
-            <div className="hidden items-center gap-1 sm:flex">
+      <AppHeader
+        device={device}
+        workspaceName="Workspace"
+        switchDestination="/dashboard"
+        onOpenPlans={() => setShowPlans(true)}
+        onOpenSchedules={() => setShowSchedules(true)}
+        onOpenSettings={() => {
+          setSettingsFocusSection("account");
+          setShowSettings(true);
+        }}
+        onOpenConnector={() => {
+          setSettingsFocusSection("connector");
+          setShowSettings(true);
+        }}
+        endControls={
+          <>
             <button
               type="button"
-              onClick={() => setShowPlans(true)}
-              className="h-8 rounded-lg flex items-center gap-1.5 px-2 text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
-              title="Plans"
-            >
-              <FileText className="w-4 h-4" />
-              <span className="hidden xl:inline text-xs font-medium">Plans</span>
-            </button>
-            <a
-              href="/settings/skills"
-              className="h-8 rounded-lg flex items-center gap-1.5 px-2 text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
-              title="Skills & instruction docs"
-            >
-              <BookOpen className="w-4 h-4" />
-              <span className="hidden lg:inline text-xs font-medium">Skills &amp; Docs</span>
-            </a>
-            <a
-              href="/settings/integrations"
-              className="h-8 rounded-lg flex items-center gap-1.5 px-2 text-zinc-400 hover:text-white hover:bg-white/10 transition-colors"
-              title="Integrations"
-            >
-              <Plug className="w-4 h-4" />
-              <span className="hidden xl:inline text-xs font-medium">Integrations</span>
-            </a>
-            <button
-              type="button"
-              onClick={() => setShowSchedules(true)}
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
-              title="Schedules"
-            >
-              <CalendarClock className="w-4 h-4" />
-            </button>
-            <a
-              href="/settings/usage"
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
-              title="Usage & cost"
-            >
-              <BarChart3 className="w-4 h-4" />
-            </a>
-            <a
-              href="/settings"
-              className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
-              title="Settings"
-            >
-              <Settings className="w-4 h-4" />
-            </a>
-            </div>
-            <button
-              type="button"
-              onClick={() => setMobileMenuOpen(true)}
-              className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white sm:hidden"
-              title="More"
-              aria-label="More options"
-            >
-              ⋯
-            </button>
-            <button
-              onClick={() => setRailOpen((v) => !v)}
-              className="w-8 h-8 rounded-lg hidden md:flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+              onClick={() => setRailOpen((value) => !value)}
+              className="hidden h-9 w-9 items-center justify-center rounded-xl text-zinc-500 transition hover:bg-white/[0.06] hover:text-white md:flex"
               title={railOpen ? "Hide orchestrator rail" : "Show orchestrator rail"}
+              aria-label={railOpen ? "Hide orchestrator rail" : "Show orchestrator rail"}
             >
               {railOpen ? (
-                <PanelRightClose className="w-4 h-4" />
+                <PanelRightClose className="h-4 w-4" />
               ) : (
-                <PanelRightOpen className="w-4 h-4" />
+                <PanelRightOpen className="h-4 w-4" />
               )}
             </button>
             <button
+              type="button"
               onClick={() => setMobileRailOpen(true)}
-              className="w-8 h-8 rounded-lg flex md:hidden items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+              className="flex h-9 w-9 items-center justify-center rounded-xl text-zinc-500 transition hover:bg-white/[0.06] hover:text-white md:hidden"
               title="Show tasks and orchestrator history"
+              aria-label="Show tasks and orchestrator history"
             >
-              <PanelRightOpen className="w-4 h-4" />
+              <PanelRightOpen className="h-4 w-4" />
             </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Mobile overflow sheet: everything the phone header can't fit */}
-      {mobileMenuOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-end bg-black/60 sm:hidden"
-          onClick={() => setMobileMenuOpen(false)}
-        >
-          <div
-            className="animate-slide-up w-full rounded-t-2xl border-t border-white/10 bg-[var(--bg-secondary)] p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))]"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-white/15" />
-            {device.connectorOutdated && (
-              <button
-                type="button"
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  if (device.supportsInPlaceUpdate) device.updateConnector();
-                  else window.location.href = connectorGuide.downloadUrl;
-                }}
-                className="mb-3 flex w-full items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
-              >
-                <AlertTriangle className="h-4 w-4" />
-                Update connector to v{MIN_CONNECTOR_VERSION}
-              </button>
-            )}
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  setShowPlans(true);
-                }}
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <FileText className="h-4 w-4 text-zinc-500" /> Plans
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  setShowSchedules(true);
-                }}
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <CalendarClock className="h-4 w-4 text-zinc-500" /> Schedules
-              </button>
-              <a
-                href="/settings/skills"
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <BookOpen className="h-4 w-4 text-zinc-500" /> Skills &amp; Docs
-              </a>
-              <a
-                href="/settings/integrations"
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <Plug className="h-4 w-4 text-zinc-500" /> Integrations
-              </a>
-              <a
-                href="/settings/usage"
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <BarChart3 className="h-4 w-4 text-zinc-500" /> Usage &amp; cost
-              </a>
-              <a
-                href="/settings"
-                className="flex items-center gap-2.5 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-zinc-300"
-              >
-                <Settings className="h-4 w-4 text-zinc-500" /> Settings
-              </a>
-            </div>
-          </div>
-        </div>
-      )}
+          </>
+        }
+      />
 
       {onboarding.loaded &&
         (onboarding.onboardingCompleted === true ||
@@ -945,6 +799,7 @@ export default function HarnessDashboard() {
         claudeCliInstalled={device.capabilities.claudeCliInstalled}
         codexCliInstalled={device.capabilities.codexCliInstalled}
         connectorOnline={device.connectorOnline}
+        mobileUi={mobileUi}
         requiredWorkspaceRoot={pendingPlan?.workspaceRoot || null}
       />
       <TransferContextModal
@@ -957,6 +812,7 @@ export default function HarnessDashboard() {
         agent={configureAgent}
         capabilities={device.capabilities}
         connectorOnline={device.connectorOnline}
+        mobileUi={mobileUi}
         onClose={() => setConfigureAgentId(null)}
         onUpdateAgent={workers.updateAgent}
         onRenameAgent={workers.renameAgent}
@@ -984,9 +840,11 @@ export default function HarnessDashboard() {
         currentOrchestratorAgentId={orchestrator.getAgentIdForSession(
           orchestrator.currentSessionId
         )}
-        focusSection={undefined}
+        focusSection={settingsFocusSection}
         onSignOut={async () => {
           await supabase.auth.signOut();
+          clearEmailFeedCache();
+          clearChatWorkspaceCaches();
           router.push("/login");
         }}
         onConnectorModeChanged={device.setConnectorMode}
@@ -995,7 +853,11 @@ export default function HarnessDashboard() {
         connectorVersion={device.connectorVersion}
         minConnectorVersion={MIN_CONNECTOR_VERSION}
         connectorSupportsInPlaceUpdate={device.supportsInPlaceUpdate}
+        connectorManagedByDesktop={connectorManagedByDesktop}
         connectorDownloadUrl={connectorGuide.downloadUrl}
+        connectorConfig={device.connectorConfig}
+        connectorCapabilities={device.capabilities}
+        onSaveConnectorConfig={(patch) => device.configureConnector(patch, { restart: true })}
         onRefreshConnector={device.refresh}
         onRestartConnector={device.restartConnector}
         onUpdateConnector={device.updateConnector}
@@ -1035,6 +897,7 @@ export default function HarnessDashboard() {
         licenseAccess.status?.joinedWorkspace !== true && (
         <HarnessOnboarding
           autoPair={desktopAutoPair}
+          mobileUi={mobileUi}
           onComplete={() => void onboarding.refetch()}
         />
       )}

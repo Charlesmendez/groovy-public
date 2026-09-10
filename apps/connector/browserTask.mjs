@@ -8,11 +8,19 @@ import {
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { execFile } from "child_process";
+import { fileURLToPath } from "url";
+import { promisify } from "util";
 import {
   killProcessesByCommandFragment,
   removeSingletonLocks,
 } from "./platform/process/index.mjs";
 import { runHeadlessClaude } from "./platform/claude/runHeadless.mjs";
+import {
+  extractCodexResult,
+  resolveCodexBin,
+  runHeadlessCodex,
+} from "./platform/codex/runHeadlessCodex.mjs";
 import { prepareSpawnEnv } from "./platform/shell/index.mjs";
 
 function sleep(ms) {
@@ -130,7 +138,10 @@ function isInvalidClaudeAuthSpawnResult(spawnResult) {
 function summarizePlaywrightToolUse(block) {
   const b = block && typeof block === "object" ? block : null;
   if (!b || b.type !== "tool_use") return "";
-  const name = String(b.name || "");
+  const rawName = String(b.name || "");
+  const name = rawName.startsWith("playwright:")
+    ? `mcp__playwright__${rawName.slice("playwright:".length)}`
+    : rawName;
   if (!name.startsWith("mcp__playwright__")) return "";
   const input = b.input && typeof b.input === "object" ? b.input : {};
   const element = cleanProgressText(input.element || input.ref || "", 90);
@@ -183,6 +194,25 @@ function summarizePlaywrightToolUse(block) {
   return "Browser step running";
 }
 
+function summarizePlaywrightCliToolUse(block) {
+  const b = block && typeof block === "object" ? block : null;
+  if (!b || b.type !== "tool_use" || b.name !== "Bash") return "";
+  const command = String(b.input?.command || "");
+  if (!command.includes("playwright-cli")) return "";
+
+  if (/\s(?:goto|open)\s/.test(command)) return "Navigate browser";
+  if (/\s(?:click|dblclick)\s/.test(command)) return "Click";
+  if (/\s(?:fill|type)\s/.test(command)) return "Type into field";
+  if (/\s(?:select|check|uncheck)\s/.test(command)) return "Update page control";
+  if (/\s(?:tab-list|tab-select|tab-new|tab-close)\b/.test(command)) {
+    return "Switch/check browser tab";
+  }
+  if (/\s(?:press|keydown|keyup)\s/.test(command)) return "Press key";
+  if (/\s(?:go-back|go-forward|reload)\b/.test(command)) return "Navigate browser";
+  if (/\s(?:find|snapshot|eval|run-code)\s/.test(command)) return "Inspect page";
+  return "Browser step running";
+}
+
 function summarizeComputerUseToolCall(toolCall) {
   const tc = toolCall && typeof toolCall === "object" ? toolCall : null;
   if (!tc) return "";
@@ -214,9 +244,94 @@ function summarizeComputerUseToolCall(toolCall) {
 }
 
 // ---------------------------------------------------------------------------
-// Playwright MCP browser task runner
-// Uses `claude -p` + Playwright MCP for reliable, headless browser automation.
+// Playwright browser task runner
+// Uses the official skill-fed Playwright CLI by default for Codex, with MCP as
+// its startup fallback. Claude continues to use Playwright MCP.
 // ---------------------------------------------------------------------------
+
+const DEFAULT_BROWSER_TASK_PROVIDER = "codex";
+const DEFAULT_PLAYWRIGHT_DRIVER = "cli";
+const PLAYWRIGHT_DRIVERS = new Set(["cli", "mcp"]);
+const DEFAULT_BROWSER_TASK_MODELS = {
+  claude: "claude-sonnet-4-6",
+  codex: "gpt-5.6-luna",
+};
+const DEFAULT_BROWSER_TASK_REASONING_EFFORT = "medium";
+const BROWSER_TASK_REASONING_EFFORTS = new Set([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+function firstNonEmptyString(values) {
+  return values
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .find(Boolean) || "";
+}
+
+function inferBrowserTaskProvider(model) {
+  const value = String(model || "").trim().toLowerCase();
+  if (value.startsWith("claude-")) return "claude";
+  if (value.startsWith("gpt-") || value.startsWith("o1") || value.startsWith("o3")) {
+    return "codex";
+  }
+  return "";
+}
+
+export function resolveBrowserTaskRuntimeSettings(opts = {}) {
+  const configuredModel = firstNonEmptyString([
+    process.env.GROOVY_BROWSER_TASK_MODEL,
+    process.env.GROOVY_COMPUTER_USE_MODEL,
+    process.env.GROOVY_CLAUDE_CLI_MODEL,
+    opts.model,
+  ]);
+  const configuredProvider = firstNonEmptyString([
+    process.env.GROOVY_BROWSER_TASK_PROVIDER,
+    process.env.GROOVY_COMPUTER_USE_PROVIDER,
+    opts.provider,
+    opts.framework,
+    inferBrowserTaskProvider(configuredModel),
+  ]).toLowerCase();
+  const provider = configuredProvider === "claude" || configuredProvider === "codex"
+    ? configuredProvider
+    : DEFAULT_BROWSER_TASK_PROVIDER;
+  const modelProvider = inferBrowserTaskProvider(configuredModel);
+  const model = configuredModel && (!modelProvider || modelProvider === provider)
+    ? configuredModel
+    : DEFAULT_BROWSER_TASK_MODELS[provider];
+  const configuredReasoningEffort = firstNonEmptyString([
+    process.env.GROOVY_BROWSER_TASK_REASONING_EFFORT,
+    process.env.GROOVY_COMPUTER_USE_REASONING_EFFORT,
+    opts.reasoning_effort,
+    opts.reasoningEffort,
+  ]).toLowerCase();
+  const reasoningEffort = BROWSER_TASK_REASONING_EFFORTS.has(configuredReasoningEffort)
+    ? configuredReasoningEffort
+    : DEFAULT_BROWSER_TASK_REASONING_EFFORT;
+  const configuredPlaywrightDriver = firstNonEmptyString([
+    process.env.GROOVY_PLAYWRIGHT_DRIVER,
+    process.env.GROOVY_BROWSER_TASK_DRIVER,
+    opts.playwright_driver,
+    opts.playwrightDriver,
+    opts.driver,
+  ]).toLowerCase();
+  const playwrightDriver = provider === "claude"
+    ? "mcp"
+    : PLAYWRIGHT_DRIVERS.has(configuredPlaywrightDriver)
+      ? configuredPlaywrightDriver
+      : DEFAULT_PLAYWRIGHT_DRIVER;
+
+  return { provider, model, reasoningEffort, playwrightDriver };
+}
+
+const CODEX_PLAYWRIGHT_CONFIG_OVERRIDES = [
+  'mcp_servers.playwright.command="npx"',
+  'mcp_servers.playwright.args=["@playwright/mcp@latest"]',
+  "mcp_servers.playwright.startup_timeout_sec=120",
+  "mcp_servers.playwright.tool_timeout_sec=180",
+];
 
 const PLAYWRIGHT_ALLOWED_TOOLS = [
   "mcp__playwright__browser_navigate",
@@ -605,8 +720,223 @@ async function preparePlaywrightCredentialSecrets(startUrl) {
   };
 }
 
+const execFileAsync = promisify(execFile);
+const CONNECTOR_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+function resolvePlaywrightCliInvocation() {
+  const override = String(process.env.GROOVY_PLAYWRIGHT_CLI_BIN || "").trim();
+  if (override) return { command: override, argsPrefix: [], display: override };
+
+  const entrypoint = path.join(
+    CONNECTOR_DIR,
+    "node_modules",
+    "@playwright",
+    "cli",
+    "playwright-cli.js"
+  );
+  return {
+    command: process.execPath,
+    argsPrefix: [entrypoint],
+    entrypoint,
+  };
+}
+
+function resolvePlaywrightCliSkillFile() {
+  return path.join(
+    CONNECTOR_DIR,
+    "node_modules",
+    "@playwright",
+    "cli",
+    "skills",
+    "playwright-cli",
+    "SKILL.md"
+  );
+}
+
+function quoteShellArg(value) {
+  const text = String(value ?? "");
+  if (process.platform === "win32") {
+    return `"${text.replace(/"/g, '\\"')}"`;
+  }
+  return `'${text.replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildPlaywrightCliCommandPrefix(invocation, sessionName) {
+  return [invocation.command, ...invocation.argsPrefix, `-s=${sessionName}`]
+    .map(quoteShellArg)
+    .join(" ");
+}
+
+function preparePlaywrightCliConfig({ userDataDir, initPageFile }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "groovy-playwright-cli-"));
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // best effort
+  }
+
+  const outputDir = path.join(dir, "output");
+  fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, "cli.config.json");
+  const config = {
+    browser: {
+      userDataDir,
+      initPage: [initPageFile],
+    },
+    outputDir,
+    outputMode: "file",
+  };
+  fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    // best effort
+  }
+  return { dir, file, outputDir };
+}
+
+async function runPlaywrightCli(invocation, args, options = {}) {
+  const env = prepareSpawnEnv({
+    ...process.env,
+    ...(options.env && typeof options.env === "object" ? options.env : {}),
+  });
+  return await execFileAsync(invocation.command, [...invocation.argsPrefix, ...args], {
+    cwd: options.cwd || CONNECTOR_DIR,
+    env,
+    timeout: Number(options.timeoutMs) || 120_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+}
+
+async function playwrightCliSessionIsOpen(invocation, sessionName) {
+  try {
+    await runPlaywrightCli(invocation, [`-s=${sessionName}`, "tab-list"], {
+      timeoutMs: 15_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function startPlaywrightCliSession({
+  invocation,
+  sessionName,
+  startUrl,
+  userDataDir,
+  configFile,
+  headless,
+  env,
+}) {
+  if (await playwrightCliSessionIsOpen(invocation, sessionName)) {
+    await runPlaywrightCli(invocation, [`-s=${sessionName}`, "close"], {
+      timeoutMs: 20_000,
+    }).catch(() => null);
+  }
+
+  const args = [
+    `-s=${sessionName}`,
+    "open",
+    ...(startUrl ? [startUrl] : []),
+    "--persistent",
+    "--profile",
+    userDataDir,
+    `--config=${configFile}`,
+    ...(!headless ? ["--headed"] : []),
+  ];
+  await runPlaywrightCli(invocation, args, { env, timeoutMs: 120_000 });
+  return { reused: false };
+}
+
+async function closePlaywrightCliSession(invocation, sessionName) {
+  if (!invocation || !sessionName) return;
+  await runPlaywrightCli(invocation, [`-s=${sessionName}`, "close"], {
+    timeoutMs: 20_000,
+  }).catch(() => null);
+}
+
+function buildPlaywrightMcpPrompt({
+  task,
+  startUrl,
+  credentialHint,
+  reportOnlyInstruction,
+  shouldContinueSession,
+}) {
+  const startUrlInstruction = shouldContinueSession
+    ? `- Continue from the CURRENT browser/tab state from the previous run.\n` +
+      `- Only navigate to the Start URL if the current tab is missing, wrong domain, or clearly broken.\n`
+    : `- Use browser_navigate to go to the start URL first.\n`;
+
+  return (
+    `Use Playwright MCP to complete this browser task:\n\n` +
+    (startUrl ? `Start URL: ${startUrl}\n\n` : "") +
+    `Task: ${task}` +
+    credentialHint +
+    reportOnlyInstruction +
+    `\n\nIMPORTANT:\n` +
+    startUrlInstruction +
+    `- Use browser_snapshot (not screenshots) to understand page content.\n` +
+    `- After each action, take a snapshot to verify the result.\n` +
+    `- If a click opens a new tab/window, use browser_tabs to list/select the new tab (usually the newest), then continue there.\n` +
+    `- If the page seems "stuck" after a click (snapshot doesn't change), check browser_tabs — you may be on the wrong tab.\n` +
+    `- NEVER repeat the same action more than 2 times when URL/title/snapshot are unchanged.\n` +
+    `- If the page stays blank/about:blank or no progress is possible, STOP and return a blocked summary instead of looping.\n` +
+    `- If you encounter a login page and local credential autofill is available, wait up to 8 seconds for autofill before continuing.\n` +
+    `- When done, provide a clear text summary of what you found/accomplished.\n` +
+    `- Always include a final status line in plain text: status=completed|partial|blocked plus what remains.`
+  );
+}
+
+function buildPlaywrightCliPrompt({
+  task,
+  startUrl,
+  credentialHint,
+  reportOnlyInstruction,
+  shouldContinueSession,
+  commandPrefix,
+  skillFile,
+}) {
+  const stateInstruction = shouldContinueSession
+    ? "The connector reused the current Playwright CLI browser session and tab state."
+    : "The connector has already opened the Start URL in the Playwright CLI browser session.";
+
+  return (
+    `Use the existing Playwright CLI browser session to complete this browser task.\n\n` +
+    (startUrl ? `Start URL: ${startUrl}\n\n` : "") +
+    `Task: ${task}` +
+    credentialHint +
+    reportOnlyInstruction +
+    `\n\nOFFICIAL PLAYWRIGHT CLI SKILL:\n` +
+    `Before taking any browser action, read the complete bundled Playwright CLI skill at:\n` +
+    `${quoteShellArg(skillFile)}\n` +
+    `Follow that skill for browser inspection and interaction. Resolve any referenced files relative to the skill directory and read only the references relevant to this task.\n\n` +
+    `GROOVY PLAYWRIGHT CLI SESSION:\n` +
+    `${stateInstruction}\n` +
+    `For every skill example or instruction that uses the literal command playwright-cli, substitute this exact shell prefix:\n` +
+    `${commandPrefix}\n\n` +
+    `IMPORTANT:\n` +
+    `- Do not run open, attach, close, close-all, kill-all, delete-data, state-save, cookie-list, localstorage-list, requests, request, response-body, tracing, video, download, upload, or install commands.\n` +
+    `- If the page stays blank/about:blank or no progress is possible, STOP and return a blocked summary instead of looping.\n` +
+    `- If you encounter a login page and local credential autofill is available, wait up to 8 seconds and inspect again. Do not inspect process environments, temporary files, browser configuration, or credential storage.\n` +
+    `- When done, provide a clear text summary of what you found/accomplished.\n` +
+    `- Always include a final status line in plain text: status=completed|partial|blocked plus what remains.`
+  );
+}
+
 export async function runBrowserTaskViaPlaywright(opts) {
   const task = String(opts?.task || "").trim();
+  const reportOnly = opts?.report_only === true || opts?.reportOnly === true;
+  const ephemeral = opts?.ephemeral === true;
+  const runtimeSettings = resolveBrowserTaskRuntimeSettings(opts);
+  const requestedPlaywrightDriver = runtimeSettings.playwrightDriver;
+  let playwrightDriver =
+    requestedPlaywrightDriver === "cli" && runtimeSettings.provider === "codex"
+      ? "cli"
+      : "mcp";
+  let playwrightDriverFallbackReason =
+    requestedPlaywrightDriver === "cli" && runtimeSettings.provider !== "codex"
+      ? "playwright_cli_currently_requires_codex"
+      : "";
   const startUrl =
     typeof opts?.start_url === "string"
       ? opts.start_url.trim()
@@ -705,48 +1035,29 @@ export async function runBrowserTaskViaPlaywright(opts) {
     await sleep(500);
   }
 
-  // Build the prompt: explain autofill availability without exposing values or
-  // passing Playwright MCP global secret substitutions.
+  // Build the prompt hint without exposing values or passing Playwright global
+  // secret substitutions. In CLI mode, the connector launches the browser
+  // before the model and does not pass this credential environment to Codex.
   let credentialHint = "";
   const credentialSecrets = await preparePlaywrightCredentialSecrets(startUrl);
   if (credentialSecrets?.file) {
     credentialHint =
-      `\n\nIMPORTANT: Saved credentials can be auto-filled locally for ${credentialSecrets.domain} and related same-site login frames/subdomains, but their values are not visible to you.\n` +
+      `\n\nIMPORTANT: Saved credentials can be auto-filled locally for ${credentialSecrets.domain} and related same-site login frames/subdomains. They are handled by the connector-owned browser session and are not included in your prompt.\n` +
       `Do not rely on the browser profile password manager, type placeholder secret names, or ask for the password. If login moves to an unrelated host, stop and report the mismatch.\n`;
   }
 
-  const startUrlInstruction = shouldContinueSession
-    ? `- Continue from the CURRENT browser/tab state from the previous run.\n` +
-      `- Only navigate to the Start URL if the current tab is missing, wrong domain, or clearly broken.\n`
-    : `- Use browser_navigate to go to the start URL first.\n`;
+  const reportOnlyInstruction = reportOnly
+    ? `\n\nTEST MODE — READ-ONLY REPORT ONLY:\n` +
+      `- Do not place, preview, stage, or submit any trade, order, transfer, or other financial transaction.\n` +
+      `- Do not insert, update, or delete database records; do not send WhatsApp messages; do not download files; and do not change account settings, watchlists, alerts, or preferences.\n` +
+      `- You may log in, navigate, select filters/tabs, and read account information needed for the report.\n` +
+      `- If any next action could mutate external state, stop before that action and report what would have been required.\n` +
+      `- Return findings only in the final text response.\n`
+    : "";
 
-  const fullPrompt =
-    `Use playwright mcp to complete this browser task:\n\n` +
-    (startUrl ? `Start URL: ${startUrl}\n\n` : "") +
-    `Task: ${task}` +
-    credentialHint +
-    `\n\nIMPORTANT:\n` +
-    startUrlInstruction +
-    `- Use browser_snapshot (not screenshots) to understand page content.\n` +
-    `- After each action, take a snapshot to verify the result.\n` +
-    `- If a click opens a new tab/window, use browser_tabs to list/select the new tab (usually the newest), then continue there.\n` +
-    `- If the page seems "stuck" after a click (snapshot doesn't change), check browser_tabs — you may be on the wrong tab.\n` +
-    `- NEVER repeat the same action more than 2 times when URL/title/snapshot are unchanged.\n` +
-    `- If the page stays blank/about:blank or no progress is possible, STOP and return a blocked summary instead of looping.\n` +
-    `- If you encounter a login page and local credential autofill is available, wait up to 8 seconds for autofill before continuing.\n` +
-    `- When done, provide a clear text summary of what you found/accomplished.\n` +
-    `- Always include a final status line in plain text: status=completed|partial|blocked plus what remains.`;
-
-  const claudeBin = resolveClaudeBin();
-  const cliModelRaw =
-    [
-      process.env.GROOVY_BROWSER_TASK_MODEL,
-      process.env.GROOVY_COMPUTER_USE_MODEL,
-      process.env.GROOVY_CLAUDE_CLI_MODEL,
-    ]
-      .map((v) => (typeof v === "string" ? v.trim() : ""))
-      .find((v) => !!v) || "";
-  const cliModel = cliModelRaw || "claude-sonnet-4-6";
+  const claudeBin = runtimeSettings.provider === "claude" ? resolveClaudeBin() : "";
+  const codexBin = runtimeSettings.provider === "codex" ? resolveCodexBin() : "";
+  const cliModel = runtimeSettings.model;
 
   // Default to visible browser so users can watch automation.
   // Set GROOVY_PLAYWRIGHT_HEADLESS=1 (or true/on/yes) to force headless mode.
@@ -762,15 +1073,29 @@ export async function runBrowserTaskViaPlaywright(opts) {
   console.log("[browser-task-playwright] starting", {
     taskLen: task.length,
     startUrl,
+    provider: runtimeSettings.provider,
     model: cliModel,
+    reasoningEffort: runtimeSettings.reasoningEffort,
+    requestedPlaywrightDriver,
+    playwrightDriver,
+    playwrightDriverFallbackReason: playwrightDriverFallbackReason || null,
     hasCredentials: !!credentialSecrets?.file,
     timeoutMs,
     profile: profileSlug,
     headless,
     continueSession: shouldContinueSession ? `${continueSessionId.slice(0, 8)}...` : null,
-    authMethod: cliToken ? "cli_token" : apiKey ? "api_key" : "local",
+    authMethod:
+      runtimeSettings.provider === "codex"
+        ? (opts?.openai_api_key ? "api_key" : "local_codex_login")
+        : cliToken
+          ? "cli_token"
+          : apiKey
+            ? "api_key"
+            : "local_claude_login",
     hasCliToken: !!cliToken,
     hasApiKey: !!apiKey,
+    reportOnly,
+    ephemeral,
   });
 
   if (abortSignal?.aborted) {
@@ -779,6 +1104,11 @@ export async function runBrowserTaskViaPlaywright(opts) {
   }
 
   let autoLoginInitPage = null;
+  let playwrightCliConfig = null;
+  let playwrightCliInvocation = null;
+  let playwrightCliSkillFile = "";
+  let playwrightCliSessionName = "";
+  let playwrightCliSessionReused = false;
   try {
     autoLoginInitPage = preparePlaywrightAutoLoginInitPage();
   } catch (err) {
@@ -800,16 +1130,219 @@ export async function runBrowserTaskViaPlaywright(opts) {
       : {}),
   };
 
+  if (playwrightDriver === "cli") {
+    playwrightCliInvocation = resolvePlaywrightCliInvocation();
+    playwrightCliSessionName = `groovy_${profileSlug}`.slice(0, 64);
+    try {
+      if (playwrightCliInvocation.entrypoint) {
+        fs.accessSync(playwrightCliInvocation.entrypoint, fs.constants.R_OK);
+      }
+      playwrightCliSkillFile = resolvePlaywrightCliSkillFile();
+      fs.accessSync(playwrightCliSkillFile, fs.constants.R_OK);
+      playwrightCliConfig = preparePlaywrightCliConfig({
+        userDataDir,
+        initPageFile: autoLoginInitPage.file,
+      });
+      const cliLaunch = await startPlaywrightCliSession({
+        invocation: playwrightCliInvocation,
+        sessionName: playwrightCliSessionName,
+        startUrl,
+        userDataDir,
+        configFile: playwrightCliConfig.file,
+        headless,
+        env: spawnEnv,
+      });
+      playwrightCliSessionReused = cliLaunch.reused === true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err || "playwright_cli_failed");
+      const detail = cleanProgressText(
+        err && typeof err === "object"
+          ? String(err.stderr || err.stdout || message)
+          : message,
+        1000
+      );
+      console.warn("[browser-task-playwright] Playwright CLI startup failed; falling back to MCP", {
+        error: detail,
+      });
+      playwrightDriver = "mcp";
+      playwrightDriverFallbackReason = "playwright_cli_startup_failed";
+      cleanupPlaywrightTempDir(playwrightCliConfig);
+      playwrightCliConfig = null;
+      playwrightCliInvocation = null;
+      playwrightCliSkillFile = "";
+      playwrightCliSessionName = "";
+      playwrightCliSessionReused = false;
+    }
+  }
+
+  const fullPrompt = playwrightDriver === "cli"
+    ? buildPlaywrightCliPrompt({
+        task,
+        startUrl,
+        credentialHint,
+        reportOnlyInstruction,
+        shouldContinueSession: playwrightCliSessionReused,
+        commandPrefix: buildPlaywrightCliCommandPrefix(
+          playwrightCliInvocation,
+          playwrightCliSessionName
+        ),
+        skillFile: playwrightCliSkillFile,
+      })
+    : buildPlaywrightMcpPrompt({
+        task,
+        startUrl,
+        credentialHint,
+        reportOnlyInstruction,
+        shouldContinueSession,
+      });
+  const agentSpawnEnv = playwrightDriver === "mcp" ? spawnEnv : {};
+
   try {
+    if (runtimeSettings.provider === "codex") {
+      const openAiApiKey = firstNonEmptyString([
+        opts?.openai_api_key,
+        opts?.openAiApiKey,
+      ]);
+      const spawnResult = await runHeadlessCodex({
+        prompt: fullPrompt,
+        cwd: resolveClaudeCwd(opts),
+        timeoutMs,
+        codexBin,
+        model: cliModel,
+        reasoningEffort: runtimeSettings.reasoningEffort,
+        sessionId: shouldContinueSession ? continueSessionId : undefined,
+        apiKey: openAiApiKey || undefined,
+        env: agentSpawnEnv,
+        abortSignal,
+        ephemeral,
+        configOverrides:
+          playwrightDriver === "mcp" ? CODEX_PLAYWRIGHT_CONFIG_OVERRIDES : undefined,
+        onStreamEvent: (event) => {
+          if (!event || event.type !== "assistant") return;
+          const content = Array.isArray(event?.message?.content) ? event.message.content : [];
+          for (const block of content) {
+            const progress = playwrightDriver === "cli"
+              ? summarizePlaywrightCliToolUse(block)
+              : summarizePlaywrightToolUse(block);
+            if (progress) emitProgress(progress);
+          }
+        },
+      });
+      const parsed = extractCodexResult(spawnResult.streamEvents);
+      const text = String(parsed.resultText || "").trim();
+      const sessionId = String(
+        parsed.threadId || spawnResult.codexThreadId || (shouldContinueSession ? continueSessionId : "")
+      ).trim();
+      const usageObj = parsed.usage || spawnResult.codexUsage || null;
+      const inputTokens = typeof usageObj?.input_tokens === "number"
+        ? usageObj.input_tokens
+        : null;
+      const outputTokens = typeof usageObj?.output_tokens === "number"
+        ? usageObj.output_tokens
+        : null;
+      const totalTokens = typeof usageObj?.total_tokens === "number"
+        ? usageObj.total_tokens
+        : typeof inputTokens === "number" && typeof outputTokens === "number"
+          ? inputTokens + outputTokens
+          : null;
+      const exitCode = Number.isFinite(Number(spawnResult.code)) ? Number(spawnResult.code) : null;
+      const stderr = String(spawnResult.stderr || "");
+      const timedOut = spawnResult.timedOut === true;
+      const aborted = spawnResult.aborted === true;
+
+      console.log("[browser-task-playwright] finished", {
+        provider: "codex",
+        exitCode,
+        signal: spawnResult.signal || null,
+        resultLen: text.length,
+        stderrLen: stderr.length,
+        sessionId: sessionId ? `${sessionId.slice(0, 8)}...` : null,
+        timedOut,
+        aborted,
+        turnFailed: parsed.turnFailed,
+      });
+
+      const meta = {
+        exitCode,
+        signal: spawnResult.signal || null,
+        playwright: true,
+        playwrightDriver,
+        requestedPlaywrightDriver,
+        playwrightDriverFallbackReason: playwrightDriverFallbackReason || undefined,
+        playwrightCliSessionReused,
+        playwrightCliSkill: playwrightDriver === "cli" ? "bundled_official" : undefined,
+        credentialEnvironmentIsolated: playwrightDriver === "cli",
+        provider: "codex",
+        reasoningEffort: runtimeSettings.reasoningEffort,
+        profile: profileSlug,
+        killedStaleChrome,
+        timedOut,
+        aborted,
+        reportOnly,
+        ephemeral,
+        authMethod: openAiApiKey ? "api_key" : "local_codex_login",
+      };
+
+      if (timedOut || aborted) {
+        return {
+          ok: false,
+          error: timedOut
+            ? spawnResult.timeoutError || `codex_run timed out after ${timeoutMs}ms`
+            : "codex_run_aborted",
+          text,
+          sessionId,
+          partial: text.length > 0,
+          meta,
+        };
+      }
+
+      if (parsed.turnFailed || (exitCode !== null && exitCode !== 0)) {
+        return {
+          ok: false,
+          error:
+            parsed.errorText ||
+            text ||
+            stderr.slice(0, 500) ||
+            `codex exited with code ${exitCode}`,
+          text,
+          sessionId,
+          partial: text.length > 0,
+          meta,
+        };
+      }
+
+      if (!text) {
+        return {
+          ok: false,
+          error: parsed.errorText || stderr.slice(0, 500) || "codex_returned_no_result",
+          sessionId,
+          meta,
+        };
+      }
+
+      return {
+        ok: true,
+        text,
+        sessionId,
+        model: cliModel,
+        input_tokens: typeof inputTokens === "number" ? inputTokens : undefined,
+        output_tokens: typeof outputTokens === "number" ? outputTokens : undefined,
+        total_tokens: typeof totalTokens === "number" ? totalTokens : undefined,
+        usage: usageObj || undefined,
+        meta,
+      };
+    }
+
     const commonClaudeOptions = {
       prompt: fullPrompt,
       cwd: resolveClaudeCwd(opts),
       timeoutMs,
       claudeBin,
       model: cliModel,
+      reasoningEffort: runtimeSettings.reasoningEffort,
       allowedTools: PLAYWRIGHT_ALLOWED_TOOLS,
       sessionId: shouldContinueSession ? continueSessionId : undefined,
-      env: spawnEnv,
+      env: agentSpawnEnv,
       abortSignal,
       onStreamEvent: (event) => {
         if (!event || event.type !== "assistant") return;
@@ -899,6 +1432,7 @@ export async function runBrowserTaskViaPlaywright(opts) {
     const aborted = spawnResult.aborted === true;
 
     console.log("[browser-task-playwright] finished", {
+      provider: "claude",
       exitCode,
       signal: spawnResult.signal || null,
       resultLen: text.length,
@@ -923,11 +1457,18 @@ export async function runBrowserTaskViaPlaywright(opts) {
           exitCode,
           signal: spawnResult.signal || null,
           playwright: true,
+          playwrightDriver,
+          requestedPlaywrightDriver,
+          playwrightDriverFallbackReason: playwrightDriverFallbackReason || undefined,
+          provider: "claude",
+          reasoningEffort: runtimeSettings.reasoningEffort,
           profile: profileSlug,
           killedStaleChrome,
           timedOut,
           aborted,
           authFallbackUsed,
+          reportOnly,
+          ephemeral,
         },
       };
     }
@@ -944,9 +1485,16 @@ export async function runBrowserTaskViaPlaywright(opts) {
           exitCode,
           signal: spawnResult.signal || null,
           playwright: true,
+          playwrightDriver,
+          requestedPlaywrightDriver,
+          playwrightDriverFallbackReason: playwrightDriverFallbackReason || undefined,
+          provider: "claude",
+          reasoningEffort: runtimeSettings.reasoningEffort,
           profile: profileSlug,
           killedStaleChrome,
           authFallbackUsed,
+          reportOnly,
+          ephemeral,
         },
       };
     }
@@ -962,10 +1510,17 @@ export async function runBrowserTaskViaPlaywright(opts) {
           exitCode,
           signal: spawnResult.signal || null,
           playwright: true,
+          playwrightDriver,
+          requestedPlaywrightDriver,
+          playwrightDriverFallbackReason: playwrightDriverFallbackReason || undefined,
+          provider: "claude",
+          reasoningEffort: runtimeSettings.reasoningEffort,
           profile: profileSlug,
           killedStaleChrome,
           authFallbackUsed,
           isError: true,
+          reportOnly,
+          ephemeral,
         },
       };
     }
@@ -987,11 +1542,26 @@ export async function runBrowserTaskViaPlaywright(opts) {
       output_tokens: typeof outputTokens === "number" ? outputTokens : undefined,
       total_tokens: typeof totalTokens === "number" ? totalTokens : undefined,
       usage: usageObj || undefined,
-      meta: { exitCode, playwright: true, profile: profileSlug, killedStaleChrome, authFallbackUsed },
+      meta: {
+        exitCode,
+        playwright: true,
+        playwrightDriver,
+        requestedPlaywrightDriver,
+        playwrightDriverFallbackReason: playwrightDriverFallbackReason || undefined,
+        provider: "claude",
+        reasoningEffort: runtimeSettings.reasoningEffort,
+        profile: profileSlug,
+        killedStaleChrome,
+        authFallbackUsed,
+        reportOnly,
+        ephemeral,
+      },
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err || "browser_task_failed");
-    if (message === "claude_run_aborted") return { ok: false, error: "aborted" };
+    if (message === "claude_run_aborted" || message === "codex_run_aborted") {
+      return { ok: false, error: "aborted" };
+    }
     if (/timed out/i.test(message)) {
       return {
         ok: false,
@@ -1000,8 +1570,12 @@ export async function runBrowserTaskViaPlaywright(opts) {
     }
     return { ok: false, error: message };
   } finally {
+    if (playwrightCliInvocation && playwrightCliSessionName) {
+      await closePlaywrightCliSession(playwrightCliInvocation, playwrightCliSessionName);
+    }
     cleanupPlaywrightCredentialSecrets(credentialSecrets);
     cleanupPlaywrightTempDir(autoLoginInitPage);
+    cleanupPlaywrightTempDir(playwrightCliConfig);
   }
 }
 
@@ -1050,14 +1624,48 @@ function hasPlaywrightInClaudeConfigJson(config, projectKey) {
   return false;
 }
 
-// Check if claude CLI + Playwright MCP is available
-let _playwrightAvailable = null;
-export async function isPlaywrightAvailable() {
-  if (_playwrightAvailable !== null) return _playwrightAvailable;
+// Check whether the selected agent runtime has at least one usable Playwright
+// transport. CLI is preferred for Codex; MCP remains the compatibility path.
+const playwrightAvailabilityByProvider = new Map();
+export async function isPlaywrightAvailable(input = {}) {
+  const settings = resolveBrowserTaskRuntimeSettings(
+    typeof input === "string" ? { provider: input } : input
+  );
+  const provider = settings.provider;
+  const cacheKey = `${provider}:${settings.playwrightDriver}`;
+  if (playwrightAvailabilityByProvider.has(cacheKey)) {
+    return playwrightAvailabilityByProvider.get(cacheKey);
+  }
   try {
-    const { execFile } = await import("child_process");
-    const { promisify } = await import("util");
-    const execFileAsync = promisify(execFile);
+    if (provider === "codex") {
+      const env = prepareSpawnEnv({ ...process.env });
+      const codexBin = resolveCodexBin();
+      await execFileAsync(codexBin, ["--version"], { timeout: 10000, env });
+
+      if (settings.playwrightDriver === "cli") {
+        try {
+          const invocation = resolvePlaywrightCliInvocation();
+          const { stdout } = await execFileAsync(
+            invocation.command,
+            [...invocation.argsPrefix, "--version"],
+            { timeout: 10000, env }
+          );
+          playwrightAvailabilityByProvider.set(cacheKey, true);
+          console.log("[browser-task] Playwright CLI available for Codex", {
+            playwrightCli: String(stdout || "").trim(),
+          });
+          return true;
+        } catch {
+          // CLI unavailable: keep MCP as an automatic pre-task fallback.
+        }
+      }
+
+      const npxBin = process.platform === "win32" ? "npx.cmd" : "npx";
+      await execFileAsync(npxBin, ["--version"], { timeout: 10000, env });
+      playwrightAvailabilityByProvider.set(cacheKey, true);
+      console.log("[browser-task] Playwright MCP fallback available for Codex");
+      return true;
+    }
 
     const claudeBin = resolveClaudeBin();
     const env = prepareSpawnEnv({ ...process.env });
@@ -1074,12 +1682,12 @@ export async function isPlaywrightAvailable() {
         if (fs.existsSync(projectMcpPath)) {
           const projectConfig = JSON.parse(fs.readFileSync(projectMcpPath, "utf8"));
           if (hasPlaywrightInMcpConfigJson(projectConfig)) {
-            _playwrightAvailable = true;
+            playwrightAvailabilityByProvider.set(cacheKey, true);
             console.log("[browser-task] playwright available (project scope)", {
               claude: stdout.trim(),
               cwd: dir,
             });
-            return _playwrightAvailable;
+            return true;
           }
           // .mcp.json exists but doesn't include playwright → stop searching upward
           break;
@@ -1096,23 +1704,24 @@ export async function isPlaywrightAvailable() {
     try {
       if (fs.existsSync(userClaudePath)) {
         const userConfig = JSON.parse(fs.readFileSync(userClaudePath, "utf8"));
-        _playwrightAvailable = hasPlaywrightInClaudeConfigJson(userConfig, cwd);
-        console.log("[browser-task] playwright available:", _playwrightAvailable, {
+        const available = hasPlaywrightInClaudeConfigJson(userConfig, cwd);
+        playwrightAvailabilityByProvider.set(cacheKey, available);
+        console.log("[browser-task] playwright available:", available, {
           claude: stdout.trim(),
           cwd,
         });
-        return _playwrightAvailable;
+        return available;
       }
     } catch {
       // ignore
     }
 
-    _playwrightAvailable = false;
+    playwrightAvailabilityByProvider.set(cacheKey, false);
     console.log("[browser-task] playwright not configured", { claude: stdout.trim(), cwd });
   } catch {
-    _playwrightAvailable = false;
+    playwrightAvailabilityByProvider.set(cacheKey, false);
   }
-  return _playwrightAvailable;
+  return false;
 }
 
 function normalizeAppUrl(appUrl) {

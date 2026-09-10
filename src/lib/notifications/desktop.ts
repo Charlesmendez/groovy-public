@@ -21,6 +21,7 @@ export type DesktopNotificationMessage = {
   profile_id: string | null;
   content: string;
   metadata: Record<string, unknown> | null;
+  thread_root_message_id?: string | null;
   created_at: string;
 };
 

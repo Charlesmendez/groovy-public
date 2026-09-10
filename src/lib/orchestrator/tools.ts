@@ -18,14 +18,14 @@ export type ToolExecutionRequest = {
 /**
  * Browser Agent Tools
  * 
- * browser_task uses Claude Computer Use - Claude can SEE the screen and click intelligently.
+ * browser_task uses the connector's selected Claude Code or Codex Playwright runtime.
  * Other browser tools are for simple, direct automation.
  */
 export const browserTools = {
   // Primary tool - uses Claude Computer Use for intelligent browsing
   browser_task: tool({
     description:
-      "Execute a browser task using Claude Computer Use. Claude will see screenshots and intelligently navigate, click, and type. Use this for complex browsing tasks like 'find the first product on Target' or 'search for flights to Paris'.",
+      "Execute a browser task using the connector's selected Claude Code or Codex Playwright runtime. Use this for complex browsing tasks like 'find the first product on Target' or 'search for flights to Paris'.",
     inputSchema: z.object({
       task: z.string().describe("Natural language description of the browsing task to complete"),
       start_url: z.string().optional().describe("Optional URL to start at (e.g., 'google.com')"),
@@ -358,8 +358,16 @@ export function toolToAgent(
   if (
     toolName === "list_agents" ||
     toolName === "list_skills_and_docs" ||
+    toolName === "read_skill_or_doc" ||
     toolName === "assign_skill_or_doc" ||
     toolName === "remove_skill_or_doc_assignment" ||
+    toolName === "list_workspace_secret_assignments" ||
+    toolName === "set_workspace_secret_assignment" ||
+    toolName === "list_channel_skills" ||
+    toolName === "create_channel_skill" ||
+    toolName === "update_channel_skill_actions" ||
+    toolName === "assign_channel_skill" ||
+    toolName === "remove_channel_skill" ||
     toolName === "assign_task" ||
     toolName === "consult_agent" ||
     toolName === "finalize_plan" ||
@@ -385,7 +393,7 @@ export function toolToAgent(
   if (toolName.startsWith("linkdb_")) return "files";
   if (toolName.startsWith("sqlite_")) return "files";
   if (toolName.startsWith("obsidian_")) return "obsidian";
-  if (toolName.startsWith("data_")) return "data";
+  if (toolName.startsWith("data_") || toolName === "home_data_operations" || toolName === "home_data_read") return "data";
   if (toolName.startsWith("schedule_")) return "schedule";
   if (toolName.startsWith("site_")) return "pages";
   if (

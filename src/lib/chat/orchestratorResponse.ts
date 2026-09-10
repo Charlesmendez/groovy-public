@@ -3,15 +3,42 @@ type ChatRoundResult =
       kind: "final";
       text?: unknown;
       toolOutputText?: unknown;
+      toolCallsExecuted?: unknown;
     }
   | {
       kind: "needs_connector" | "ui_open_code" | "browser_task";
     };
 
-const EMPTY_RESPONSE_MESSAGE =
-  "Groovy could not produce a response for this turn. Please try again.";
 const CONNECTOR_RESPONSE_MESSAGE =
   "This channel turn could not be completed without a local connector.";
+
+const SCHEDULE_MUTATION_TOOLS = new Set([
+  "schedule_create",
+  "schedule_update",
+  "schedule_pause",
+  "schedule_resume",
+  "schedule_cancel_next",
+  "schedule_delete",
+]);
+
+/**
+ * Tell Team Chat clients when a completed Mind turn changed the channel's
+ * schedule list. The flag is persisted on the assistant message so every
+ * open client can invalidate its sidebar, not only the sender's device.
+ */
+export function chatRoundChangesScheduledTasks(
+  result: ChatRoundResult,
+): boolean {
+  return (
+    result.kind === "final" &&
+    Array.isArray(result.toolCallsExecuted) &&
+    result.toolCallsExecuted.some(
+      (toolName) =>
+        typeof toolName === "string" &&
+        SCHEDULE_MUTATION_TOOLS.has(toolName),
+    )
+  );
+}
 
 function meaningfulText(value: unknown, depth = 0): string {
   if (depth > 5 || value == null) return "";
@@ -66,5 +93,10 @@ export function resolveChatRoundText(result: ChatRoundResult): string {
   if (assistantText) return assistantText;
 
   const toolText = meaningfulText(result.toolOutputText);
-  return toolText || EMPTY_RESPONSE_MESSAGE;
+  if (toolText) return toolText;
+
+  // An empty provider turn is an error, not a successful assistant message.
+  // The route keeps the user's message, marks the run failed, and exposes the
+  // Edit & resend recovery path instead of persisting a misleading reply.
+  throw new Error("The orchestrator returned an empty final response.");
 }

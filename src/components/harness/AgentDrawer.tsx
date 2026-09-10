@@ -60,6 +60,7 @@ export function AgentDrawer({
   agent,
   capabilities,
   connectorOnline,
+  mobileUi,
   onClose,
   onUpdateAgent,
   onRenameAgent,
@@ -73,6 +74,7 @@ export function AgentDrawer({
     codexCliInstalled: boolean | null;
   };
   connectorOnline: boolean;
+  mobileUi: boolean;
   onClose: () => void;
   onUpdateAgent: (
     id: string,
@@ -105,7 +107,7 @@ export function AgentDrawer({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50"
+          className="fixed inset-x-0 bottom-[var(--safe-area-inset-bottom)] top-[var(--safe-area-inset-top)] z-50"
         >
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
           <motion.div
@@ -131,8 +133,10 @@ export function AgentDrawer({
                 </div>
               </div>
               <button
+                type="button"
                 onClick={onClose}
                 className="ml-auto w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-white hover:bg-white/10 transition-colors"
+                aria-label="Close agent settings"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -169,6 +173,7 @@ export function AgentDrawer({
                   agent={agent}
                   capabilities={capabilities}
                   connectorOnline={connectorOnline}
+                  mobileUi={mobileUi}
                   onUpdateAgent={onUpdateAgent}
                   onRenameAgent={onRenameAgent}
                   onDeleteAgent={onDeleteAgent}
@@ -198,6 +203,7 @@ function GeneralTab({
   agent,
   capabilities,
   connectorOnline,
+  mobileUi,
   onUpdateAgent,
   onRenameAgent,
   onDeleteAgent,
@@ -208,6 +214,7 @@ function GeneralTab({
   agent: WorkerAgentInfo;
   capabilities: { claudeCliInstalled: boolean | null; codexCliInstalled: boolean | null };
   connectorOnline: boolean;
+  mobileUi: boolean;
   onUpdateAgent: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
   onRenameAgent: (id: string, name: string) => Promise<boolean>;
   onDeleteAgent: (id: string) => Promise<boolean>;
@@ -415,20 +422,34 @@ function GeneralTab({
       {/* Workspace */}
       <div>
         <label className="block text-xs font-medium text-zinc-400 mb-1.5">Workspace</label>
-        <button
-          onClick={changeWorkspace}
-          disabled={!connectorOnline || changingWorkspace}
-          className="w-full flex items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-left hover:border-white/20 transition-colors disabled:opacity-50"
-        >
-          {changingWorkspace ? (
-            <Loader2 className="w-4 h-4 text-zinc-500 animate-spin" />
-          ) : (
-            <Folder className="w-4 h-4 text-zinc-500" />
-          )}
-          <span className="text-sm text-zinc-300 truncate">
-            {agent.workspaceRootPath || "Home folder (default)"}
-          </span>
-        </button>
+        {mobileUi ? (
+          <div className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2.5">
+            <div className="flex items-center gap-2">
+              <Folder className="h-4 w-4 shrink-0 text-zinc-500" />
+              <span className="truncate text-sm text-zinc-300">
+                {agent.workspaceRootPath || "Home folder (default)"}
+              </span>
+            </div>
+            <p className="mt-1 text-[10px] text-zinc-600">
+              Change the workspace from Groovy on your computer.
+            </p>
+          </div>
+        ) : (
+          <button
+            onClick={changeWorkspace}
+            disabled={!connectorOnline || changingWorkspace}
+            className="w-full flex items-center gap-2 rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-left hover:border-white/20 transition-colors disabled:opacity-50"
+          >
+            {changingWorkspace ? (
+              <Loader2 className="w-4 h-4 text-zinc-500 animate-spin" />
+            ) : (
+              <Folder className="w-4 h-4 text-zinc-500" />
+            )}
+            <span className="text-sm text-zinc-300 truncate">
+              {agent.workspaceRootPath || "Home folder (default)"}
+            </span>
+          </button>
+        )}
       </div>
 
       {/* Save */}

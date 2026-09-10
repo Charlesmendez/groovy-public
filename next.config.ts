@@ -1,5 +1,11 @@
 import type { NextConfig } from "next";
 
+const agentSdkRuntimeFiles = [
+  "./node_modules/@anthropic-ai/claude-agent-sdk/cli.js",
+  "./node_modules/@anthropic-ai/claude-agent-sdk/package.json",
+  "./node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+];
+
 const nextConfig: NextConfig = {
   output: "standalone",
   allowedDevOrigins: ["*.trycloudflare.com"],
@@ -9,11 +15,8 @@ const nextConfig: NextConfig = {
   // Agent SDK spawns cli.js as a subprocess at runtime (not imported).
   // File tracing won't discover it automatically, so include it explicitly.
   outputFileTracingIncludes: {
-    "/api/orchestrator": [
-      "./node_modules/@anthropic-ai/claude-agent-sdk/cli.js",
-      "./node_modules/@anthropic-ai/claude-agent-sdk/package.json",
-      "./node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
-    ],
+    "/api/orchestrator": agentSdkRuntimeFiles,
+    "/api/home-inbox/run": agentSdkRuntimeFiles,
   },
 };
 

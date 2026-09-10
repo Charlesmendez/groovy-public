@@ -1,4 +1,13 @@
 import { randomUUID } from "node:crypto";
+import {
+  MAX_CHAT_VOICE_BYTES,
+  MAX_CHAT_VOICE_DURATION_MS,
+} from "./voiceNotes";
+
+export {
+  MAX_CHAT_VOICE_BYTES,
+  MAX_CHAT_VOICE_DURATION_MS,
+} from "./voiceNotes";
 
 export const CHAT_IMAGE_BUCKET = "chat_uploads";
 export const MAX_CHAT_IMAGE_FILES = 3;
@@ -17,6 +26,22 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
+const SUPPORTED_CHAT_VOICE_TYPES = new Set([
+  "audio/webm",
+  "audio/ogg",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/x-wav",
+]);
+const VOICE_EXTENSIONS: Record<string, string> = {
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+};
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 export type ValidatedChatImage = {
@@ -32,6 +57,23 @@ export type PublicChatImageAttachment = {
   name: string;
   mimeType: string;
   sizeBytes: number;
+};
+
+export type ValidatedChatVoiceNote = {
+  mediaType: string;
+  base64: string;
+  filename: string;
+  bytes: Buffer;
+  byteSize: number;
+  durationMs: number;
+};
+
+export type PublicChatVoiceAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  durationMs: number;
 };
 
 export class ChatImageValidationError extends Error {
@@ -70,32 +112,103 @@ function decodeStrictBase64(value: unknown): Buffer {
   return bytes;
 }
 
-function hasExpectedSignature(mediaType: string, bytes: Buffer): boolean {
-  if (mediaType === "image/jpeg") {
-    return (
+function decodeVoiceBase64(value: unknown): Buffer {
+  if (typeof value !== "string") {
+    throw new ChatImageValidationError(
+      "The voice note must include recorded audio.",
+    );
+  }
+  const trimmed = value.trim();
+  const commaIndex = trimmed.indexOf(",");
+  const normalized = (commaIndex >= 0 ? trimmed.slice(commaIndex + 1) : trimmed)
+    .replace(/\s+/g, "");
+  if (!normalized || !BASE64_PATTERN.test(normalized)) {
+    throw new ChatImageValidationError("The recorded voice note is invalid.");
+  }
+  const bytes = Buffer.from(normalized, "base64");
+  if (!bytes.length || bytes.toString("base64") !== normalized) {
+    throw new ChatImageValidationError("The recorded voice note is invalid.");
+  }
+  return bytes;
+}
+
+function detectedImageMediaType(bytes: Buffer): string | null {
+  if (
       bytes.length >= 3 &&
       bytes[0] === 0xff &&
       bytes[1] === 0xd8 &&
       bytes[2] === 0xff
-    );
+  ) {
+    return "image/jpeg";
   }
-  if (mediaType === "image/png") {
-    return (
+  if (
       bytes.length >= 8 &&
       bytes.subarray(0, 8).equals(
         Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
       )
-    );
+  ) {
+    return "image/png";
   }
-  if (mediaType === "image/gif") {
-    const signature = bytes.subarray(0, 6).toString("ascii");
-    return signature === "GIF87a" || signature === "GIF89a";
+  const gifSignature = bytes.subarray(0, 6).toString("ascii");
+  if (gifSignature === "GIF87a" || gifSignature === "GIF89a") {
+    return "image/gif";
   }
-  if (mediaType === "image/webp") {
-    return (
+  if (
       bytes.length >= 12 &&
       bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
       bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+function normalizeImageFilename(value: unknown, mediaType: string): string {
+  const normalized = normalizeFilename(value, mediaType);
+  const expectedExtension = IMAGE_EXTENSIONS[mediaType] || "jpg";
+  const imageExtension = normalized.match(/\.(?:jpe?g|png|webp|gif)$/i);
+  if (imageExtension) {
+    return `${normalized.slice(0, -imageExtension[0].length)}.${expectedExtension}`;
+  }
+  return `${normalized}.${expectedExtension}`;
+}
+
+function hasExpectedVoiceSignature(
+  mediaType: string,
+  bytes: Buffer,
+): boolean {
+  if (mediaType === "audio/webm") {
+    return (
+      bytes.length >= 4 &&
+      bytes[0] === 0x1a &&
+      bytes[1] === 0x45 &&
+      bytes[2] === 0xdf &&
+      bytes[3] === 0xa3
+    );
+  }
+  if (mediaType === "audio/ogg") {
+    return bytes.length >= 4 && bytes.subarray(0, 4).toString("ascii") === "OggS";
+  }
+  if (mediaType === "audio/mp4") {
+    return (
+      bytes.length >= 12 &&
+      bytes.subarray(4, 8).toString("ascii") === "ftyp"
+    );
+  }
+  if (mediaType === "audio/mpeg") {
+    return (
+      (bytes.length >= 3 &&
+        bytes.subarray(0, 3).toString("ascii") === "ID3") ||
+      (bytes.length >= 2 &&
+        bytes[0] === 0xff &&
+        (bytes[1] & 0xe0) === 0xe0)
+    );
+  }
+  if (mediaType === "audio/wav" || mediaType === "audio/x-wav") {
+    return (
+      bytes.length >= 12 &&
+      bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+      bytes.subarray(8, 12).toString("ascii") === "WAVE"
     );
   }
   return false;
@@ -119,11 +232,11 @@ export function validateChatImages(value: unknown): ValidatedChatImage[] {
       raw && typeof raw === "object"
         ? (raw as Record<string, unknown>)
         : null;
-    const mediaType =
+    const requestedMediaType =
       typeof item?.mediaType === "string"
-        ? item.mediaType.trim().toLowerCase()
+        ? item.mediaType.trim().toLowerCase().split(";")[0]
         : "";
-    if (!SUPPORTED_CHAT_IMAGE_TYPES.has(mediaType)) {
+    if (!SUPPORTED_CHAT_IMAGE_TYPES.has(requestedMediaType)) {
       throw new ChatImageValidationError(
         "Use a JPEG, PNG, WebP, or GIF image.",
       );
@@ -140,7 +253,8 @@ export function validateChatImages(value: unknown): ValidatedChatImage[] {
         "Keep attached images under 2 MB total.",
       );
     }
-    if (!hasExpectedSignature(mediaType, bytes)) {
+    const mediaType = detectedImageMediaType(bytes);
+    if (!mediaType) {
       throw new ChatImageValidationError(
         "An attached file does not match its image type.",
       );
@@ -148,12 +262,66 @@ export function validateChatImages(value: unknown): ValidatedChatImage[] {
     files.push({
       mediaType,
       base64: bytes.toString("base64"),
-      filename: normalizeFilename(item?.filename, mediaType),
+      filename: normalizeImageFilename(item?.filename, mediaType),
       bytes,
       byteSize: bytes.length,
     });
   }
   return files;
+}
+
+export function validateChatVoiceNote(
+  value: unknown,
+): ValidatedChatVoiceNote | null {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ChatImageValidationError("The voice note is invalid.");
+  }
+  const item = value as Record<string, unknown>;
+  const rawMediaType =
+    typeof item.mediaType === "string"
+      ? item.mediaType.trim().toLowerCase()
+      : "";
+  const mediaType = rawMediaType.split(";")[0]?.trim() || "";
+  if (!SUPPORTED_CHAT_VOICE_TYPES.has(mediaType)) {
+    throw new ChatImageValidationError(
+      "This browser recorded an unsupported voice-note format.",
+    );
+  }
+  const bytes = decodeVoiceBase64(item.base64);
+  if (bytes.length > MAX_CHAT_VOICE_BYTES) {
+    throw new ChatImageValidationError(
+      "Voice notes must be 12 MB or smaller.",
+    );
+  }
+  if (!hasExpectedVoiceSignature(mediaType, bytes)) {
+    throw new ChatImageValidationError(
+      "The recorded audio does not match its voice-note format.",
+    );
+  }
+  const durationMs =
+    typeof item.durationMs === "number" && Number.isFinite(item.durationMs)
+      ? Math.round(item.durationMs)
+      : 0;
+  if (durationMs < 250 || durationMs > MAX_CHAT_VOICE_DURATION_MS) {
+    throw new ChatImageValidationError(
+      "Voice notes must be between one second and ten minutes.",
+    );
+  }
+  return {
+    mediaType,
+    base64: bytes.toString("base64"),
+    filename: normalizeFilename(
+      item.filename,
+      mediaType,
+    ).replace(
+      /^image\.[a-z0-9]+$/i,
+      `voice-note.${VOICE_EXTENSIONS[mediaType] || "webm"}`,
+    ),
+    bytes,
+    byteSize: bytes.length,
+    durationMs,
+  };
 }
 
 export function buildChatImageStoragePath(args: {
@@ -166,8 +334,22 @@ export function buildChatImageStoragePath(args: {
   }`;
 }
 
+export function buildChatVoiceStoragePath(args: {
+  uploaderId: string;
+  channelId: string;
+  mediaType: string;
+}): string {
+  return `${args.uploaderId}/team-chat/${args.channelId}/${randomUUID()}.${
+    VOICE_EXTENSIONS[args.mediaType] || "webm"
+  }`;
+}
+
 export function imageOnlyMessage(count: number): string {
   return count === 1 ? "Shared an image" : `Shared ${count} images`;
+}
+
+export function voiceNoteMessage(): string {
+  return "Shared a voice note";
 }
 
 export function publicChatImageAttachment(value: {
@@ -181,5 +363,21 @@ export function publicChatImageAttachment(value: {
     name: String(value.file_name),
     mimeType: String(value.mime_type),
     sizeBytes: Number(value.size_bytes),
+  };
+}
+
+export function publicChatVoiceAttachment(value: {
+  id: unknown;
+  file_name: unknown;
+  mime_type: unknown;
+  size_bytes: unknown;
+  duration_ms: unknown;
+}): PublicChatVoiceAttachment {
+  return {
+    id: String(value.id),
+    name: String(value.file_name),
+    mimeType: String(value.mime_type),
+    sizeBytes: Number(value.size_bytes),
+    durationMs: Number(value.duration_ms),
   };
 }

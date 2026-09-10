@@ -53,6 +53,7 @@ type Summary = {
   unmeteredLlmCalls?: number;
   totalToolCalls: number;
   estimatedCount: number;
+  derivedModelCostCount?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   cacheSavingsUsd?: number;
@@ -175,10 +176,13 @@ function formatDateInput(d: Date): string {
 const SOURCE_LABELS: Record<string, string> = {
   orchestrator: "Orchestrator",
   orchestrator_round: "Orchestrator (WhatsApp/Scheduler)",
+  orchestrator_round_agent_sdk: "Orchestrator (Agent SDK)",
+  durable_context_checkpoint: "Durable Context",
   heartbeat: "Heartbeat",
   memory_planner: "Memory Planner",
   compaction: "Prompt Compaction",
   ai_agent_delegate: "AI Agent Delegate",
+  agent_task: "Worker Agent",
   datagran_agent: "Data Agent",
   code_agent_cli: "Code Agent (CLI)",
   connector_code_cli: "Claude Code (CLI)",
@@ -341,7 +345,6 @@ export function UsageDashboardContent() {
   const groovyKeyTokens = summary?.groovyKeyTokens || 0;
   const externalKeyTokens = summary?.externalKeyTokens || 0;
   const noChargeTokens = summary?.noChargeTokens || 0;
-  const meteredLlmCalls = summary?.meteredLlmCalls ?? summary?.totalLlmCalls ?? 0;
   const unmeteredLlmCalls = summary?.unmeteredLlmCalls || 0;
   const hasChargeSplit = externalKeyTokens > 0 || noChargeTokens > 0;
 
@@ -509,13 +512,17 @@ export function UsageDashboardContent() {
             />
             <SummaryCard
               icon={<TrendingUp className="w-4 h-4" />}
-              label="Avg Tokens / Call"
+              label="Estimated API Value"
               value={
-                summary && meteredLlmCalls > 0
-                  ? formatNumber(Math.round(summary.totalTokens / meteredLlmCalls))
+                summary && (summary.modelCostUsdTotal || 0) > 0
+                  ? formatUsd(summary.modelCostUsdTotal || 0)
                   : "—"
               }
-              detail={unmeteredLlmCalls > 0 ? "excludes unmetered" : undefined}
+              detail={
+                summary && (summary.modelCostUsdTotal || 0) > 0
+                  ? `current API rates · ${formatUsd(summary.totalChargeUsdTotal || 0)} charged`
+                  : undefined
+              }
               color="emerald"
             />
           </div>
@@ -567,9 +574,28 @@ export function UsageDashboardContent() {
                           <div className="text-sm font-medium text-white tabular-nums">
                             {member.tokens > 0 ? formatNumber(member.tokens) : "No tokens"}
                           </div>
-                          <div className="text-[11px] text-zinc-600">
-                            {member.totalChargeUsd > 0 ? formatUsd(member.totalChargeUsd) : usageLabel || "0 calls"}
-                          </div>
+                          {member.modelCostUsd > 0 ? (
+                            <>
+                              <div className="text-[11px] text-zinc-500">
+                                {formatUsd(member.modelCostUsd)} estimated API value
+                              </div>
+                              <div
+                                className={`text-[10px] ${
+                                  member.totalChargeUsd > 0
+                                    ? "text-zinc-600"
+                                    : "text-emerald-400/80"
+                                }`}
+                              >
+                                {member.totalChargeUsd > 0
+                                  ? `${formatUsd(member.totalChargeUsd)} charged`
+                                  : "$0 charged · included"}
+                              </div>
+                            </>
+                          ) : (
+                            <div className="text-[11px] text-zinc-600">
+                              {usageLabel || "0 calls"}
+                            </div>
+                          )}
                         </div>
                       </div>
                       <div className="mt-3 h-1.5 rounded-full bg-white/5 overflow-hidden">
@@ -691,7 +717,7 @@ export function UsageDashboardContent() {
                         <div className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
                         <div>
                           <span className="text-sm text-zinc-200">Cache Hits</span>
-                          <p className="text-[11px] text-zinc-600">Tokens served from cache at 90% discount</p>
+                          <p className="text-[11px] text-zinc-600">Tokens served from provider cache at discounted rates</p>
                         </div>
                       </div>
                       <span className="text-sm font-medium text-emerald-400 tabular-nums">{formatNumber(cacheRead)}</span>
@@ -804,7 +830,12 @@ export function UsageDashboardContent() {
           {/* Breakdowns */}
           <div className="grid grid-cols-1 gap-4">
             {/* By Agent (harness) */}
-            <AgentUsageBreakdown />
+            <AgentUsageBreakdown
+              key={`${data.range.from}:${data.range.to}:${data.selectedTeamMemberId || "all"}`}
+              from={data.range.from}
+              to={data.range.to}
+              teamMemberId={data.selectedTeamMemberId || null}
+            />
             {/* By Source */}
             <div className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
               <h2 className="text-sm font-medium text-zinc-300 mb-4">Usage by Source</h2>
@@ -850,7 +881,14 @@ export function UsageDashboardContent() {
 
             {/* By Model */}
             <div className="rounded-2xl border border-white/5 bg-white/[0.02] p-5">
-              <h2 className="text-sm font-medium text-zinc-300 mb-4">Usage by Model</h2>
+              <div className="flex items-center justify-between gap-3 mb-4">
+                <h2 className="text-sm font-medium text-zinc-300">Usage by Model</h2>
+                {unmeteredLlmCalls > 0 && (
+                  <span className="text-[10px] text-zinc-500">
+                    {unmeteredLlmCalls} {unmeteredLlmCalls === 1 ? "call" : "calls"} excluded without token data
+                  </span>
+                )}
+              </div>
               {data.byModel.length > 0 ? (
                 <div className="space-y-3">
                   {data.byModel.map((m) => {

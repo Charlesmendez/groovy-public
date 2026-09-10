@@ -7,7 +7,7 @@
  * in-place `connector_update` relay flow.
  */
 
-export const MIN_CONNECTOR_VERSION = "0.24.15";
+export const MIN_CONNECTOR_VERSION = "0.24.46";
 export const SELF_UPDATE_MIN_CONNECTOR_VERSION = "0.23.1";
 
 /** Parse "v1.2.3-beta.1" → { nums: [1,2,3], prerelease: "beta.1" | null }. */

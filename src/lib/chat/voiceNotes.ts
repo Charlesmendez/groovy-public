@@ -1,0 +1,2 @@
+export const MAX_CHAT_VOICE_BYTES = 12 * 1024 * 1024;
+export const MAX_CHAT_VOICE_DURATION_MS = 10 * 60 * 1_000;

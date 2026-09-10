@@ -55,7 +55,10 @@ function fallbackCodeAgentModel(billing: CodeAgentUsageBillingContext): string |
 }
 
 export async function recordCodeAgentUsage(args: {
+  /** Account that owns the worker, credentials, and billing workspace. */
   userId: string;
+  /** Member who initiated shared workspace work; defaults to userId. */
+  usageActorUserId?: string | null;
   userEmail: string | null;
   agentId: string;
   requestId: string;
@@ -71,6 +74,7 @@ export async function recordCodeAgentUsage(args: {
   unmetered: boolean;
 }> {
   const { userId, userEmail, agentId, requestId, billing, result } = args;
+  const usageActorUserId = args.usageActorUserId || userId;
   const source = args.source || "code_agent_cli";
 
   const workspaceId = await getOrCreateWorkspaceIdForUser({
@@ -141,6 +145,9 @@ export async function recordCodeAgentUsage(args: {
   const modelForStorage = model || modelForEstimation;
   const meta = {
     agentId,
+    ...(usageActorUserId !== userId
+      ? { usageActorUserId, credentialOwnerUserId: userId }
+      : {}),
     codeCliProvider: billing.codeCliProvider,
     authMethod: billing.authMethod,
     authOrigin: billing.authOrigin,
@@ -157,7 +164,7 @@ export async function recordCodeAgentUsage(args: {
 
   await insertBillingUsageEventBestEffort({
     workspaceId,
-    userId,
+    userId: usageActorUserId,
     turnId: requestId,
     traceId: requestId,
     source,

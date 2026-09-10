@@ -266,7 +266,7 @@ export function buildSystemPrompt(
     obsidian: `**Obsidian Agent**: Search, read, and write notes in Obsidian vaults. Use for knowledge management, note-taking, and searching the user's personal notes.`,
     data: `**Data Agent**: Connect to marketing platforms (Google Ads, Facebook, LinkedIn, TikTok) and analyze data. Use for analytics, reporting, and insights.`,
     chat: `**AI Chat Agent**: A dedicated conversational AI for open-ended discussion, brainstorming, explanations, and general assistance. Use when the user wants a conversation, needs explanations, or wants to discuss ideas without using specific tools.`,
-    schedule: `**Schedule Agent**: Create, list, pause, cancel-next-run, and delete scheduled tasks that run locally on the user's machine. Use when the user asks to run something at a certain time, periodically, or wants to manage scheduled jobs.`,
+    schedule: `**Schedule Agent**: Create, list, update, pause, cancel-next-run, and delete scheduled tasks that run locally on the user's machine. Use when the user asks to run something at a certain time, periodically, or wants to inspect or manage scheduled jobs.`,
     code: `**Code Agent**: Relay to a local interactive Claude Code session running on the user's machine. Use for coding tasks that should be executed inside Claude Code.`,
   };
 

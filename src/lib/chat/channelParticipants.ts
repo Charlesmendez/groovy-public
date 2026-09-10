@@ -21,7 +21,8 @@ function clean(value: unknown, fallback: string, maximum = 200): string {
 export function buildChannelParticipantContext(args: {
   channelName: string;
   visibility: "workspace" | "private";
-  currentSpeakerUserId: string;
+  /** Omitted for system-originated turns such as a scheduled channel run. */
+  currentSpeakerUserId?: string | null;
   humans: ChannelHumanParticipant[];
   agents: ChannelAgentParticipant[];
   mindName: string;

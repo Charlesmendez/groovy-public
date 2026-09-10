@@ -5,6 +5,7 @@ import {
   createChatChannelInRlsOrder,
   MAX_CHANNEL_ORCHESTRATOR_INSTRUCTIONS,
   mentionsHandle,
+  newChannelOrchestratorMode,
   parseChannelOrchestratorInstructions,
   parseTeamChatControlRequest,
   shouldRunChannelOrchestrator,
@@ -121,6 +122,21 @@ test("channel modes and profile/agent mentions route correctly", () => {
   );
 });
 
+test("person DMs default to humans only while channels keep mention mode", () => {
+  assert.equal(
+    newChannelOrchestratorMode({ kind: "dm", requestedMode: undefined }),
+    "off",
+  );
+  assert.equal(
+    newChannelOrchestratorMode({ kind: "channel", requestedMode: undefined }),
+    "mention",
+  );
+  assert.equal(
+    newChannelOrchestratorMode({ kind: "dm", requestedMode: "mention" }),
+    "mention",
+  );
+});
+
 test("team chat control requests require explicit targets and redirect text", () => {
   assert.deepEqual(parseTeamChatControlRequest({ action: "stop" }), {
     ok: false,
@@ -152,6 +168,32 @@ test("team chat control requests require explicit targets and redirect text", ()
         taskId: "task-123",
         direction: "Focus only on the API.",
       },
+    },
+  );
+  assert.deepEqual(
+    parseTeamChatControlRequest({
+      action: "approve",
+      target: "agent",
+      taskId: "task-123",
+    }),
+    {
+      ok: true,
+      value: {
+        action: "approve",
+        target: "agent",
+        taskId: "task-123",
+        direction: null,
+      },
+    },
+  );
+  assert.deepEqual(
+    parseTeamChatControlRequest({
+      action: "reject",
+      target: "orchestrator",
+    }),
+    {
+      ok: false,
+      error: "approval decisions require an agent task",
     },
   );
 });

@@ -13,10 +13,22 @@ type Params = {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export async function GET(_request: Request, { params }: Params) {
+function safeDownloadName(value: unknown): string {
+  const normalized =
+    typeof value === "string"
+      ? value
+          .replace(/[\u0000-\u001f\u007f/\\]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 180)
+      : "";
+  return normalized || "chat-attachment";
+}
+
+export async function GET(request: Request, { params }: Params) {
   const { id: channelId, attachmentId } = await params;
   if (!UUID_PATTERN.test(channelId) || !UUID_PATTERN.test(attachmentId)) {
-    return NextResponse.json({ error: "Image not found" }, { status: 404 });
+    return NextResponse.json({ error: "Attachment not found" }, { status: 404 });
   }
 
   const supabase = await createSupabaseServerClient();
@@ -37,18 +49,18 @@ export async function GET(_request: Request, { params }: Params) {
     .maybeSingle();
   if (channelError) {
     return NextResponse.json(
-      { error: "Could not verify access to this image." },
+      { error: "Could not verify access to this attachment." },
       { status: 500 },
     );
   }
   if (!channel) {
-    return NextResponse.json({ error: "Image not found" }, { status: 404 });
+    return NextResponse.json({ error: "Attachment not found" }, { status: 404 });
   }
 
   const admin = createSupabaseAdminClient();
   const { data: attachment, error } = await admin
     .from("chat_message_attachments")
-    .select("storage_path")
+    .select("storage_path,file_name,mime_type")
     .eq("id", attachmentId)
     .eq("channel_id", channelId)
     .maybeSingle();
@@ -60,22 +72,29 @@ export async function GET(_request: Request, { params }: Params) {
     return NextResponse.json(
       {
         error: migrationPending
-          ? "Channel images are not enabled yet."
-          : "Could not load this image.",
+          ? "Chat attachments are not enabled yet."
+          : "Could not load this attachment.",
       },
       { status: migrationPending ? 503 : 500 },
     );
   }
   if (!attachment?.storage_path) {
-    return NextResponse.json({ error: "Image not found" }, { status: 404 });
+    return NextResponse.json({ error: "Attachment not found" }, { status: 404 });
   }
 
+  const download = new URL(request.url).searchParams.get("download") === "1";
   const { data: signed, error: signedError } = await admin.storage
     .from(CHAT_IMAGE_BUCKET)
-    .createSignedUrl(String(attachment.storage_path), 60);
+    .createSignedUrl(
+      String(attachment.storage_path),
+      60,
+      download
+        ? { download: safeDownloadName(attachment.file_name) }
+        : undefined,
+    );
   if (signedError || !signed?.signedUrl) {
     return NextResponse.json(
-      { error: "This image is temporarily unavailable." },
+      { error: "This attachment is temporarily unavailable." },
       { status: 503 },
     );
   }

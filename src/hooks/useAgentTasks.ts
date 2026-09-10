@@ -6,6 +6,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { useRelay } from "@/hooks/useRelay";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 
 export type AgentTaskStatus =
@@ -36,8 +37,203 @@ export type AgentTask = {
 };
 
 const OPEN_STATUSES: AgentTaskStatus[] = ["queued", "running", "awaiting_approval"];
+const LIVE_TEXT_MAX_CHARS = 60_000;
+const LIVE_TOOLS_MAX = 24;
+const LIVE_EVENTS_MAX = 250;
+const LIVE_EVENTS_MAX_CHARS = 60_000;
 
-export function useAgentTasks(args?: { userId?: string | null; limit?: number }) {
+type LiveProgressEvent =
+  | {
+      seq: number;
+      type: "assistant";
+      content: string;
+      at?: string;
+      content_truncated?: boolean;
+    }
+  | {
+      seq: number;
+      type: "tool_use";
+      name: string;
+      input?: string;
+      at?: string;
+    };
+
+const LIVE_PROGRESS_META_KEYS = [
+  "relay_request_id",
+  "live_status",
+  "live_text",
+  "live_text_truncated",
+  "live_tools",
+  "live_events",
+  "live_event_count",
+  "live_events_truncated",
+  "progress_updated_at",
+] as const;
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function progressCount(meta: Record<string, unknown>): number {
+  const explicit = Number(meta.live_event_count);
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  return Array.isArray(meta.live_events) ? meta.live_events.length : 0;
+}
+
+function mergeTaskRow(previous: AgentTask | undefined, incoming: AgentTask): AgentTask {
+  if (!previous) return incoming;
+
+  const previousMeta = recordValue(previous.result_meta);
+  const incomingMeta = recordValue(incoming.result_meta);
+  const previousRequestId =
+    typeof previousMeta.relay_request_id === "string" ? previousMeta.relay_request_id : "";
+  const incomingRequestId =
+    typeof incomingMeta.relay_request_id === "string" ? incomingMeta.relay_request_id : "";
+
+  if (
+    incomingRequestId &&
+    previousRequestId &&
+    incomingRequestId !== previousRequestId
+  ) {
+    return { ...previous, ...incoming };
+  }
+  if (progressCount(incomingMeta) >= progressCount(previousMeta)) {
+    return { ...previous, ...incoming };
+  }
+
+  const mergedMeta = { ...incomingMeta };
+  for (const key of LIVE_PROGRESS_META_KEYS) {
+    if (key in previousMeta) mergedMeta[key] = previousMeta[key];
+  }
+  return {
+    ...previous,
+    ...incoming,
+    result_meta: mergedMeta,
+  };
+}
+
+function parseLiveProgressEvent(value: unknown): LiveProgressEvent | null {
+  const event = recordValue(value);
+  const seq = Number(event.seq);
+  if (!Number.isFinite(seq) || seq < 1) return null;
+
+  if (event.type === "assistant" && typeof event.content === "string") {
+    return {
+      seq,
+      type: "assistant",
+      content: event.content,
+      ...(typeof event.at === "string" ? { at: event.at } : {}),
+      ...(event.content_truncated === true ? { content_truncated: true } : {}),
+    };
+  }
+  if (event.type === "tool_use" && typeof event.name === "string") {
+    return {
+      seq,
+      type: "tool_use",
+      name: event.name,
+      ...(typeof event.input === "string" ? { input: event.input } : {}),
+      ...(typeof event.at === "string" ? { at: event.at } : {}),
+    };
+  }
+  return null;
+}
+
+function applyRelayProgress(task: AgentTask, message: Record<string, unknown>): AgentTask {
+  const event = parseLiveProgressEvent(message.event);
+  if (!event) return task;
+
+  const meta = recordValue(task.result_meta);
+  const requestId = typeof message.request_id === "string" ? message.request_id : "";
+  const currentRequestId =
+    typeof meta.relay_request_id === "string" ? meta.relay_request_id : "";
+  if (requestId && currentRequestId && requestId !== currentRequestId) return task;
+
+  const existingEvents = Array.isArray(meta.live_events)
+    ? meta.live_events
+        .map(parseLiveProgressEvent)
+        .filter((item): item is LiveProgressEvent => item !== null)
+    : [];
+  if (existingEvents.some((item) => item.seq === event.seq)) return task;
+
+  const unboundedEvents = [...existingEvents, event]
+    .sort((left, right) => left.seq - right.seq)
+    .slice(-LIVE_EVENTS_MAX);
+  const nextEvents = [...unboundedEvents];
+  let eventChars = nextEvents.reduce(
+    (total, item) =>
+      total +
+      (item.type === "assistant"
+        ? item.content.length
+        : (item.input || "").length),
+    0
+  );
+  while (nextEvents.length > 1 && eventChars > LIVE_EVENTS_MAX_CHARS) {
+    const removed = nextEvents.shift();
+    if (!removed) break;
+    eventChars -=
+      removed.type === "assistant"
+        ? removed.content.length
+        : (removed.input || "").length;
+  }
+  const nextMeta: Record<string, unknown> = {
+    ...meta,
+    ...(requestId ? { relay_request_id: requestId } : {}),
+    live_status: "running",
+    live_events: nextEvents,
+    live_event_count: Math.max(
+      progressCount(meta),
+      Number(message.live_event_count) || 0,
+      event.seq
+    ),
+    live_events_truncated:
+      meta.live_events_truncated === true ||
+      existingEvents.length + 1 > LIVE_EVENTS_MAX ||
+      nextEvents.length < unboundedEvents.length ||
+      eventChars > LIVE_EVENTS_MAX_CHARS ||
+      undefined,
+    progress_updated_at:
+      typeof message.progress_updated_at === "string"
+        ? message.progress_updated_at
+        : event.at || new Date().toISOString(),
+  };
+
+  if (event.type === "assistant") {
+    const combined = `${typeof meta.live_text === "string" ? meta.live_text : ""}${
+      event.content
+    }`;
+    nextMeta.live_text =
+      combined.length > LIVE_TEXT_MAX_CHARS
+        ? combined.slice(-LIVE_TEXT_MAX_CHARS)
+        : combined;
+    nextMeta.live_text_truncated =
+      meta.live_text_truncated === true ||
+      combined.length > LIVE_TEXT_MAX_CHARS ||
+      undefined;
+  } else {
+    const existingTools = Array.isArray(meta.live_tools) ? meta.live_tools : [];
+    const lastTool = recordValue(existingTools[existingTools.length - 1]);
+    if (lastTool.name !== event.name || lastTool.input !== (event.input || "")) {
+      nextMeta.live_tools = [
+        ...existingTools.slice(-(LIVE_TOOLS_MAX - 1)),
+        {
+          name: event.name,
+          input: event.input || "",
+          ...(event.at ? { at: event.at } : {}),
+        },
+      ];
+    }
+  }
+
+  return { ...task, result_meta: nextMeta };
+}
+
+export function useAgentTasks(args?: {
+  userId?: string | null;
+  limit?: number;
+  relay?: Pick<ReturnType<typeof useRelay>, "subscribe">;
+}) {
   const supabase = getSupabaseBrowserClient();
   const [tasks, setTasks] = useState<AgentTask[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -57,7 +253,12 @@ export function useAgentTasks(args?: { userId?: string | null; limit?: number })
       const res = await fetch(`/api/agents/tasks?limit=${limit}`, { cache: "no-store" });
       const json = await res.json().catch(() => ({}));
       if (res.ok && Array.isArray(json?.tasks)) {
-        setTasks(json.tasks as AgentTask[]);
+        setTasks((previous) => {
+          const previousById = new Map(previous.map((task) => [task.id, task]));
+          return (json.tasks as AgentTask[]).map((task) =>
+            mergeTaskRow(previousById.get(task.id), task)
+          );
+        });
       }
     } catch {
       // keep prior state
@@ -94,7 +295,7 @@ export function useAgentTasks(args?: { userId?: string | null; limit?: number })
               return prev.filter((t) => t.id !== row.id);
             }
             const next = prev.filter((t) => t.id !== row.id);
-            next.unshift({ ...(prev.find((t) => t.id === row.id) || {}), ...row } as AgentTask);
+            next.unshift(mergeTaskRow(prev.find((t) => t.id === row.id), row));
             next.sort(
               (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
             );
@@ -107,6 +308,25 @@ export function useAgentTasks(args?: { userId?: string | null; limit?: number })
       void supabase.removeChannel(channel);
     };
   }, [supabase, userId, limit]);
+
+  // The relay is the token-level fast path used by the direct multi-agent
+  // panes. Merge those same ordered events immediately for orchestrator-
+  // delegated runs; the database snapshot remains the reconnect/fallback path.
+  useEffect(() => {
+    if (!args?.relay) return;
+    return args.relay.subscribe((message) => {
+      if (message.type !== "agent_task_progress") return;
+      const taskId = typeof message.task_id === "string" ? message.task_id : "";
+      if (!taskId) return;
+      setTasks((previous) =>
+        previous.map((task) =>
+          task.id === taskId
+            ? applyRelayProgress(task, message)
+            : task
+        )
+      );
+    });
+  }, [args?.relay]);
 
   const openTasks = useMemo(
     () => tasks.filter((t) => OPEN_STATUSES.includes(t.status)),

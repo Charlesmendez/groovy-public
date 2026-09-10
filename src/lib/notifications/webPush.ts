@@ -8,6 +8,13 @@ import {
   pushTopicForChannel,
   type ChatNotificationMode,
 } from "@/lib/notifications/push";
+import {
+  emailFocusNotificationCopy,
+  emailFocusNotificationUrl,
+  emailFocusPrefetchTargets,
+  type EmailFocusArrival,
+} from "@/lib/email/focusNotifications";
+import { directMessageDisplayName } from "@/lib/chat/directMessages";
 
 type PushConfiguration = {
   publicKey: string;
@@ -27,6 +34,16 @@ type PushSubscriptionRow = {
   p256dh: string;
   auth: string;
   expiration_time: number | string | null;
+  last_success_at?: string | null;
+};
+
+export type WebPushTestResult = {
+  delivered: boolean;
+  reason?:
+    | "not_configured"
+    | "not_subscribed"
+    | "rate_limited"
+    | "subscription_expired";
 };
 
 class UnsafePushEndpointError extends Error {}
@@ -94,6 +111,204 @@ export function getWebPushPublicKey(): string | null {
   return getPushConfiguration()?.publicKey || null;
 }
 
+export async function sendWebPushTestNotification(args: {
+  admin: SupabaseClient;
+  userId: string;
+  endpoint: string;
+}): Promise<WebPushTestResult> {
+  const config = getPushConfiguration();
+  if (!config) return { delivered: false, reason: "not_configured" };
+  const { data, error } = await args.admin
+    .from("web_push_subscriptions")
+    .select(
+      "id,user_id,endpoint,p256dh,auth,expiration_time,last_success_at",
+    )
+    .eq("user_id", args.userId)
+    .eq("endpoint", args.endpoint)
+    .maybeSingle();
+  if (error) throw error;
+  const subscription = data as PushSubscriptionRow | null;
+  if (!subscription) {
+    return { delivered: false, reason: "not_subscribed" };
+  }
+  if (
+    typeof subscription.last_success_at === "string" &&
+    Date.now() - Date.parse(subscription.last_success_at) < 5_000
+  ) {
+    return { delivered: false, reason: "rate_limited" };
+  }
+  try {
+    await assertPublicPushEndpoint(subscription.endpoint);
+    await webPush.sendNotification(
+      {
+        endpoint: subscription.endpoint,
+        expirationTime:
+          subscription.expiration_time === null
+            ? null
+            : Number(subscription.expiration_time),
+        keys: {
+          p256dh: subscription.p256dh,
+          auth: subscription.auth,
+        },
+      },
+      JSON.stringify({
+        type: "test",
+        title: "Groovy notifications are ready",
+        body: "If you hear or feel this, sound and vibration are working on this device.",
+        url: "/settings/notifications",
+        tag: "groovy-notification-test",
+        sentAt: Date.now(),
+      }),
+      {
+        TTL: 60,
+        urgency: "high",
+        topic: "groovy-notification-test",
+        timeout: 7_500,
+        vapidDetails: {
+          subject: config.subject,
+          publicKey: config.publicKey,
+          privateKey: config.privateKey,
+        },
+      },
+    );
+    await args.admin
+      .from("web_push_subscriptions")
+      .update({ last_success_at: new Date().toISOString() })
+      .eq("id", subscription.id);
+    return { delivered: true };
+  } catch (cause) {
+    if (
+      cause instanceof UnsafePushEndpointError ||
+      (cause instanceof webPush.WebPushError &&
+        (cause.statusCode === 404 || cause.statusCode === 410))
+    ) {
+      await args.admin
+        .from("web_push_subscriptions")
+        .delete()
+        .eq("id", subscription.id);
+      return { delivered: false, reason: "subscription_expired" };
+    }
+    throw cause;
+  }
+}
+
+export async function sendEmailFocusPush(args: {
+  admin: SupabaseClient;
+  userId: string;
+  arrivals: EmailFocusArrival[];
+}): Promise<{ attempted: number; delivered: number }> {
+  const config = getPushConfiguration();
+  const arrivals = args.arrivals.filter(
+    (arrival) => arrival.actionId && arrival.subject,
+  );
+  if (!config || arrivals.length === 0) {
+    return { attempted: 0, delivered: 0 };
+  }
+  const { data, error } = await args.admin
+    .from("web_push_subscriptions")
+    .select("id,user_id,endpoint,p256dh,auth,expiration_time")
+    .eq("user_id", args.userId);
+  if (error) {
+    console.warn("[web-push] Focus subscription lookup failed", {
+      userId: args.userId,
+      code: error.code,
+    });
+    return { attempted: 0, delivered: 0 };
+  }
+  const subscriptions = (data || []) as PushSubscriptionRow[];
+  if (subscriptions.length === 0) {
+    return { attempted: 0, delivered: 0 };
+  }
+
+  const copy = emailFocusNotificationCopy(arrivals);
+  const payload = JSON.stringify({
+    type: "email-focus",
+    title: copy.title,
+    body: copy.body,
+    url: emailFocusNotificationUrl(arrivals),
+    tag: "groovy-email-focus",
+    // The service worker warms these conversation bodies while the page is
+    // suspended, so a tap renders the message instead of fetching it. Batched
+    // arrivals land on the list, so warm each candidate the user may open.
+    threadTargets: emailFocusPrefetchTargets(arrivals),
+    actionIds: arrivals.map((arrival) => arrival.actionId),
+    sentAt: Date.now(),
+  });
+  const staleIds: string[] = [];
+  const successfulIds: string[] = [];
+  const settled = await Promise.allSettled(
+    subscriptions.map(async (subscription) => {
+      try {
+        await assertPublicPushEndpoint(subscription.endpoint);
+        await webPush.sendNotification(
+          {
+            endpoint: subscription.endpoint,
+            expirationTime:
+              subscription.expiration_time === null
+                ? null
+                : Number(subscription.expiration_time),
+            keys: {
+              p256dh: subscription.p256dh,
+              auth: subscription.auth,
+            },
+          },
+          payload,
+          {
+            TTL: 60 * 60,
+            urgency: "high",
+            topic: "groovy-email-focus",
+            timeout: 7_500,
+            vapidDetails: {
+              subject: config.subject,
+              publicKey: config.publicKey,
+              privateKey: config.privateKey,
+            },
+          },
+        );
+        successfulIds.push(subscription.id);
+      } catch (cause) {
+        if (
+          cause instanceof UnsafePushEndpointError ||
+          (cause instanceof webPush.WebPushError &&
+            (cause.statusCode === 404 || cause.statusCode === 410))
+        ) {
+          staleIds.push(subscription.id);
+          return;
+        }
+        console.warn("[web-push] Focus delivery failed", {
+          userId: args.userId,
+          status:
+            cause instanceof webPush.WebPushError ? cause.statusCode : null,
+          error: cause instanceof Error ? cause.message : "Unknown push error",
+        });
+        throw cause;
+      }
+    }),
+  );
+  await Promise.all([
+    staleIds.length
+      ? args.admin
+          .from("web_push_subscriptions")
+          .delete()
+          .in("id", staleIds)
+      : Promise.resolve(),
+    successfulIds.length
+      ? args.admin
+          .from("web_push_subscriptions")
+          .update({ last_success_at: new Date().toISOString() })
+          .in("id", successfulIds)
+      : Promise.resolve(),
+  ]);
+  return {
+    attempted: subscriptions.length,
+    delivered: settled.filter(
+      (result, index) =>
+        result.status === "fulfilled" &&
+        successfulIds.includes(subscriptions[index].id),
+    ).length,
+  };
+}
+
 function userDisplayName(user: {
   email?: string | null;
   user_metadata?: Record<string, unknown> | null;
@@ -144,11 +359,17 @@ export type TeamChatPushInput = {
   authorUserId?: string | null;
   authorLabel?: string | null;
   content: string;
+  /**
+   * Thread participants explicitly follow replies independently of the
+   * room-level all/mentions/off preference. Access is still revalidated below.
+   */
+  forceRecipientUserIds?: string[];
+  threadRootMessageId?: string | null;
 };
 
 /**
- * Delivers one best-effort Web Push event to users who explicitly opted into
- * this room. Every recipient is re-authorized against current channel
+ * Delivers one best-effort Web Push event to users whose room notifications
+ * are enabled. Every recipient is re-authorized against current channel
  * membership before an endpoint is used, so a stale preference cannot leak a
  * private-channel message after access is removed.
  */
@@ -189,15 +410,59 @@ export async function sendTeamChatPush(
         code: preferenceError.code,
       });
     }
-    return { attempted: 0, delivered: 0 };
   }
 
-  const preferences = (preferenceData || []) as PushPreferenceRow[];
+  const preferences = preferenceError
+    ? []
+    : ((preferenceData || []) as PushPreferenceRow[]);
+  const forcedRecipientUserIds = new Set(
+    (input.forceRecipientUserIds || []).filter(
+      (userId) => userId && userId !== input.authorUserId,
+    ),
+  );
+  if (input.threadRootMessageId) {
+    const [{ data: root }, { data: participants, error: participantError }] =
+      await Promise.all([
+        input.admin
+          .from("chat_messages")
+          .select("author_user_id")
+          .eq("id", input.threadRootMessageId)
+          .eq("channel_id", input.channelId)
+          .is("thread_root_message_id", null)
+          .maybeSingle(),
+        input.admin
+          .from("chat_messages")
+          .select("author_user_id")
+          .eq("channel_id", input.channelId)
+          .eq("thread_root_message_id", input.threadRootMessageId)
+          .eq("author_type", "user")
+          .not("author_user_id", "is", null),
+      ]);
+    if (participantError) {
+      console.warn("[web-push] thread participant lookup failed", {
+        channelId: input.channelId,
+        threadRootMessageId: input.threadRootMessageId,
+        code: participantError.code,
+      });
+    }
+    for (const participantId of [
+      root?.author_user_id,
+      ...(participants || []).map((participant) => participant.author_user_id),
+    ]) {
+      if (
+        typeof participantId === "string" &&
+        participantId !== input.authorUserId
+      ) {
+        forcedRecipientUserIds.add(participantId);
+      }
+    }
+  }
   const candidateUserIds = Array.from(
     new Set(
-      preferences
-        .map((preference) => preference.user_id)
-        .filter((userId) => userId && userId !== input.authorUserId),
+      [
+        ...preferences.map((preference) => preference.user_id),
+        ...forcedRecipientUserIds,
+      ].filter((userId) => userId && userId !== input.authorUserId),
     ),
   );
   if (candidateUserIds.length === 0) return { attempted: 0, delivered: 0 };
@@ -252,15 +517,20 @@ export async function sendTeamChatPush(
         })
       : new Set<string>();
   const enabledUserIds = new Set(
-    preferences
-      .filter(
-        (preference) =>
-          eligibleUserIds.has(preference.user_id) &&
-          (preference.mode === "all" ||
-            (preference.mode === "mentions" &&
-              mentionedUserIds.has(preference.user_id))),
-      )
-      .map((preference) => preference.user_id),
+    [
+      ...preferences
+        .filter(
+          (preference) =>
+            eligibleUserIds.has(preference.user_id) &&
+            (preference.mode === "all" ||
+              (preference.mode === "mentions" &&
+                mentionedUserIds.has(preference.user_id))),
+        )
+        .map((preference) => preference.user_id),
+      ...Array.from(forcedRecipientUserIds).filter((userId) =>
+        eligibleUserIds.has(userId),
+      ),
+    ],
   );
   if (enabledUserIds.size === 0) return { attempted: 0, delivered: 0 };
 
@@ -298,23 +568,89 @@ export async function sendTeamChatPush(
             : "Teammate";
   }
 
-  const roomLabel =
-    channel.kind === "channel" ? `#${channel.name}` : String(channel.name);
-  const payload = JSON.stringify({
-    title: `${roomLabel} · ${authorLabel}`,
-    body: notificationExcerpt(input.content) || "New message",
-    url: `/chat/${input.channelId}`,
-    tag: `groovy-chat-${input.channelId}`,
-    channelId: input.channelId,
-    messageId: input.messageId,
-    kind: channel.kind,
-  });
+  let directMemberUserIds: string[] = [];
+  let directHasAgent = false;
+  const directMemberNames = new Map<string, string>();
+  if (channel.kind === "dm") {
+    const { data: directMembers, error: directMembersError } = await input.admin
+      .from("chat_channel_members")
+      .select("member_type,user_id")
+      .eq("channel_id", input.channelId)
+      .in("member_type", ["user", "agent"]);
+    if (directMembersError) {
+      console.warn("[web-push] direct-message member lookup failed", {
+        channelId: input.channelId,
+        code: directMembersError.code,
+      });
+    } else {
+      directHasAgent = (directMembers || []).some(
+        (member) => member.member_type === "agent",
+      );
+      directMemberUserIds = Array.from(
+        new Set(
+          (directMembers || [])
+            .filter((member) => member.member_type === "user")
+            .map((member) => String(member.user_id || ""))
+            .filter(Boolean),
+        ),
+      );
+      if (!directHasAgent) {
+        const users = await Promise.all(
+          directMemberUserIds.map(async (userId) => {
+            const { data } =
+              await input.admin.auth.admin.getUserById(userId);
+            return data.user
+              ? ([userId, userDisplayName(data.user)] as const)
+              : null;
+          }),
+        );
+        for (const user of users) {
+          if (user) directMemberNames.set(user[0], user[1]);
+        }
+      }
+    }
+  }
+  if (input.authorUserId && authorLabel) {
+    directMemberNames.set(input.authorUserId, authorLabel);
+  }
+
+  const notificationUrl = input.threadRootMessageId
+    ? `/chat/${input.channelId}?thread=${encodeURIComponent(
+        input.threadRootMessageId,
+      )}#message-${encodeURIComponent(input.messageId)}`
+    : `/chat/${input.channelId}`;
+  const notificationSentAt = Date.now();
   const staleSubscriptionIds: string[] = [];
   const successfulSubscriptionIds: string[] = [];
 
   const settled = await Promise.allSettled(
     subscriptions.map(async (subscription) => {
       try {
+        const roomName =
+          channel.kind === "dm"
+            ? directMessageDisplayName({
+                fallbackName: String(channel.name),
+                currentUserId: subscription.user_id,
+                memberUserIds: directMemberUserIds,
+                hasAgent: directHasAgent,
+                memberNames: directMemberNames,
+              })
+            : `#${channel.name}`;
+        const payload = JSON.stringify({
+          title: input.threadRootMessageId
+            ? `${roomName} thread · ${authorLabel}`
+            : `${roomName} · ${authorLabel}`,
+          body: notificationExcerpt(input.content) || "New message",
+          url: notificationUrl,
+          tag: input.threadRootMessageId
+            ? `groovy-chat-thread-${input.threadRootMessageId}`
+            : `groovy-chat-${input.channelId}`,
+          channelId: input.channelId,
+          messageId: input.messageId,
+          threadRootMessageId: input.threadRootMessageId || null,
+          kind: channel.kind,
+          sentAt: notificationSentAt,
+        });
         await assertPublicPushEndpoint(subscription.endpoint);
         await webPush.sendNotification(
           {

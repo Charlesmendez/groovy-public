@@ -306,6 +306,13 @@ CONFIGURED_APP_URL=${shellQuote(configuredAppUrl)}
 CONFIGURED_RELAY_URL=${shellQuote(configuredRelayUrl)}
 LAUNCH_AGENT_LABEL="ai.gogroovy.connector"
 
+# The updater needs the licensed app endpoint even when WhatsApp and Aiyra are
+# disabled. Preserve an explicit operator override, otherwise use the URL
+# embedded by the signed release build.
+if [ -z "\${GROOVY_APP_URL:-}" ]; then
+  export GROOVY_APP_URL="$CONFIGURED_APP_URL"
+fi
+
 APPLE_SILICON_HW="$(/usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null || true)"
 ARCH="$(uname -m 2>/dev/null || true)"
 if [ "$APPLE_SILICON_HW" != "1" ] && [ "$ARCH" != "arm64" ] && [ "$ARCH" != "arm64e" ]; then

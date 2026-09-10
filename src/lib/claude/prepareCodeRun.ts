@@ -18,14 +18,17 @@ import { getOrCreateWorkspaceIdForUser } from "@/lib/billing/workspace";
 import { preflightGroovyUsage } from "@/lib/billing/guard";
 import { getProductAccessForUser } from "@/lib/licensing/access";
 import {
-  buildAssignedSkillsPromptContext,
-  preflightAgentSkills,
+  buildAssignedSkillsPromptContextForUser,
+  preflightAgentSkillsForUser,
 } from "@/lib/skills-manager/service";
 import { reasoningEffortsForModel } from "@/lib/ai/modelCatalog";
+import { CODE_AGENT_RUN_TIMEOUT_MS } from "@/lib/orchestrator/agentTaskTimeout";
+import { resolveAgentWorkspaceRoot } from "@/lib/claude/workspaceResolution";
 
-export const DEFAULT_CLAUDE_RUN_TIMEOUT_MS = 20 * 60 * 1000;
+export const DEFAULT_CLAUDE_RUN_TIMEOUT_MS = CODE_AGENT_RUN_TIMEOUT_MS;
 
 export type CodeCliProvider = "claude" | "codex";
+export type CodeRunExternalAccess = "none" | "vercel_read";
 
 export type CodeRunBilling = {
   billable: true;
@@ -45,6 +48,12 @@ export type PrepareCodeRunParams = {
   sessionId?: string | null;
   timeoutMs?: number;
   planMode?: boolean;
+  /** Whether the harness should answer with a plan, independent of read-only safety. */
+  planResponse?: boolean;
+  /** Enforce a non-mutating local execution sandbox/tool set. */
+  readOnly?: boolean;
+  /** Narrow external CLI capability for a non-mutating worker task. */
+  externalAccess?: CodeRunExternalAccess;
   // CLI flag overrides (from slash commands / callers)
   model?: string | null;
   reasoningEffort?: string | null;
@@ -91,6 +100,9 @@ export async function prepareCodeRun(
     agentId,
     sessionId,
     planMode = false,
+    planResponse = planMode,
+    readOnly = false,
+    externalAccess = "none",
     allowedTools,
     maxTurns,
     systemPrompt,
@@ -98,6 +110,7 @@ export async function prepareCodeRun(
     cookie = "",
     billingSource = "code_agent_cli",
   } = params;
+  const enforceReadOnly = readOnly || planMode;
 
   const prompt = params.prompt?.trim() || "";
   if (!agentId || !prompt) {
@@ -179,20 +192,43 @@ export async function prepareCodeRun(
       ? String((agentConfig as { workspace_id: string }).workspace_id)
       : null;
 
-  // Get workspace root path (optional). If missing, let connector default to $HOME.
-  let rootPath = "";
+  // Resolve the configured workspace strictly. Legacy agents with no
+  // workspace_id may still default to $HOME, but a stale configured workspace
+  // must fail closed instead of silently running in the wrong repository.
+  let workspaceRootPath: unknown = "";
+  let workspaceDeviceId: unknown = "";
+  let workspaceLookupFailed = false;
   if (workspaceId) {
-    const { data: workspace } = await supabase
+    const { data: workspace, error: workspaceError } = await supabase
       .from("device_workspaces")
-      .select("root_path")
+      .select("root_path, device_id")
       .eq("id", workspaceId)
       .eq("user_id", userId)
       .single();
-    rootPath = workspace?.root_path ? String(workspace.root_path) : "";
+    workspaceRootPath = workspace?.root_path;
+    workspaceDeviceId = workspace?.device_id;
+    workspaceLookupFailed = !!workspaceError;
   }
+  const workspaceResolution = resolveAgentWorkspaceRoot({
+    workspaceId,
+    rootPath: workspaceRootPath,
+    agentDeviceId: agentConfig.device_id,
+    workspaceDeviceId,
+    lookupFailed: workspaceLookupFailed,
+  });
+  if (!workspaceResolution.ok) {
+    return {
+      ok: false,
+      status: 400,
+      code: workspaceResolution.code,
+      error: workspaceResolution.error,
+    };
+  }
+  const rootPath = workspaceResolution.rootPath;
 
   if (agentConfig.device_id) {
-    await preflightAgentSkills({
+    await preflightAgentSkillsForUser({
+      userId,
       deviceId: String(agentConfig.device_id),
       agentId,
       target: codeCliProvider,
@@ -204,7 +240,8 @@ export async function prepareCodeRun(
     });
   }
 
-  const skillsPromptContext = await buildAssignedSkillsPromptContext({
+  const skillsPromptContext = await buildAssignedSkillsPromptContextForUser({
+    userId,
     deviceId: String(agentConfig.device_id || ""),
     agentId,
     target: codeCliProvider,
@@ -312,6 +349,11 @@ export async function prepareCodeRun(
         ...(codexApiKey ? { api_key: codexApiKey } : {}),
         ...(sessionId ? { session_id: sessionId } : {}),
         ...(planMode ? { plan_mode: true } : {}),
+        ...(planMode ? { plan_response: planResponse } : {}),
+        ...(enforceReadOnly ? { read_only: true } : {}),
+        ...(enforceReadOnly && externalAccess !== "none"
+          ? { external_access: externalAccess }
+          : {}),
         ...(model ? { model } : {}),
       },
     };
@@ -388,10 +430,16 @@ export async function prepareCodeRun(
       ...(useCliToken
         ? { cli_token: resolved.claudeCliToken }
         : { api_key: apiKey }),
-      allowed_tools: allowedTools || "Read,Edit,Bash,Write",
+      allowed_tools:
+        allowedTools || (enforceReadOnly ? "Read,Grep,Glob" : "Read,Edit,Bash,Write"),
       timeout_ms: timeoutMs,
       ...(sessionId ? { session_id: sessionId } : {}),
       ...(planMode ? { plan_mode: true } : {}),
+      ...(planMode ? { plan_response: planResponse } : {}),
+      ...(enforceReadOnly ? { read_only: true } : {}),
+      ...(enforceReadOnly && externalAccess !== "none"
+        ? { external_access: externalAccess }
+        : {}),
       ...(model ? { model } : {}),
       ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       ...(maxTurns ? { max_turns: maxTurns } : {}),

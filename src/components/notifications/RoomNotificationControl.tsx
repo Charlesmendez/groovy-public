@@ -11,6 +11,7 @@ import {
   Smartphone,
 } from "lucide-react";
 import { useWebPushNotifications } from "@/hooks/useWebPushNotifications";
+import { MobileNotificationGuide } from "@/components/notifications/MobileNotificationGuide";
 import type { ChatNotificationMode } from "@/lib/notifications/push";
 
 type Room = {
@@ -69,7 +70,9 @@ export function RoomNotificationMenu({ room }: { room: Room }) {
   const active =
     mode !== "off" &&
     notifications.deviceSubscribed &&
-    notifications.permission === "granted";
+    (notifications.transport === "desktop-native"
+      ? notifications.permission !== "denied"
+      : notifications.permission === "granted");
 
   return (
     <div ref={containerRef} className="relative">
@@ -99,7 +102,7 @@ export function RoomNotificationMenu({ room }: { room: Room }) {
       </button>
 
       {open ? (
-        <div className="absolute right-0 top-11 z-50 w-[min(21rem,calc(100vw-1.5rem))] overflow-hidden rounded-2xl border border-white/10 bg-[#111319] shadow-2xl shadow-black/60">
+        <div className="absolute right-0 top-11 z-50 max-h-[calc(100dvh-10rem)] w-[min(21rem,calc(100vw-1.5rem))] overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-[#111319] shadow-2xl shadow-black/60">
           <div className="border-b border-white/[0.07] px-4 py-3.5">
             <div className="flex items-center gap-2 text-sm font-medium">
               <Bell className="h-4 w-4 text-cyan-300" />
@@ -110,6 +113,10 @@ export function RoomNotificationMenu({ room }: { room: Room }) {
               {room.kind === "channel" ? `#${room.name}` : room.name}.
             </p>
           </div>
+
+          {notifications.transport === "web-push" ? (
+            <MobileNotificationGuide compact className="mx-3 mt-3" />
+          ) : null}
 
           <div className="space-y-1 p-2">
             {roomModes(room.kind).map((option) => {
@@ -177,17 +184,18 @@ export function RoomNotificationMenu({ room }: { room: Room }) {
             >
               {notifications.error}
             </div>
-          ) : notifications.support !== "supported" ? (
+          ) : notifications.support !== "checking" &&
+            notifications.support !== "supported" ? (
             <div className="mx-3 mb-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2.5 text-[11px] leading-relaxed text-amber-100">
               {notifications.transport === "desktop-native"
                 ? "Update Groovy Desktop to enable native notifications."
-                : "On iPhone or iPad, add Groovy to your Home Screen and open it there to enable background notifications."}
+                : "This browser cannot receive background notifications. On iPhone or iPad, follow the Home Screen setup above."}
             </div>
           ) : notifications.migrationPending ? (
             <div className="mx-3 mb-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2.5 text-[11px] leading-relaxed text-amber-100">
               Notification storage is still being activated.
             </div>
-          ) : !notifications.configured ? (
+          ) : !notifications.configured && !notifications.loading ? (
             <div className="mx-3 mb-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] px-3 py-2.5 text-[11px] leading-relaxed text-amber-100">
               {notifications.transport === "desktop-native"
                 ? "Update Groovy Desktop to enable native notifications."
@@ -222,6 +230,9 @@ export function RoomNotificationPanel({ room }: { room: Room }) {
           else in the workspace.
         </p>
       </div>
+      {notifications.transport === "web-push" ? (
+        <MobileNotificationGuide className="mb-4" />
+      ) : null}
       <div className="grid gap-2 sm:grid-cols-3">
         {roomModes(room.kind).map((option) => {
           const selected = mode === option;

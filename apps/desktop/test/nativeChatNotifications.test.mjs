@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   NativeNotificationDeduper,
+  parseNativeBadgeCount,
   parseNativeChatNotificationPayload,
 } from "../dist/main/nativeChatNotifications.js";
 
@@ -11,6 +12,7 @@ const validPayload = {
   title: "#launch · Groovy",
   body: "The task is complete.",
   url: "/chat/22222222-2222-4222-8222-222222222222",
+  silent: false,
 };
 
 test("native notification payloads only permit bounded chat routes", () => {
@@ -38,6 +40,16 @@ test("native notification payloads only permit bounded chat routes", () => {
   );
 });
 
+test("native notification payloads accept an explicit silent banner", () => {
+  assert.deepEqual(parseNativeChatNotificationPayload({
+    ...validPayload,
+    silent: true,
+  }), {
+    ...validPayload,
+    silent: true,
+  });
+});
+
 test("native notification deduplication is bounded", () => {
   const deduper = new NativeNotificationDeduper(2);
   deduper.add("first");
@@ -47,4 +59,13 @@ test("native notification deduplication is bounded", () => {
   assert.equal(deduper.has("first"), false);
   assert.equal(deduper.has("second"), true);
   assert.equal(deduper.has("third"), true);
+});
+
+test("native badge counts are finite non-negative integers", () => {
+  assert.equal(parseNativeBadgeCount(0), 0);
+  assert.equal(parseNativeBadgeCount(42), 42);
+  assert.equal(parseNativeBadgeCount(100_000), 9_999);
+  assert.equal(parseNativeBadgeCount(-1), null);
+  assert.equal(parseNativeBadgeCount(1.5), null);
+  assert.equal(parseNativeBadgeCount("4"), null);
 });

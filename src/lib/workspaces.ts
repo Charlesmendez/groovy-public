@@ -7,6 +7,37 @@ import {
 } from "@/lib/billing/state";
 
 const MEMBER_EMAIL_LOOKUP_CONCURRENCY = 8;
+// Member emails almost never change, but the auth-admin lookup is a network
+// round trip per member and sits on the critical path of /api/chat/channels.
+const MEMBER_EMAIL_CACHE_TTL_MS = 10 * 60_000;
+const MEMBER_EMAIL_CACHE_MAX = 1_000;
+const memberEmailCache = new Map<
+  string,
+  { email: string | null; expiresAt: number }
+>();
+
+function readCachedMemberEmail(
+  userId: string,
+): { email: string | null } | null {
+  const hit = memberEmailCache.get(userId);
+  if (!hit) return null;
+  if (hit.expiresAt < Date.now()) {
+    memberEmailCache.delete(userId);
+    return null;
+  }
+  return { email: hit.email };
+}
+
+function rememberMemberEmail(userId: string, email: string | null): void {
+  if (memberEmailCache.size >= MEMBER_EMAIL_CACHE_MAX) {
+    const oldest = memberEmailCache.keys().next().value;
+    if (oldest !== undefined) memberEmailCache.delete(oldest);
+  }
+  memberEmailCache.set(userId, {
+    email,
+    expiresAt: Date.now() + MEMBER_EMAIL_CACHE_TTL_MS,
+  });
+}
 
 export type WorkspaceRole = "admin" | "member" | "guest";
 
@@ -79,11 +110,15 @@ export async function getOrCreateWorkspaceForUser(): Promise<WorkspaceInfo> {
       for (let i = 0; i < members.length; i += MEMBER_EMAIL_LOOKUP_CONCURRENCY) {
         const chunk = await Promise.all(
           members.slice(i, i + MEMBER_EMAIL_LOOKUP_CONCURRENCY).map(async (m) => {
+            const cached = readCachedMemberEmail(m.user_id);
+            if (cached) return { ...m, email: cached.email };
             let email: string | null = null;
             try {
               const { data } = await admin.auth.admin.getUserById(m.user_id);
               email = data.user?.email || null;
+              rememberMemberEmail(m.user_id, email);
             } catch {
+              // Transient failures are not cached so the next request retries.
               email = null;
             }
             return { ...m, email };

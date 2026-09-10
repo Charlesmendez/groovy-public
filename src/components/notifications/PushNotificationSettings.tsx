@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import {
+  Badge,
   Bell,
   BellOff,
   BellRing,
@@ -9,11 +10,16 @@ import {
   Lock,
   MessageCircle,
   Search,
+  Settings2,
   ShieldCheck,
   Smartphone,
+  Vibrate,
+  Volume2,
 } from "lucide-react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import { MobileNotificationGuide } from "@/components/notifications/MobileNotificationGuide";
 import { useWebPushNotifications } from "@/hooks/useWebPushNotifications";
+import type { DesktopNativeNotificationPermission } from "@/lib/desktop/shell";
 import type { ChatNotificationMode } from "@/lib/notifications/push";
 
 export type NotificationRoom = {
@@ -53,23 +59,33 @@ function modeOptions(kind: NotificationRoom["kind"]) {
 function DeviceState({
   subscribed,
   permission,
+  desktopNative,
 }: {
   subscribed: boolean;
-  permission: NotificationPermission | "unsupported";
+  permission: DesktopNativeNotificationPermission;
+  desktopNative: boolean;
 }) {
-  if (subscribed && permission === "granted") {
-    return (
-      <span className="inline-flex items-center gap-1.5 text-emerald-300">
-        <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
-        Connected
-      </span>
-    );
-  }
   if (permission === "denied") {
     return (
       <span className="inline-flex items-center gap-1.5 text-red-300">
         <span className="h-1.5 w-1.5 rounded-full bg-red-300" />
         Blocked by device
+      </span>
+    );
+  }
+  if (subscribed && desktopNative) {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-cyan-200">
+        <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" />
+        Managed by macOS
+      </span>
+    );
+  }
+  if (subscribed && permission === "granted") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-emerald-300">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
+        Connected
       </span>
     );
   }
@@ -149,6 +165,7 @@ export function PushNotificationSettings({
                 <DeviceState
                   subscribed={notifications.deviceSubscribed}
                   permission={notifications.permission}
+                  desktopNative={desktopNative}
                 />
               </span>
             </div>
@@ -156,7 +173,11 @@ export function PushNotificationSettings({
               {notifications.deviceSubscribed
                 ? `${enabledRoomCount} ${
                     enabledRoomCount === 1 ? "room is" : "rooms are"
-                  } allowed to notify you.`
+                  } allowed to notify you.${
+                    desktopNative
+                      ? " macOS controls whether banners and sounds appear."
+                      : ""
+                  }`
                 : desktopNative
                   ? "Update Groovy Desktop or allow it in macOS notification settings."
                   : "Select an alert option below to request permission and connect this device."}
@@ -165,20 +186,47 @@ export function PushNotificationSettings({
                 : ""}
             </p>
           </div>
-          {notifications.deviceSubscribed && notifications.canDisableDevice ? (
-            <button
-              type="button"
-              disabled={notifications.busy}
-              onClick={() => void notifications.disableThisDevice()}
-              className="w-fit rounded-xl border border-white/10 px-3.5 py-2.5 text-xs text-zinc-400 transition hover:border-red-400/25 hover:bg-red-400/[0.05] hover:text-red-200 disabled:opacity-50"
-            >
-              Turn off this device
-            </button>
-          ) : notifications.deviceSubscribed ? (
-            <span className="flex w-fit items-center gap-1.5 rounded-full border border-cyan-400/15 bg-cyan-400/[0.04] px-2.5 py-1.5 text-[10px] text-cyan-200/80">
-              <ShieldCheck className="h-3.5 w-3.5" />
-              Native desktop
-            </span>
+          {notifications.deviceSubscribed ? (
+            <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+              {notifications.canTestDevice ? (
+                <button
+                  type="button"
+                  disabled={notifications.busy || notifications.testBusy}
+                  onClick={() => void notifications.testThisDevice()}
+                  className="inline-flex w-fit items-center gap-2 rounded-xl bg-cyan-300 px-3.5 py-2.5 text-xs font-semibold text-[#071014] transition hover:bg-cyan-200 disabled:opacity-50"
+                >
+                  {notifications.testBusy ? (
+                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-[#071014]/30 border-t-[#071014]" />
+                  ) : (
+                    <BellRing className="h-3.5 w-3.5" />
+                  )}
+                  {notifications.testBusy ? "Sending…" : "Send test alert"}
+                </button>
+              ) : null}
+              {notifications.canOpenNativeNotificationSettings ? (
+                <button
+                  type="button"
+                  disabled={notifications.testBusy}
+                  onClick={() =>
+                    void notifications.openNativeNotificationSettings()
+                  }
+                  className="inline-flex w-fit items-center gap-2 rounded-xl border border-white/10 px-3.5 py-2.5 text-xs text-zinc-300 transition hover:border-cyan-400/25 hover:bg-cyan-400/[0.05] hover:text-cyan-100 disabled:opacity-50"
+                >
+                  <Settings2 className="h-3.5 w-3.5" />
+                  Open macOS Settings
+                </button>
+              ) : null}
+              {notifications.canDisableDevice ? (
+                <button
+                  type="button"
+                  disabled={notifications.busy || notifications.testBusy}
+                  onClick={() => void notifications.disableThisDevice()}
+                  className="w-fit rounded-xl border border-white/10 px-3.5 py-2.5 text-xs text-zinc-400 transition hover:border-red-400/25 hover:bg-red-400/[0.05] hover:text-red-200 disabled:opacity-50"
+                >
+                  Turn off
+                </button>
+              ) : null}
+            </div>
           ) : (
             <span className="flex w-fit items-center gap-1.5 rounded-full border border-white/[0.08] px-2.5 py-1.5 text-[10px] text-zinc-500">
               <ShieldCheck className="h-3.5 w-3.5" />
@@ -186,6 +234,53 @@ export function PushNotificationSettings({
             </span>
           )}
         </div>
+
+        {notifications.deviceSubscribed ? (
+          <div className="border-t border-white/[0.07] px-5 py-4 sm:px-6">
+            {desktopNative ? (
+              <p className="max-w-3xl text-[11px] leading-relaxed text-zinc-500">
+                Groovy Desktop can request native alerts, but macOS owns the
+                authorization, alert style, sound, and Focus decisions. Send a
+                test alert above; if it does not appear, open macOS Settings
+                and allow notifications for Groovy.
+              </p>
+            ) : (
+              <>
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { Icon: Volume2, label: "Sound requested" },
+                    { Icon: Vibrate, label: "Vibration requested" },
+                    { Icon: Badge, label: "App badge synced" },
+                  ].map(({ Icon, label }) => (
+                    <span
+                      key={label}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/15 bg-emerald-300/[0.045] px-2.5 py-1.5 text-[10px] text-emerald-200/80"
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      {label}
+                    </span>
+                  ))}
+                </div>
+                <p className="mt-3 max-w-3xl text-[11px] leading-relaxed text-zinc-500">
+                  Groovy requests an audible, vibrating alert and keeps the app
+                  badge aligned with unread conversations. Your phone’s Silent
+                  Mode, Focus, battery restrictions, and notification settings
+                  have final control. On iPhone or iPad, use the Home Screen app
+                  and enable Notifications, Sounds, and Badges for Groovy.
+                </p>
+              </>
+            )}
+          </div>
+        ) : null}
+
+        {notifications.testStatus ? (
+          <div
+            role="status"
+            className="border-t border-emerald-300/15 bg-emerald-300/[0.04] px-5 py-3 text-xs leading-relaxed text-emerald-200 sm:px-6"
+          >
+            {notifications.testStatus}
+          </div>
+        ) : null}
 
         {notifications.error ? (
           <div
@@ -220,6 +315,8 @@ export function PushNotificationSettings({
           </div>
         ) : null}
       </section>
+
+      {!desktopNative ? <MobileNotificationGuide className="mt-4" /> : null}
 
       <div className="relative mt-7 max-w-md">
         <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-600" />

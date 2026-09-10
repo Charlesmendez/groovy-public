@@ -91,7 +91,7 @@ export async function listPidsByCommandFragment(commandFragment, options = {}) {
   }
 }
 
-export function summarizeProcessTreeMemory(records, rootPid) {
+export function summarizeProcessTreeUsage(records, rootPid) {
   const targetPid = Number(rootPid);
   if (!Number.isFinite(targetPid) || targetPid <= 0 || !Array.isArray(records)) return null;
 
@@ -100,6 +100,7 @@ export function summarizeProcessTreeMemory(records, rootPid) {
       pid: Number(record?.pid),
       parentPid: Number(record?.parentPid),
       rssBytes: Math.max(0, Number(record?.rssBytes) || 0),
+      cpuPercent: Math.max(0, Number(record?.cpuPercent) || 0),
     }))
     .filter((record) => Number.isFinite(record.pid) && record.pid > 0);
   if (!normalized.some((record) => record.pid === targetPid)) return null;
@@ -115,6 +116,8 @@ export function summarizeProcessTreeMemory(records, rootPid) {
   const visited = new Set();
   let totalRssBytes = 0;
   let maxRssBytes = 0;
+  let totalCpuPercent = 0;
+  let maxCpuPercent = 0;
 
   while (pending.length > 0) {
     const pid = pending.pop();
@@ -124,6 +127,8 @@ export function summarizeProcessTreeMemory(records, rootPid) {
     if (record) {
       totalRssBytes += record.rssBytes;
       maxRssBytes = Math.max(maxRssBytes, record.rssBytes);
+      totalCpuPercent += record.cpuPercent;
+      maxCpuPercent = Math.max(maxCpuPercent, record.cpuPercent);
     }
     for (const childPid of childrenByParent.get(pid) || []) pending.push(childPid);
   }
@@ -133,10 +138,23 @@ export function summarizeProcessTreeMemory(records, rootPid) {
     processCount: visited.size,
     totalRssBytes,
     maxRssBytes,
+    totalCpuPercent,
+    maxCpuPercent,
   };
 }
 
-export async function getProcessTreeMemory(rootPid) {
+export function summarizeProcessTreeMemory(records, rootPid) {
+  const usage = summarizeProcessTreeUsage(records, rootPid);
+  if (!usage) return null;
+  return {
+    rootPid: usage.rootPid,
+    processCount: usage.processCount,
+    totalRssBytes: usage.totalRssBytes,
+    maxRssBytes: usage.maxRssBytes,
+  };
+}
+
+export async function getProcessTreeUsage(rootPid) {
   const targetPid = Number(rootPid);
   if (!Number.isFinite(targetPid) || targetPid <= 0) return null;
 
@@ -154,27 +172,39 @@ export async function getProcessTreeMemory(rootPid) {
         .split(/\r?\n/)
         .map((line) => line.trim().split("|").map(Number))
         .filter((parts) => parts.length === 3 && parts.every(Number.isFinite))
-        .map(([pid, parentPid, rssBytes]) => ({ pid, parentPid, rssBytes }));
-      return summarizeProcessTreeMemory(records, targetPid);
+        .map(([pid, parentPid, rssBytes]) => ({ pid, parentPid, rssBytes, cpuPercent: 0 }));
+      return summarizeProcessTreeUsage(records, targetPid);
     }
 
-    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=,ppid=,rss="], {
+    const { stdout } = await execFileAsync("ps", ["-ax", "-o", "pid=,ppid=,rss=,%cpu="], {
       timeout: 7000,
       maxBuffer: 5 * 1024 * 1024,
     });
     const records = String(stdout || "")
       .split(/\r?\n/)
       .map((line) => line.trim().split(/\s+/).map(Number))
-      .filter((parts) => parts.length === 3 && parts.every(Number.isFinite))
-      .map(([pid, parentPid, rssKb]) => ({
+      .filter((parts) => parts.length === 4 && parts.every(Number.isFinite))
+      .map(([pid, parentPid, rssKb, cpuPercent]) => ({
         pid,
         parentPid,
         rssBytes: rssKb * 1024,
+        cpuPercent,
       }));
-    return summarizeProcessTreeMemory(records, targetPid);
+    return summarizeProcessTreeUsage(records, targetPid);
   } catch {
     return null;
   }
+}
+
+export async function getProcessTreeMemory(rootPid) {
+  const usage = await getProcessTreeUsage(rootPid);
+  if (!usage) return null;
+  return {
+    rootPid: usage.rootPid,
+    processCount: usage.processCount,
+    totalRssBytes: usage.totalRssBytes,
+    maxRssBytes: usage.maxRssBytes,
+  };
 }
 
 export async function killProcessTree(pid, options = {}) {

@@ -10,6 +10,7 @@ export type PublicChannelSchedule =
 
 export type ChannelScheduledTask = {
   id: string;
+  deviceId: string | null;
   name: string;
   kind: "shell" | "orchestrator";
   summary: string;
@@ -21,7 +22,45 @@ export type ChannelScheduledTask = {
   updatedAt: string | null;
   targetAgentName: string | null;
   canManage: boolean;
+  canRun: boolean;
 };
+
+export function resolveScheduledTaskRunDevice(args: {
+  assignedDeviceId: string | null;
+  activeDeviceId: string | null;
+  onlineDeviceIds: string[];
+}): string | null {
+  const onlineDeviceIds = new Set(
+    args.onlineDeviceIds.map((deviceId) => deviceId.trim()).filter(Boolean),
+  );
+  if (
+    args.assignedDeviceId &&
+    onlineDeviceIds.has(args.assignedDeviceId)
+  ) {
+    return args.assignedDeviceId;
+  }
+  if (args.activeDeviceId && onlineDeviceIds.has(args.activeDeviceId)) {
+    return args.activeDeviceId;
+  }
+  return onlineDeviceIds.values().next().value || null;
+}
+
+export function channelScheduleManualRunDeviceCandidates(args: {
+  assignedDeviceId: string | null;
+  ownedDeviceIds: string[];
+  canMoveToAnotherDevice: boolean;
+}): string[] {
+  const candidates: string[] = [];
+  const append = (value: string | null | undefined) => {
+    const deviceId = value?.trim() || "";
+    if (deviceId && !candidates.includes(deviceId)) candidates.push(deviceId);
+  };
+  append(args.assignedDeviceId);
+  if (args.canMoveToAnotherDevice) {
+    for (const deviceId of args.ownedDeviceIds) append(deviceId);
+  }
+  return candidates;
+}
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -32,6 +71,62 @@ export function parseTeamChatChannelId(value: unknown): string | null {
   }
   const channelId = value.slice("team_chat:".length).trim();
   return UUID_PATTERN.test(channelId) ? channelId : null;
+}
+
+export function resolveTeamChatScheduleChannelId(args: {
+  storedChannelId: unknown;
+  externalThreadKey: unknown;
+}): { channelId: string | null; conflict: boolean } {
+  const stored =
+    typeof args.storedChannelId === "string"
+      ? parseTeamChatChannelId(`team_chat:${args.storedChannelId.trim()}`)
+      : null;
+  const mapped =
+    typeof args.externalThreadKey === "string"
+      ? parseTeamChatChannelId(`team_chat:${args.externalThreadKey.trim()}`)
+      : null;
+  return {
+    channelId: stored || mapped,
+    conflict: Boolean(stored && mapped && stored !== mapped),
+  };
+}
+
+function normalizedScheduleExecutorRef(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Team Chat uses @groovy (and the selected Mind's name/slug) to address the
+ * channel Mind. Do not silently reinterpret that invocation as a worker with
+ * the same name. A same-name worker remains selectable when the model records
+ * that the user explicitly asked for a worker/agent.
+ */
+export function resolveScheduledWorkerRef(args: {
+  requestedAgent: unknown;
+  teamChatChannelId: string | null;
+  currentMindName?: unknown;
+  currentMindSlug?: unknown;
+  explicitWorker?: unknown;
+}): string | null {
+  const requested =
+    typeof args.requestedAgent === "string"
+      ? args.requestedAgent.trim()
+      : "";
+  if (!requested || !args.teamChatChannelId || args.explicitWorker === true) {
+    return requested || null;
+  }
+  const normalizedRequested = normalizedScheduleExecutorRef(requested);
+  const mindRefs = new Set(
+    ["groovy", args.currentMindName, args.currentMindSlug]
+      .map(normalizedScheduleExecutorRef)
+      .filter(Boolean),
+  );
+  return mindRefs.has(normalizedRequested) ? null : requested;
 }
 
 export function parseChannelScheduleAction(
@@ -48,10 +143,36 @@ export function canManageChannelSchedules(args: {
   channelCreatedBy: string;
   userId: string;
 }): boolean {
-  return (
+  // Channel creation is not an authorization grant. In particular, a stale
+  // or legacy `created_by` value must never let a guest manage a persistent
+  // job that executes on the workspace owner's connector.
+  return args.workspaceRole === "admin" || args.workspaceRole === "member";
+}
+
+export function channelScheduleCreateDenialReason(args: {
+  channelId: string | null;
+  kind: unknown;
+}): string | null {
+  if (args.channelId && args.kind === "shell") {
+    return "Team Chat schedules must run through the channel Mind or an assigned worker; direct shell schedules are not allowed.";
+  }
+  return null;
+}
+
+export function canManageCurrentChannelSchedules(args: {
+  workspaceRole: unknown;
+  visibility: unknown;
+  isChannelMember: boolean;
+  isArchived: boolean;
+}): boolean {
+  if (args.isArchived) return false;
+  const canReadChannel =
     args.workspaceRole === "admin" ||
-    args.workspaceRole === "member" ||
-    args.channelCreatedBy === args.userId
+    (args.workspaceRole === "member" && args.visibility === "workspace") ||
+    args.isChannelMember;
+  return (
+    canReadChannel &&
+    (args.workspaceRole === "admin" || args.workspaceRole === "member")
   );
 }
 

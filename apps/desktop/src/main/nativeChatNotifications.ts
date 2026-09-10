@@ -4,6 +4,7 @@ export type NativeChatNotificationPayload = {
   title: string;
   body: string;
   url: string;
+  silent: boolean;
 };
 
 const UUID_PATTERN =
@@ -14,6 +15,18 @@ function boundedText(value: unknown, maximum: number): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (!normalized || normalized.length > maximum) return null;
   return normalized;
+}
+
+export function parseNativeBadgeCount(input: unknown): number | null {
+  if (
+    typeof input !== "number" ||
+    !Number.isFinite(input) ||
+    !Number.isInteger(input) ||
+    input < 0
+  ) {
+    return null;
+  }
+  return Math.min(input, 9_999);
 }
 
 export function parseNativeChatNotificationPayload(
@@ -38,7 +51,14 @@ export function parseNativeChatNotificationPayload(
   ) {
     return null;
   }
-  return { messageId, channelId, title, body, url };
+  return {
+    messageId,
+    channelId,
+    title,
+    body,
+    url,
+    silent: candidate.silent === true,
+  };
 }
 
 export class NativeNotificationDeduper {

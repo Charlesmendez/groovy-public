@@ -10,12 +10,13 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Notification } from "electron";
+import { Notification, powerMonitor } from "electron";
 import log from "electron-log/main";
 import { autoUpdater } from "electron-updater";
 import { appOrigin } from "./window";
 
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30m fallback; foreground/resume checks are immediate.
+const FOREGROUND_CHECK_COOLDOWN_MS = 60 * 1000;
 
 export type UpdateState = "idle" | "checking" | "available" | "downloading" | "ready" | "error";
 
@@ -57,12 +58,17 @@ export class Updater {
   private timer: NodeJS.Timeout | null = null;
   private installInProgress = false;
   private notifiedVersion: string | null = null;
+  private checkInProgress: Promise<void> | null = null;
+  private lastCheckStartedAt = 0;
+  private powerMonitorListening = false;
+  private readonly checkAfterResume = () => void this.checkIfStale();
 
   constructor(private beforeInstall: () => Promise<void>) {
     autoUpdater.logger = log;
     autoUpdater.autoDownload = true;
     // Installation must go through quitAndInstall(), which removes the bundled
     // connector LaunchAgent before Squirrel replaces /Applications/Groovy.app.
+    // main.ts invokes it automatically once the app is hidden or minimized.
     autoUpdater.autoInstallOnAppQuit = false;
     autoUpdater.setFeedURL({
       provider: "generic",
@@ -123,23 +129,57 @@ export class Updater {
     return () => this.listeners.delete(listener);
   }
 
-  /** Check on launch + every 6h. */
+  /** Check on launch + every 30m, and immediately after system resume/unlock. */
   startSchedule() {
     void this.check();
     this.timer = setInterval(() => void this.check(), CHECK_INTERVAL_MS);
+    if (!this.powerMonitorListening) {
+      powerMonitor.on("resume", this.checkAfterResume);
+      powerMonitor.on("unlock-screen", this.checkAfterResume);
+      this.powerMonitorListening = true;
+    }
   }
 
   stopSchedule() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.powerMonitorListening) {
+      powerMonitor.off("resume", this.checkAfterResume);
+      powerMonitor.off("unlock-screen", this.checkAfterResume);
+      this.powerMonitorListening = false;
+    }
   }
 
   async check(): Promise<void> {
+    if (this.checkInProgress) return this.checkInProgress;
+    const pending = this.performCheck();
+    this.checkInProgress = pending;
+    try {
+      await pending;
+    } finally {
+      if (this.checkInProgress === pending) this.checkInProgress = null;
+    }
+  }
+
+  async checkIfStale(
+    cooldownMs = FOREGROUND_CHECK_COOLDOWN_MS
+  ): Promise<void> {
+    if (
+      this.checkInProgress ||
+      Date.now() - this.lastCheckStartedAt < Math.max(0, cooldownMs)
+    ) {
+      return;
+    }
+    await this.check();
+  }
+
+  private async performCheck(): Promise<void> {
     const token = readDeviceToken();
     if (!token) {
       log.info("[updater] no device token yet; skipping update check");
       return;
     }
+    this.lastCheckStartedAt = Date.now();
     autoUpdater.requestHeaders = { "x-device-token": token };
     try {
       await autoUpdater.checkForUpdates();

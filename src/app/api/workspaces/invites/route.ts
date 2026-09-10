@@ -7,9 +7,10 @@ import { normalizeWorkspaceInviteEmail } from "@/lib/workspaceInvites";
 import { sendTransactionalEmail } from "@/lib/email/resend";
 import { getWorkspaceMembershipForUser } from "@/lib/billing/state";
 import {
-  GUEST_SAFE_MIND_REQUIREMENT,
-  isGuestSafeMind,
-} from "@/lib/chat/guestMind";
+  normalizeWorkspaceAccessChannelIds,
+  validateWorkspaceAccessChannels,
+  type WorkspaceAccessRole,
+} from "@/lib/workspaceAccess";
 
 function safeOrigin() {
   const o = getConfiguredAppUrl() || "";
@@ -119,12 +120,15 @@ export async function GET() {
 
 type InviteBody = {
   email?: string;
-  role?: "member" | "guest";
+  role?: WorkspaceAccessRole;
   channelIds?: string[];
 };
 
-type ResendInviteBody = {
+type PatchInviteBody = {
   inviteId?: unknown;
+  action?: unknown;
+  role?: unknown;
+  channelIds?: unknown;
 };
 
 export async function POST(req: Request) {
@@ -136,19 +140,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid email" }, { status: 400 });
     }
     const role = body.role === "guest" ? "guest" : "member";
-    const requestedChannelIds = Array.from(
-      new Set(
-        (Array.isArray(body.channelIds) ? body.channelIds : [])
-          .map((id) => String(id).trim())
-          .filter(Boolean),
-      ),
+    const requestedChannelIds = normalizeWorkspaceAccessChannelIds(
+      body.channelIds,
     );
-    if (role === "guest" && requestedChannelIds.length === 0) {
-      return NextResponse.json(
-        { error: "Channel guests must be invited to at least one channel" },
-        { status: 400 },
-      );
-    }
 
     const admin = createSupabaseAdminClient();
     const membership = await getWorkspaceMembershipForUser({
@@ -168,75 +162,19 @@ export async function POST(req: Request) {
       .eq("id", membership.workspace_id)
       .single();
     const workspaceName = ws?.name ? String(ws.name) : "Workspace";
-    const { data: selectedChannels, error: channelError } =
-      requestedChannelIds.length
-        ? await admin
-            .from("chat_channels")
-            .select("id,name,profile_id,orchestrator_mode")
-            .eq("workspace_id", membership.workspace_id)
-            .eq("kind", "channel")
-            .eq("is_archived", false)
-            .in("id", requestedChannelIds)
-        : { data: [], error: null };
-    if (channelError) {
+    const channelValidation = await validateWorkspaceAccessChannels({
+      admin,
+      workspaceId: String(membership.workspace_id),
+      role,
+      channelIds: requestedChannelIds,
+    });
+    if (!channelValidation.ok) {
       return NextResponse.json(
-        { error: channelError.message },
-        { status: 500 },
+        { error: channelValidation.error },
+        { status: channelValidation.status },
       );
     }
-    if ((selectedChannels || []).length !== requestedChannelIds.length) {
-      return NextResponse.json(
-        { error: "One or more selected channels are invalid" },
-        { status: 400 },
-      );
-    }
-    if (role === "guest") {
-      const channelsWithMind = (selectedChannels || []).filter(
-        (channel) => channel.orchestrator_mode !== "off",
-      );
-      const profileIds = Array.from(
-        new Set(
-          channelsWithMind
-            .map((channel) => String(channel.profile_id || ""))
-            .filter(Boolean),
-        ),
-      );
-      const { data: profiles, error: profilesError } = profileIds.length
-        ? await admin
-            .from("orchestrator_profiles")
-            .select(
-              "id,workspace_id,surface,authorization_stance,memory_scope,inherit_workspace_skills,inherit_workspace_integrations",
-            )
-            .eq("workspace_id", membership.workspace_id)
-            .in("id", profileIds)
-        : { data: [], error: null };
-      if (profilesError) {
-        return NextResponse.json(
-          { error: profilesError.message },
-          { status: 500 },
-        );
-      }
-      const safeProfileIds = new Set(
-        (profiles || [])
-          .filter((profile) => isGuestSafeMind(profile))
-          .map((profile) => String(profile.id)),
-      );
-      const invalidChannels = channelsWithMind.filter(
-        (channel) =>
-          !channel.profile_id ||
-          !safeProfileIds.has(String(channel.profile_id)),
-      );
-      if (invalidChannels.length > 0) {
-        return NextResponse.json(
-          {
-            error: `${GUEST_SAFE_MIND_REQUIREMENT} Configure ${invalidChannels
-              .map((channel) => `#${channel.name}`)
-              .join(", ")} before inviting a guest.`,
-          },
-          { status: 409 },
-        );
-      }
-    }
+    const selectedChannels = channelValidation.channels;
 
     const token = randomUUID();
     const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString();
@@ -319,7 +257,7 @@ export async function PATCH(req: Request) {
   try {
     const user = await getAuthedUser();
     const body = (await req.json().catch(() => null)) as
-      | ResendInviteBody
+      | PatchInviteBody
       | null;
     const inviteId =
       typeof body?.inviteId === "string" ? body.inviteId.trim() : "";
@@ -365,6 +303,76 @@ export async function PATCH(req: Request) {
         { error: "Invite not found" },
         { status: 404 },
       );
+    }
+
+    const action =
+      body?.action === undefined || body.action === "resend"
+        ? "resend"
+        : body.action === "update_access"
+          ? "update_access"
+          : null;
+    if (!action) {
+      return NextResponse.json(
+        { error: "Unsupported invitation action" },
+        { status: 400 },
+      );
+    }
+
+    if (action === "update_access") {
+      if (body?.role !== "member" && body?.role !== "guest") {
+        return NextResponse.json(
+          { error: "Invitation role must be member or guest" },
+          { status: 400 },
+        );
+      }
+      const nextRole: WorkspaceAccessRole = body.role;
+      const requestedChannelIds = normalizeWorkspaceAccessChannelIds(
+        body.channelIds,
+      );
+      const channelValidation = await validateWorkspaceAccessChannels({
+        admin,
+        workspaceId: String(membership.workspace_id),
+        role: nextRole,
+        channelIds: requestedChannelIds,
+      });
+      if (!channelValidation.ok) {
+        return NextResponse.json(
+          { error: channelValidation.error },
+          { status: channelValidation.status },
+        );
+      }
+
+      const { error: updateError } = await admin.rpc(
+        "update_workspace_invite_access",
+        {
+          p_workspace_id: membership.workspace_id,
+          p_invite_id: inviteId,
+          p_role: nextRole,
+          p_channel_ids: requestedChannelIds,
+        },
+      );
+      if (updateError) {
+        return NextResponse.json(
+          { error: updateError.message },
+          { status: 500 },
+        );
+      }
+
+      return NextResponse.json({
+        ok: true,
+        invite: {
+          id: storedInvite.id,
+          email: storedInvite.email,
+          token: storedInvite.token,
+          role: nextRole,
+          expires_at: storedInvite.expires_at,
+          created_at: storedInvite.created_at,
+          channels: channelValidation.channels.map((channel) => ({
+            id: channel.id,
+            name: channel.name,
+          })),
+        },
+      });
     }
 
     let invite = storedInvite;
@@ -444,7 +452,7 @@ export async function PATCH(req: Request) {
     });
   } catch (error) {
     const message =
-      error instanceof Error ? error.message : "Failed to resend invitation";
+      error instanceof Error ? error.message : "Failed to update invitation";
     return NextResponse.json(
       { error: message },
       { status: message === "Unauthorized" ? 401 : 500 },

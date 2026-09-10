@@ -3,6 +3,8 @@ import type { WorkerHarness } from "./types";
 export const WORKER_MODEL_PRESETS: Record<WorkerHarness, string[]> = {
   claude: [
     "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",

@@ -55,7 +55,9 @@ type ConfigRow = {
   device_workspaces: unknown;
 };
 
-const WORKSPACE_PICK_TIMEOUT_MS = 20000;
+// Native folder dialogs may remain open for up to 180 seconds on the connector.
+// Leave transport/DB headroom so the browser never abandons a valid selection first.
+const WORKSPACE_PICK_TIMEOUT_MS = 200_000;
 
 export function useWorkerAgents(args: {
   relay: ReturnType<typeof useRelay>;
@@ -369,7 +371,7 @@ export function useWorkerAgents(args: {
           const m = msg as { request_id?: string; ok?: boolean; error?: string };
           if (String(m.request_id || "") !== requestId) return;
           if (m.ok) return;
-          if (m.error === "cancelled") {
+          if (m.error === "cancelled" || m.error === "folder_picker_cancelled") {
             finish(() => resolve(null));
             return;
           }
@@ -389,7 +391,14 @@ export function useWorkerAgents(args: {
         }
       });
 
-      relay.send({ type: "workspace_pick", request_id: requestId, device_id: activeDeviceId });
+      const sent = relay.send({
+        type: "workspace_pick",
+        request_id: requestId,
+        device_id: activeDeviceId,
+      });
+      if (!sent) {
+        finish(() => reject(new Error("Relay disconnected before the folder picker opened.")));
+      }
     });
   }, [activeDeviceId, relay]);
 

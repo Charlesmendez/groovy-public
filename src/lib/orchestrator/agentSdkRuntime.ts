@@ -10,6 +10,8 @@ import { join } from "path";
 import { fileURLToPath } from "url";
 import type { ModelMessage } from "ai";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
+import { agentSdkUsageObservations, type HarnessUsageObservation } from "../homeInbox/usage";
 
 type ExecutableToolDefinition = {
   description: string;
@@ -36,6 +38,7 @@ export type AgentSdkToolResultEvent = {
 };
 
 type AgentSdkCallbacks = {
+  onUsage?: (event: HarnessUsageObservation) => void | Promise<void>;
   onTextDelta?: (text: string) => void | Promise<void>;
   onToolCall?: (event: AgentSdkToolCallEvent) => void | Promise<void>;
   onToolResult?: (event: AgentSdkToolResultEvent) => void | Promise<void>;
@@ -320,6 +323,7 @@ export async function runAgentSdkOrchestrator(
   args: RunAgentSdkOrchestratorArgs
 ): Promise<RunAgentSdkOrchestratorResult> {
   const startedAt = Date.now();
+  const usageAttemptId = randomUUID();
   const mcpServerName = DEFAULT_MCP_SERVER_NAME;
   const mcpTools = buildMcpTools(args.tools);
   const mcpServer = createSdkMcpServer({
@@ -457,6 +461,13 @@ export async function runAgentSdkOrchestrator(
     }
 
     if (messageType === "result") {
+      // Capture even error results before throwing. The provider's aggregate
+      // includes every model, not only the configured orchestrator brain.
+      for (const observation of agentSdkUsageObservations({
+        id: `sdk:${usageAttemptId}:${typeof message.uuid === "string" ? message.uuid : "result"}`,
+        model: args.model, modelUsage: message.modelUsage, usage: message.usage,
+        totalCostUsd: message.total_cost_usd,
+      })) await args.callbacks?.onUsage?.(observation);
       sawResultEvent = true;
       const subtype = typeof message.subtype === "string" ? message.subtype : "";
       if (subtype) resultSubtypes.push(subtype);

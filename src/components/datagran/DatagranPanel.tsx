@@ -5,16 +5,23 @@ import { Loader2, ExternalLink, CheckCircle2, AlertTriangle, Image as ImageIcon,
 import { createPortal } from "react-dom";
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { SessionPicker, type ChatSession } from "@/components/chat/SessionPicker";
+import {
+  connectDatagranInSystemBrowser,
+  providerUsesDesktopBrowserOAuth,
+} from "@/lib/datagran/desktopConnect";
 import { DATAGRAN_PROVIDER_LABELS, NO_AUTH_PROVIDERS, type DatagranProvider } from "@/lib/datagran/prompts";
+import { isDesktopShell } from "@/lib/desktop/shell";
 
 declare global {
   interface Window {
     DatagranLink?: {
       open: (options: {
         linkToken: string;
-        onSuccess?: (payload: { connection_id: string }) => void;
+        autoCloseOnSuccess?: boolean;
+        onSuccess?: (payload: { connection_id?: string }) => void;
         onExit?: (payload: unknown) => void;
       }) => void;
+      close?: () => void;
     };
   }
 }
@@ -424,6 +431,32 @@ export function DatagranPanel({
 
   // Handle authentication
   const handleAuthenticate = useCallback(async () => {
+    if (
+      isDesktopShell() &&
+      config?.provider &&
+      providerUsesDesktopBrowserOAuth(config.provider)
+    ) {
+      setAuthenticating(true);
+      setAuthError(null);
+      try {
+        await connectDatagranInSystemBrowser({
+          provider: config.provider,
+          agentId,
+        });
+        await loadConfig();
+        onUpdateRef.current?.({
+          lastSessionId: activeSessionId || "",
+          status: "ready",
+        });
+      } catch (cause) {
+        setAuthError(
+          cause instanceof Error ? cause.message : "Authentication failed",
+        );
+      } finally {
+        setAuthenticating(false);
+      }
+      return;
+    }
     if (!scriptLoaded || !window.DatagranLink) {
       setAuthError("Datagran widget not loaded. Please refresh the page.");
       return;
@@ -482,7 +515,13 @@ export function DatagranPanel({
       setAuthError(e instanceof Error ? e.message : "Authentication failed");
       setAuthenticating(false);
     }
-  }, [agentId, scriptLoaded, loadConfig, activeSessionId]);
+  }, [
+    activeSessionId,
+    agentId,
+    config?.provider,
+    loadConfig,
+    scriptLoaded,
+  ]);
 
   // Session management
   const loadSessions = async () => {

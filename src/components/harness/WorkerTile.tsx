@@ -64,6 +64,10 @@ function DelegatedRunProgress({
     live_text?: unknown;
     live_text_truncated?: unknown;
     live_tools?: unknown;
+    live_events?: unknown;
+    live_event_count?: unknown;
+    live_events_truncated?: unknown;
+    progress_updated_at?: unknown;
   };
   const liveText =
     typeof meta.live_text === "string" ? meta.live_text.trimStart() : "";
@@ -82,12 +86,75 @@ function DelegatedRunProgress({
         : [],
     [rawLiveTools]
   );
+  const rawLiveEvents = meta.live_events;
+  const liveEvents = useMemo(() => {
+    if (!Array.isArray(rawLiveEvents)) return [];
+
+    type DisplayEvent =
+      | { key: string; type: "assistant"; content: string }
+      | { key: string; type: "tool_use"; name: string; input: string };
+    const displayEvents: DisplayEvent[] = [];
+
+    rawLiveEvents.forEach((item, index) => {
+      if (!item || typeof item !== "object") return;
+      const event = item as {
+        seq?: unknown;
+        type?: unknown;
+        content?: unknown;
+        name?: unknown;
+        input?: unknown;
+      };
+      const sequence =
+        typeof event.seq === "number" || typeof event.seq === "string"
+          ? String(event.seq)
+          : String(index);
+
+      if (event.type === "assistant" && typeof event.content === "string") {
+        if (!event.content) return;
+        const previous = displayEvents[displayEvents.length - 1];
+        if (previous?.type === "assistant") {
+          previous.content += event.content;
+          previous.key = `${previous.key}-${sequence}`;
+        } else {
+          displayEvents.push({
+            key: `assistant-${sequence}`,
+            type: "assistant",
+            content: event.content,
+          });
+        }
+        return;
+      }
+
+      if (event.type === "tool_use" && typeof event.name === "string") {
+        displayEvents.push({
+          key: `tool-${sequence}`,
+          type: "tool_use",
+          name: event.name,
+          input: typeof event.input === "string" ? event.input : "",
+        });
+      }
+    });
+
+    return displayEvents;
+  }, [rawLiveEvents]);
+  const hasOrderedEvents = liveEvents.length > 0;
+  const liveEventCount =
+    typeof meta.live_event_count === "number" && Number.isFinite(meta.live_event_count)
+      ? meta.live_event_count
+      : Array.isArray(rawLiveEvents)
+        ? rawLiveEvents.length
+        : 0;
+  const progressRevision =
+    typeof meta.progress_updated_at === "string" ? meta.progress_updated_at : "";
 
   useEffect(() => {
     const element = scrollRef.current;
     if (!element) return;
-    element.scrollTop = element.scrollHeight;
-  }, [liveText, liveTools]);
+    const frame = window.requestAnimationFrame(() => {
+      element.scrollTop = element.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [liveText, liveTools, liveEvents, progressRevision]);
 
   return (
     <div className="shrink-0 border-b border-cyan-400/10 bg-cyan-400/[0.035] px-3 py-2">
@@ -98,6 +165,11 @@ function DelegatedRunProgress({
         <span className="min-w-0 flex-1 truncate text-[10px] text-zinc-500">
           {task.title || task.prompt}
         </span>
+        {liveEventCount > 0 && (
+          <span className="shrink-0 text-[9px] tabular-nums text-zinc-600">
+            {liveEventCount} {liveEventCount === 1 ? "event" : "events"}
+          </span>
+        )}
       </div>
       <div
         ref={scrollRef}
@@ -105,10 +177,35 @@ function DelegatedRunProgress({
           expanded ? "max-h-[38vh]" : "max-h-36"
         }`}
       >
-        {meta.live_text_truncated === true && (
+        {(meta.live_text_truncated === true || meta.live_events_truncated === true) && (
           <div className="mb-1 text-zinc-600">…earlier output hidden…</div>
         )}
-        {liveText ? (
+        {hasOrderedEvents ? (
+          <div className="space-y-1.5">
+            {liveEvents.map((event) =>
+              event.type === "assistant" ? (
+                <div
+                  key={event.key}
+                  className="whitespace-pre-wrap break-words text-zinc-300"
+                >
+                  {event.content}
+                </div>
+              ) : (
+                <div
+                  key={event.key}
+                  className="flex min-w-0 items-start gap-1.5 rounded border border-white/5 bg-black/20 px-2 py-1.5 text-[10px]"
+                >
+                  <span className="shrink-0 text-cyan-400">› {event.name}</span>
+                  {event.input && (
+                    <span className="min-w-0 whitespace-pre-wrap break-words text-zinc-500">
+                      {event.input}
+                    </span>
+                  )}
+                </div>
+              )
+            )}
+          </div>
+        ) : liveText ? (
           <div className="whitespace-pre-wrap break-words">{liveText}</div>
         ) : (
           <div className="flex items-center gap-1.5 text-zinc-500">
@@ -116,7 +213,7 @@ function DelegatedRunProgress({
             Starting delegated work…
           </div>
         )}
-        {liveTools.length > 0 && (
+        {!hasOrderedEvents && liveTools.length > 0 && (
           <div className="mt-2 space-y-1 border-t border-white/5 pt-2">
             {liveTools.map((tool, index) => (
               <div
@@ -186,10 +283,10 @@ export const WorkerTile = memo(function WorkerTile({
       animate={{ opacity: 1, scale: 1 }}
       exit={{ opacity: 0, scale: 0.97 }}
       transition={{ duration: 0.18 }}
-      className={`flex min-w-0 flex-col min-h-0 rounded-2xl border backdrop-blur overflow-hidden transition-shadow ${
+      className={`flex min-w-0 flex-col min-h-0 border backdrop-blur overflow-hidden transition-shadow ${
         isFocused
-          ? "fixed inset-x-2 bottom-[calc(0.5rem+var(--safe-area-inset-bottom))] top-[calc(0.5rem+var(--safe-area-inset-top))] z-[60] bg-zinc-950 shadow-2xl shadow-black/80 md:inset-4"
-          : "relative w-full bg-zinc-900/50"
+          ? "absolute inset-0 z-[60] rounded-none bg-zinc-950 pb-[var(--safe-area-inset-bottom)] shadow-2xl shadow-black/80 overscroll-contain md:inset-4 md:rounded-2xl md:pb-0"
+          : "relative w-full rounded-2xl bg-zinc-900/50"
       } ${
         running
           ? "border-cyan-400/30 shadow-[0_0_24px_rgba(0,240,255,0.06)]"

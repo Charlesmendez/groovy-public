@@ -5,6 +5,8 @@ on:
   pull_request:
     paths:
       - "apps/connector/**"
+      - "apps/desktop/package.json"
+      - "apps/desktop/package-lock.json"
       - "src/lib/connector/**"
       - "src/components/onboarding/**"
       - "src/components/harness/HarnessDashboard.tsx"
@@ -14,10 +16,14 @@ on:
       - "src/components/command-center/SettingsModal.tsx"
       - ".github/workflows/connector-regression.yml"
       - ".github/workflows/release-connector.yml"
+      - ".github/workflows/release-desktop.yml"
+      - "scripts/check-desktop-connector-version-sync.mjs"
   push:
     branches: [main]
     paths:
       - "apps/connector/**"
+      - "apps/desktop/package.json"
+      - "apps/desktop/package-lock.json"
       - "src/lib/connector/**"
       - "src/components/onboarding/**"
       - "src/components/harness/HarnessDashboard.tsx"
@@ -27,8 +33,40 @@ on:
       - "src/components/command-center/SettingsModal.tsx"
       - ".github/workflows/connector-regression.yml"
       - ".github/workflows/release-connector.yml"
+      - ".github/workflows/release-desktop.yml"
+      - "scripts/check-desktop-connector-version-sync.mjs"
 
 jobs:
+  release-version-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Desktop bundles the released Connector version
+        env:
+          BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          node --check apps/connector/connector.mjs
+          node --check apps/connector/packaging/build-macos.mjs
+          node --check apps/connector/packaging/build-windows.mjs
+          node --check scripts/check-desktop-connector-version-sync.mjs
+          node --test \
+            apps/connector/packaging/bundle-connector-runtime.test.mjs \
+            apps/connector/scheduledBrowserTask.test.mjs \
+            apps/connector/schedulerDelivery.test.mjs \
+            apps/connector/whatsapp-recycle.test.mjs \
+            apps/connector/platform/startup/args.test.mjs \
+            apps/connector/platform/claude/runHeadless.test.mjs \
+            apps/connector/platform/codex/runHeadlessCodex.test.mjs
+          if [ -n "$BASE_REF" ]; then
+            node scripts/check-desktop-connector-version-sync.mjs --base-ref "$BASE_REF"
+          else
+            node scripts/check-desktop-connector-version-sync.mjs
+          fi
+
   web-lint:
     runs-on: ubuntu-latest
     steps:

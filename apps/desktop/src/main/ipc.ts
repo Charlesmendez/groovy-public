@@ -3,19 +3,26 @@
  */
 
 import {
+  app,
   BrowserWindow,
   ipcMain,
   Notification,
   powerMonitor,
   shell,
 } from "electron";
+import log from "electron-log/main";
 import * as path from "path";
 import type { ConnectorManager, ConnectorStatus } from "./connectorManager";
 import type { HostedUiUpdater } from "./hostedUiUpdater";
 import {
   NativeNotificationDeduper,
+  parseNativeBadgeCount,
   parseNativeChatNotificationPayload,
 } from "./nativeChatNotifications";
+import {
+  nativeNotificationSettingsUrl,
+  nativeNotificationStatus,
+} from "./nativeNotificationSupport";
 import type { Updater, UpdateStatus } from "./updater";
 import { getSettings, groovyDir, setSetting, type DesktopSettings } from "./settings";
 import { appUrl } from "./window";
@@ -39,7 +46,12 @@ export function registerIpc(args: {
   connector.on("status", (status: ConnectorStatus) => broadcast("groovy:connector-status", status));
   updater.onStatus((status: UpdateStatus) => broadcast("groovy:update-status", status));
   hostedUiUpdater.onStatus((status) => broadcast("groovy:ui-update-status", status));
-  const broadcastResume = () => broadcast("groovy:system-resumed", {});
+  const broadcastResume = () => {
+    broadcast("groovy:system-resumed", {});
+    // A release may have landed while the Mac was asleep. Licensed devices
+    // should check as soon as they return instead of waiting for the timer.
+    void updater.check();
+  };
   powerMonitor.on("resume", broadcastResume);
   powerMonitor.on("unlock-screen", broadcastResume);
 
@@ -58,14 +70,67 @@ export function registerIpc(args: {
   ipcMain.handle("groovy:quit-and-install", () => updater.quitAndInstall());
   ipcMain.handle("groovy:get-ui-update-status", () => hostedUiUpdater.getStatus());
   ipcMain.handle("groovy:reload-ui", () => hostedUiUpdater.reloadNow());
-  ipcMain.handle("groovy:get-native-notification-status", () => {
+  ipcMain.handle("groovy:get-native-notification-status", () =>
+    nativeNotificationStatus(Notification.isSupported()),
+  );
+  ipcMain.handle("groovy:test-native-notification", async () => {
     if (!Notification.isSupported()) {
-      return { supported: false as const, permission: "unsupported" as const };
+      return { requested: false as const, reason: "unsupported" };
     }
-    // Electron 33 does not expose macOS notification authorization state.
-    // The first native Notification prompts when needed; macOS owns any
-    // subsequent allow/deny choice in System Settings.
-    return { supported: true as const, permission: "granted" as const };
+
+    const notification = new Notification({
+      title: "Groovy notifications",
+      body: "This is a test alert from Groovy Desktop.",
+      silent: false,
+      sound: "Ping",
+    });
+    liveNotifications.add(notification);
+
+    return new Promise<{ requested: boolean; reason?: string }>((resolve) => {
+      let settled = false;
+      const finish = (result: { requested: boolean; reason?: string }) => {
+        if (settled) return;
+        settled = true;
+        liveNotifications.delete(notification);
+        resolve(result);
+      };
+      const acceptedTimer = setTimeout(
+        () => finish({ requested: true }),
+        500,
+      );
+      notification.once("failed", (_event, error) => {
+        clearTimeout(acceptedTimer);
+        log.warn(`[notifications] native test alert failed: ${error}`);
+        finish({ requested: false, reason: "failed" });
+      });
+      notification.once("close", () => liveNotifications.delete(notification));
+      try {
+        notification.show();
+      } catch (error) {
+        clearTimeout(acceptedTimer);
+        log.warn(
+          `[notifications] native test alert threw: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        finish({ requested: false, reason: "failed" });
+      }
+    });
+  });
+  ipcMain.handle("groovy:open-native-notification-settings", async () => {
+    const url = nativeNotificationSettingsUrl(process.platform);
+    if (!url) return { opened: false as const, reason: "unsupported" };
+    try {
+      await shell.openExternal(url);
+      return { opened: true as const };
+    } catch (error) {
+      log.warn(
+        `[notifications] could not open system settings: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return { opened: false as const, reason: "open_failed" };
+    }
   });
   ipcMain.handle("groovy:show-chat-notification", (event, input: unknown) => {
     const payload = parseNativeChatNotificationPayload(input);
@@ -96,12 +161,16 @@ export function registerIpc(args: {
     const notification = new Notification({
       title: payload.title,
       body: payload.body,
-      silent: false,
+      silent: payload.silent,
+      ...(payload.silent ? {} : { sound: "Ping" }),
     });
     liveNotifications.add(notification);
     const release = () => liveNotifications.delete(notification);
     notification.once("close", release);
-    notification.once("failed", release);
+    notification.once("failed", (_event, error) => {
+      log.warn(`[notifications] native chat alert failed: ${error}`);
+      release();
+    });
     notification.on("click", () => {
       release();
       const win = showWindow();
@@ -115,6 +184,17 @@ export function registerIpc(args: {
     });
     notification.show();
     return { shown: true as const };
+  });
+  ipcMain.handle("groovy:set-chat-badge-count", (_event, input: unknown) => {
+    const count = parseNativeBadgeCount(input);
+    if (count === null) return { updated: false as const };
+    if (process.platform === "darwin" && app.dock) {
+      app.dock.setBadge(
+        count > 0 ? (count > 99 ? "99+" : String(count)) : "",
+      );
+      return { updated: true as const };
+    }
+    return { updated: app.setBadgeCount(count) };
   });
   ipcMain.handle("groovy:get-settings", () => getSettings());
   ipcMain.handle("groovy:set-setting", (_event, key: unknown, value: unknown) => {
